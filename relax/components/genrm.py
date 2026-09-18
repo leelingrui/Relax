@@ -26,6 +26,8 @@ from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_genrm_managers
+from relax.engine.inference.discovery import new_manager_epoch
+from relax.engine.inference.types import Role
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
 
@@ -151,6 +153,7 @@ class GenRM(Base):
         # {route_key: GenRMManager handle}. Single-instance configs (the legacy
         # --genrm-model-path path) resolve to exactly {"__default__": manager}.
         self.genrm_managers = create_genrm_managers(config, pg, runtime_env=runtime_env)
+        self._manager_epoch = new_manager_epoch()
         self.instance_specs = config._genrm_instances_resolved
 
         self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
@@ -169,6 +172,46 @@ class GenRM(Base):
         self.tokenizers = {
             key: load_tokenizer(spec["model_path"], trust_remote_code=True)
             for key, spec in self.instance_specs.items()
+        }
+
+    @app.get("/engines")
+    async def get_engines(self, schema_version: int | None = None, status_filter: str | None = None) -> dict:
+        """Return v2 discovery, while retaining the legacy route surface."""
+        if schema_version != 2:
+            return {
+                "models": {
+                    key: {"router_ip": None, "router_port": None, "engine_groups": [], "total_engines": 0}
+                    for key in self.genrm_managers
+                },
+                "total_engines": 0,
+            }
+        refs = [
+            manager.get_discovery_snapshot.remote(
+                role=Role.GENRM, model_id=key, allow_defer=True, status_filter=status_filter
+            )
+            for key, manager in self.genrm_managers.items()
+        ]
+        snapshots = await asyncio.to_thread(ray.get, refs)
+        if not snapshots:
+            return {
+                "schema_version": 2,
+                "role": Role.GENRM.value,
+                "manager_epoch": self._manager_epoch,
+                "topology_revision": 0,
+                "models": {},
+            }
+        return {
+            "schema_version": 2,
+            "role": Role.GENRM.value,
+            "manager_epoch": self._manager_epoch,
+            "topology_revision": max(snapshot.topology_revision for snapshot in snapshots),
+            "phase": None,
+            "routing": {
+                "default_model": next(iter(self.genrm_managers)) if len(self.genrm_managers) == 1 else None,
+                "route_key_to_model": {key: key for key in self.genrm_managers},
+                "config_version": 0,
+            },
+            "models": {model.model_id: model.to_dict() for snapshot in snapshots for model in snapshot.models},
         }
 
     def run(self):

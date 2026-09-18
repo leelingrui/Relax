@@ -24,6 +24,8 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
+from relax.engine.inference.discovery import new_manager_epoch, snapshot_from_legacy_engines
+from relax.engine.inference.types import Role, RoleSnapshot
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
@@ -889,6 +891,9 @@ class RolloutManager(ReloadableMixin):
     def __init__(self, args, pg, data_source=None):
         self.pg = pg
         self.args = args
+        self.manager_epoch = new_manager_epoch()
+        self.topology_revision = 0
+        self._topology_signature: tuple[tuple[str, tuple[tuple[int, str, tuple[bool, ...]], ...]], ...] | None = None
         self._dynamic_global_batch_size = None
 
         init_tracking(args, primary=False)
@@ -3258,15 +3263,18 @@ class RolloutManager(ReloadableMixin):
         return {"router_ip": srv.router_ip, "router_port": srv.router_port}
 
     @ray.method(concurrency_group="scale_out")
-    def get_engines_info(self, model_name: Optional[str] = None) -> dict:
+    def get_engines_info(self, model_name: Optional[str] = None, status_filter: Optional[str] = None) -> dict:
         """Get information about all engines.
 
         Args:
             model_name: Model name to query (optional, default: all models)
+            status_filter: Filter engines by ``active`` or ``dead`` status.
 
         Returns:
             Dict with engine information
         """
+        if status_filter not in (None, "active", "dead"):
+            raise ValueError("status_filter must be one of: active, dead")
         result = {"models": {}, "total_engines": 0}
 
         models_to_query = {model_name: self._get_server(model_name)} if model_name else self.servers
@@ -3309,9 +3317,12 @@ class RolloutManager(ReloadableMixin):
                         logger.debug("Failed to batch-fetch engine URLs/pids, skipping URL info")
 
                 for j, engine in enumerate(group.all_engines):
+                    status = "active" if engine is not None else "dead"
+                    if status_filter is not None and status_filter != status:
+                        continue
                     engine_info = {
                         "rank": group.rank_offset + j,
-                        "status": "active" if engine is not None else "dead",
+                        "status": status,
                     }
                     if j in engine_urls and engine_urls[j] is not None:
                         engine_info["url"] = engine_urls[j]
@@ -3322,12 +3333,46 @@ class RolloutManager(ReloadableMixin):
                     group_info["engines"].append(engine_info)
 
                 model_info["engine_groups"].append(group_info)
-                model_info["total_engines"] += len(group.all_engines)
+                model_info["total_engines"] += len(group_info["engines"])
 
             result["models"][name] = model_info
             result["total_engines"] += model_info["total_engines"]
 
         return result
+
+    @ray.method(concurrency_group="scale_out")
+    def get_discovery_snapshot(
+        self, model_name: Optional[str] = None, status_filter: Optional[str] = None
+    ) -> RoleSnapshot:
+        """Adapt the legacy engine inventory into the common discovery type."""
+        self._refresh_topology_revision()
+        return snapshot_from_legacy_engines(
+            self.get_engines_info(model_name, status_filter),
+            role=Role.ROLLOUT,
+            manager_epoch=self.manager_epoch,
+            topology_revision=self.topology_revision,
+            default_model=model_name or (next(iter(self.servers), None) if len(self.servers) == 1 else None),
+        )
+
+    def _refresh_topology_revision(self) -> None:
+        if not hasattr(self, "topology_revision"):
+            self.topology_revision = 0
+        signature = tuple(
+            (
+                model_name,
+                tuple(
+                    (group.rank_offset, group.worker_type, tuple(engine is not None for engine in group.all_engines))
+                    for group in server.engine_groups
+                ),
+            )
+            for model_name, server in sorted(self.servers.items())
+        )
+        previous = getattr(self, "_topology_signature", None)
+        if previous is None:
+            self._topology_signature = signature
+        elif signature != previous:
+            self.topology_revision = getattr(self, "topology_revision", 0) + 1
+            self._topology_signature = signature
 
     @ray.method(concurrency_group="scale_out")
     def list_all_scale_out_requests(

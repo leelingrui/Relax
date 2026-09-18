@@ -146,3 +146,39 @@ def test_dedicated_teacher_recovery_requires_global_restart(monkeypatch):
 
     with pytest.raises(RuntimeError, match="global restart"):
         manager.recover()
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_teacher_placement_preserves_owner_and_bundle_mapping(monkeypatch, shared):
+    module = _import_teacher_manager(monkeypatch)
+    cls = module.TeacherManager.__ray_metadata__.modified_class
+    manager = object.__new__(cls)
+    manager.args = SimpleNamespace(rollout_num_gpus=4, enable_affinity=False)
+    manager.gpus_per_replica = 2
+    manager._shared_pg = shared
+    manager._bundle_offset = 2
+    manager._shared_pg_tuple = ("shared", list(range(12)), list(range(12)))
+    dedicated = ("dedicated", [3, 1], [1, 0])
+    module.create_placement_group.return_value = dedicated
+
+    placement, owns_pg, gpu_index = manager._resolve_placement(rank=1)
+
+    assert placement is (manager._shared_pg_tuple if shared else dedicated)
+    assert owns_pg is not shared
+    assert gpu_index == (8 if shared else 0)
+    if shared:
+        module.create_placement_group.assert_not_called()
+    else:
+        module.create_placement_group.assert_called_once_with(num_gpus=2, node_group_affinity=False)
+
+
+def test_teacher_init_never_registers_static_weights_with_dcs_or_router(monkeypatch):
+    module = _import_teacher_manager(monkeypatch)
+    cls = module.TeacherManager.__ray_metadata__.modified_class
+    manager = object.__new__(cls)
+    addr = {"host": "teacher.test", "port": 15000, "nccl_port": 15001, "dist_init_addr": "teacher.test:15002"}
+    result = manager._build_engine_init_kwargs(0, addr)
+    assert result == dict(
+        addr, router_ip=None, router_port=None, skip_dcs_registration=True, skip_router_registration=True
+    )
+    assert "skip_dcs_registration" not in addr

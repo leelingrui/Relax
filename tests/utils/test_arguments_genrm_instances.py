@@ -173,3 +173,23 @@ def test_genrm_resource_must_match_instance_gpu_sum(_arguments_module):
 
     with pytest.raises(ValueError, match="must equal the sum"):
         _arguments_module._validate_genrm_resource_config(args, resolved)
+
+
+@pytest.mark.parametrize("override", [None, {}])
+def test_genrm_instance_explicit_empty_config_does_not_merge_globals(_resolve_genrm_instances, override):
+    args = _args(
+        genrm_instances={
+            "judge": {"model_path": "/judge", "num_gpus": 2, "engine_config": override, "sampling_config": override}
+        },
+        genrm_engine_config={"mem_fraction_static": 0.3},
+        genrm_sampling_config={"temperature": 0.5},
+    )
+    resolved = _resolve_genrm_instances(args)["judge"]
+    assert resolved["engine_config"] == {}
+    assert resolved["sampling_config"] == {}
+
+
+def test_genrm_resource_is_required_when_enabled(_arguments_module):
+    args = _args(genrm_model_path="/judge", resource={})
+    with pytest.raises(ValueError, match="no 'genrm' entry"):
+        _arguments_module._validate_genrm_resource_config(args, _arguments_module._resolve_genrm_instances(args))

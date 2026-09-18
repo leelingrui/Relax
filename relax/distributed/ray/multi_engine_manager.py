@@ -22,6 +22,8 @@ import ray
 import requests
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from relax.engine.inference.discovery import new_manager_epoch, snapshot_from_engine_urls
+from relax.engine.inference.types import LifecycleState, Role, RoleSnapshot
 from relax.utils.logging_utils import get_logger
 
 
@@ -87,6 +89,9 @@ class MultiEngineManager:
         log_prefix: str = "",
     ) -> None:
         self.args = args
+        self.manager_epoch = new_manager_epoch()
+        self.topology_revision = 0
+        self._topology_signature: tuple[tuple[int, bool], ...] | None = None
         self.engine_actor_cls = engine_actor_cls
         self.nodes_per_engine = max(1, nodes_per_engine)
         self._log_prefix = log_prefix
@@ -99,14 +104,71 @@ class MultiEngineManager:
         # Track memory-occupation state so repeated onload/offload calls become
         # safe no-ops. Engines start onloaded; callers may immediately offload.
         self._onloaded = True
-
         if not skip_init:
             self._init_engines(list(range(num_slots)))
+
+    def get_discovery_snapshot(
+        self,
+        *,
+        role: Role,
+        model_id: str,
+        allow_defer: bool = False,
+        direct_eligible: bool = False,
+        phase: str | None = None,
+        status_filter: str | None = None,
+    ) -> RoleSnapshot:
+        """Publish a snapshot from current engine endpoints and health
+        evidence."""
+        if status_filter not in (None, "active", "dead"):
+            raise ValueError("status_filter must be one of: active, dead")
+        self._refresh_topology_revision()
+        urls = []
+        if status_filter == "dead":
+            return snapshot_from_engine_urls(
+                [],
+                role=role,
+                model_id=model_id,
+                manager_epoch=self.manager_epoch,
+                topology_revision=self.topology_revision,
+                state=LifecycleState.DEAD,
+                admission=False,
+                allow_defer=allow_defer,
+                direct_eligible=direct_eligible,
+                phase=phase,
+            )
+        for engine in self.engines:
+            if engine is None:
+                continue
+            try:
+                urls.append(ray.get(engine.get_url.remote()))
+            except Exception:
+                continue
+        healthy = bool(urls) and self.health_check()
+        return snapshot_from_engine_urls(
+            urls,
+            role=role,
+            model_id=model_id,
+            manager_epoch=self.manager_epoch,
+            topology_revision=self.topology_revision,
+            state=LifecycleState.READY if healthy and self._onloaded else LifecycleState.SLEEPING,
+            admission=healthy and self._onloaded,
+            allow_defer=allow_defer,
+            direct_eligible=direct_eligible,
+            phase=phase,
+        )
 
     @property
     def engines(self) -> list[Any]:
         """Return the head-node slot of each logical engine."""
         return self.all_engines[:: self.nodes_per_engine]
+
+    def _refresh_topology_revision(self) -> None:
+        signature = tuple((rank, engine is not None) for rank, engine in enumerate(self.all_engines))
+        if self._topology_signature is None:
+            self._topology_signature = signature
+        elif signature != self._topology_signature:
+            self.topology_revision += 1
+            self._topology_signature = signature
 
     # ------------------------------------------------------------------
     # Hooks -- subclasses must implement these.

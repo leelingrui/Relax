@@ -242,3 +242,19 @@ class TestManagerLookup:
         replica.genrm_managers["safety"] = object()
         with pytest.raises(RuntimeError, match="route_key"):
             replica.get_genrm_manager()
+
+
+async def test_genrm_endpoint_preserves_route_and_strips_response():
+    from unittest.mock import AsyncMock
+
+    cls = genrm_module.GenRM.func_or_class
+    replica = object.__new__(cls)
+    replica._call_engine = AsyncMock(return_value={"text": "  score\n"})
+    request = genrm_module.GenerateRequest(
+        route_key="quality", messages=[{"role": "user", "content": "judge"}], sampling_params={"temperature": 0.1}
+    )
+
+    result = await replica.generate(request)
+
+    assert result.response == "score"
+    replica._call_engine.assert_awaited_once_with("quality", request.messages, {"temperature": 0.1})

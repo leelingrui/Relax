@@ -255,3 +255,31 @@ def test_shutdown_removes_owned_placement_group_but_not_borrowed_one(_patch_ray,
     borrowing_manager = _FakeManager(num_slots=1, owns_pg=False)
     borrowing_manager.shutdown()
     assert removed_pgs == []
+
+
+def test_manager_onload_skips_resume_for_newly_rebuilt_engine(_patch_ray):
+    manager = _FakeManager(num_slots=2)
+    manager.offload()
+    manager._retire_engines([0])
+    survivor = manager.all_engines[1]
+    survivor.calls.clear()
+
+    manager.onload()
+
+    assert manager.all_engines[0].calls == ["init"]
+    assert survivor.calls == ["resume_memory_occupation"]
+    assert manager.is_onloaded()
+
+
+def test_manager_onload_rebuilds_engine_that_died_while_sleeping(_patch_ray):
+    manager = _FakeManager(num_slots=1)
+    manager.offload()
+    old = manager.all_engines[0]
+    old.dead_methods = frozenset({"resume_memory_occupation"})
+
+    manager.onload()
+
+    assert old in _patch_ray.killed
+    assert manager.all_engines[0] is not old
+    assert manager.all_engines[0].calls == ["init"]
+    assert manager.is_onloaded()

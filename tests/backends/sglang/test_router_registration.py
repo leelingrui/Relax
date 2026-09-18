@@ -311,3 +311,96 @@ def test_unregister_timeout_allows_a_later_retry(monkeypatch, sglang_engine_modu
 
     assert not engine.unregister_from_router(wait_for_removal=True, timeout=1.0)
     assert engine._router_unregister_submitted is False
+
+
+@pytest.mark.parametrize(
+    "node_rank,fully_async,override", [(0, True, 4), (0, True, None), (1, True, 4), (0, False, 4)]
+)
+def test_engine_dcs_registration_eligibility_and_gpu_metadata(
+    monkeypatch, sglang_engine_module, node_rank, fully_async, override
+):
+    from unittest.mock import MagicMock
+
+    engine = _make_engine(sglang_engine_module)
+    engine.node_rank = node_rank
+    engine.rank = 2
+    engine.num_gpus_per_engine = override
+    engine.args = SimpleNamespace(
+        fully_async=fully_async, rollout_num_gpus_per_engine=2, coordinator_url="http://dcs.test"
+    )
+    engine.checkpoint_engine_client = None
+    create_client = MagicMock(return_value=object())
+    monkeypatch.setattr(sglang_engine_module, "create_client", create_client)
+
+    engine.register_dcs()
+
+    if node_rank == 0 and fully_async:
+        create_client.assert_called_once_with(
+            args=engine.args,
+            coordinator_url="http://dcs.test",
+            role="rollout",
+            ip="worker",
+            port=8000,
+            rank=2,
+            metadata={"num_gpus_per_engine": override or 2},
+        )
+        assert engine.checkpoint_engine_client is create_client.return_value
+    else:
+        create_client.assert_not_called()
+        assert engine.checkpoint_engine_client is None
+
+
+@pytest.mark.parametrize("skip_dcs", [False, True])
+def test_engine_startup_precedes_dcs_registration(monkeypatch, sglang_engine_module, skip_dcs):
+    engine = _make_engine(sglang_engine_module)
+    engine.args = SimpleNamespace(sglang_router_ip="router", sglang_router_port=30000, rollout_external=False)
+    engine.rank = 0
+    engine.base_gpu_id = 0
+    engine.sglang_overrides = {}
+    engine.num_gpus_per_engine = 2
+    events = []
+    monkeypatch.setattr(
+        sglang_engine_module,
+        "_compute_server_args",
+        lambda *a, **kw: ({"node_rank": 0, "host": "worker", "port": 8000}, []),
+    )
+    engine._init_normal = lambda args: events.append("started")
+    engine.register_dcs = lambda: events.append("dcs")
+
+    engine.init("worker:8001", 8000, 8002, skip_router_registration=True, skip_dcs_registration=skip_dcs)
+
+    assert events == (["started"] if skip_dcs else ["started", "dcs"])
+    assert engine._skip_router_registration is True
+
+
+@pytest.mark.parametrize("worker_type", ["regular", "prefill", "decode"])
+def test_router_registration_preserves_pd_bootstrap_payload(monkeypatch, sglang_engine_module, worker_type):
+    from unittest.mock import MagicMock
+
+    engine = _make_engine(sglang_engine_module)
+    engine.worker_type = worker_type
+    post = MagicMock(return_value=_Response(200, {"worker_id": "worker-id"}))
+    monkeypatch.setattr(sglang_engine_module.requests, "post", post)
+
+    assert engine.register_to_router(bootstrap_port=9000)
+
+    payload = {"url": "http://worker:8000", "worker_type": worker_type}
+    if worker_type == "prefill":
+        payload["bootstrap_port"] = 9000
+    post.assert_called_once_with("http://router:30000/workers", json=payload, timeout=30)
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_engine_shutdown_respects_external_ownership(monkeypatch, sglang_engine_module, external):
+    engine = _make_engine(sglang_engine_module)
+    engine.args.rollout_external = external
+    events = []
+    engine.unregister_from_router = lambda: events.append("router")
+    engine.unregister_dcs = lambda: events.append("dcs")
+    engine.process = SimpleNamespace(pid=42)
+    monkeypatch.setattr(sglang_engine_module, "kill_process_tree", lambda pid: events.append(("kill", pid)))
+    try:
+        engine.shutdown()
+        assert events == ([] if external else ["router", ("kill", 42)])
+    finally:
+        del engine.process  # Do not invoke the destructor's process cleanup in this unit test.
