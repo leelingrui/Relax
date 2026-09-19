@@ -27,8 +27,8 @@ class LifecycleState(str, Enum):
 class ReplicaSnapshot:
     # Stable logical replica identity; it survives replacement of the process.
     engine_id: str
-    base_url: str | None = None
     state: LifecycleState
+    base_url: str | None = None
     weight_version: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -36,7 +36,7 @@ class ReplicaSnapshot:
         return {
             "engine_id": self.engine_id,
             "base_url": self.base_url,
-            "state": self.state.value if self.state is not None else None,
+            "state": self.state.value,
             "weight_version": self.weight_version,
         }
 

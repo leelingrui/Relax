@@ -31,6 +31,7 @@ except ImportError:
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
+from relax.engine.inference.capabilities import WeightSource
 from relax.utils import device as device_utils
 from relax.utils import scale_utils
 from relax.utils.async_utils import run
@@ -336,6 +337,8 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
 
 
 class SGLangEngine(RayActor):
+    weight_source = WeightSource.POLICY
+
     def __init__(
         self,
         args,
@@ -345,8 +348,10 @@ class SGLangEngine(RayActor):
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
         register_sigterm_handler: bool = False,
+        weight_source: WeightSource | str | None = None,
     ):
         self.args = args
+        self.weight_source = WeightSource(weight_source) if weight_source is not None else type(self).weight_source
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
@@ -417,7 +422,7 @@ class SGLangEngine(RayActor):
         ip_part, port_part = dist_init_addr.rsplit(":", 1)
         dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
 
-        server_args_dict, external_engine_need_check_fields = _compute_server_args(
+        server_args_dict, external_engine_need_check_fields = self._compute_engine_server_args(
             self.args,
             self.rank,
             dist_init_addr,
@@ -445,15 +450,26 @@ class SGLangEngine(RayActor):
                 init_external_kwargs = {"external_engine_need_check_fields": external_engine_need_check_fields}
             self._init_external(server_args_dict, **init_external_kwargs)
         else:
-            self._init_normal(server_args_dict)
+            if self.weight_source == WeightSource.POLICY:
+                self._init_normal(server_args_dict)
+            else:
+                self._init_normal(server_args_dict, apply_policy_load_plan=False)
 
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
         # Scaled-out engines use direct weight sync from seed engine instead of DCS.
         # Done after engine startup so the coordinator can immediately reach the server.
-        if not skip_dcs_registration:
+        if not skip_dcs_registration and self.weight_source == WeightSource.POLICY:
             self.register_dcs()
 
+    def _compute_engine_server_args(self, *args, **kwargs) -> tuple[dict, list]:
+        return _compute_server_args(*args, **kwargs)
+
+    def _require_policy_weights(self) -> None:
+        if self.weight_source != WeightSource.POLICY:
+            raise RuntimeError(f"Policy weight updates are forbidden for {self.weight_source.value} engines")
+
     def register_dcs(self):
+        self._require_policy_weights()
         if self.node_rank == 0 and self.args.fully_async:
             # Resolve effective num_gpus_per_engine for this engine
             effective_num_gpus = self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine
@@ -609,6 +625,7 @@ class SGLangEngine(RayActor):
         Note: The model should be on GPUs rather than CPU for this functionality to work properly.
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """
+        self._require_policy_weights()
         payload = {
             "serialized_named_tensors": serialized_named_tensors,
             "load_format": load_format,
@@ -655,6 +672,7 @@ class SGLangEngine(RayActor):
         Returns:
             Response dict from the server (``{"success": bool, ...}``), or None on non-lead node.
         """
+        self._require_policy_weights()
         return self._make_request(
             "load_lora_adapter_from_tensors",
             {
@@ -703,6 +721,7 @@ class SGLangEngine(RayActor):
         Returns:
             Response dict from the server (``{"success": bool, ...}``), or None on non-lead node.
         """
+        self._require_policy_weights()
         return self._make_request(
             "update_lora_from_distributed",
             {
@@ -729,6 +748,7 @@ class SGLangEngine(RayActor):
         Returns:
             Response dict from the server (``{"success": bool, ...}``), or None on non-lead node.
         """
+        self._require_policy_weights()
         return self._make_request("unload_lora_adapter", {"lora_name": lora_name})
 
     def abort_requests(self, timeout: float = _SGLANG_HTTP_ATTEMPT_TIMEOUT_S):
@@ -1028,6 +1048,7 @@ class SGLangEngine(RayActor):
         return self._make_request("weights_checker", {"action": action})
 
     def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
+        self._require_policy_weights()
         return self._make_request(
             "init_weights_update_group",
             {
@@ -1055,6 +1076,7 @@ class SGLangEngine(RayActor):
     def update_weights_from_distributed(
         self, names, dtypes, shapes, group_name, flush_cache=False, weight_version: str | None = None
     ):
+        self._require_policy_weights()
         payload = {
             "names": names,
             "dtypes": [str(dtype).replace("torch.", "") for dtype in dtypes],
@@ -1072,6 +1094,7 @@ class SGLangEngine(RayActor):
     def init_weights_send_group_for_remote_instance(
         self, master_address, ports, group_rank, world_size, group_name="weight_send_group", backend="nccl"
     ):
+        self._require_policy_weights()
         return self._make_request(
             "init_weights_send_group_for_remote_instance",
             {
@@ -1085,6 +1108,7 @@ class SGLangEngine(RayActor):
         )
 
     def send_weights_to_remote_instance(self, master_address, ports, group_name="weight_send_group"):
+        self._require_policy_weights()
         return self._make_request(
             "send_weights_to_remote_instance",
             {
@@ -1373,6 +1397,7 @@ class SGLangEngine(RayActor):
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """
 
+        self._require_policy_weights()
         return self._make_request(
             "post_process_weights",
             {
@@ -1405,48 +1430,26 @@ class GenRMEngine(SGLangEngine):
     specific arguments (model path, GPU count, sampling parameters, etc.).
     """
 
+    weight_source = WeightSource.CHECKPOINT
+
+    def _compute_engine_server_args(self, *args, **kwargs) -> tuple[dict, list]:
+        kwargs.pop("sglang_overrides", None)
+        kwargs.pop("num_gpus_per_engine", None)
+        return _compute_genrm_server_args(*args, **kwargs)
+
     def init(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None):
-        """Initialize the genRM engine with genrm-specific arguments."""
-        self.router_ip = ""
-        self.router_port = 0
-        self._skip_router_registration = True
-
-        host = host or get_host_info()[1]
-
-        def _format_v6_uri(addr):
-            if not addr or addr.startswith("["):
-                return addr
-            try:
-                if ipaddress.ip_address(addr).version == 6:
-                    return f"[{addr}]"
-            except ValueError:
-                pass
-            return addr
-
-        host = _format_v6_uri(host)
-        ip_part, port_part = dist_init_addr.rsplit(":", 1)
-        dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
-
-        server_args_dict, external_engine_need_check_fields = _compute_genrm_server_args(
-            self.args,
-            self.rank,
+        """Compatibility facade for the common static-engine startup path."""
+        return super().init(
             dist_init_addr,
-            nccl_port,
-            host,
             port,
-            self.worker_type,
-            disaggregation_bootstrap_port,
-            base_gpu_id=self.base_gpu_id,
+            nccl_port,
+            host=host,
+            disaggregation_bootstrap_port=disaggregation_bootstrap_port,
+            router_ip="",
+            router_port=0,
+            skip_dcs_registration=True,
+            skip_router_registration=True,
         )
-
-        self.node_rank = server_args_dict["node_rank"]
-        self.server_host = server_args_dict["host"]  # with [] if ipv6
-        self.server_port = server_args_dict["port"]
-
-        if self.args.rollout_external:
-            self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
-        else:
-            self._init_normal(server_args_dict, apply_policy_load_plan=False)
 
     def release_memory_occupation(self):
         # GenRM is colocated on the training GPUs, so it must offload at the

@@ -373,6 +373,74 @@ def test_engine_startup_precedes_dcs_registration(monkeypatch, sglang_engine_mod
     assert engine._skip_router_registration is True
 
 
+@pytest.mark.parametrize("source", ["checkpoint", "external"])
+def test_static_engine_rejects_policy_mutations(sglang_engine_module, source):
+    from unittest.mock import MagicMock
+
+    module = sglang_engine_module
+    engine = module.SGLangEngine(SimpleNamespace(), rank=0, weight_source=source)
+    engine._make_request = MagicMock()
+    operations = [
+        lambda: engine.register_dcs(),
+        lambda: engine.update_weights_from_tensor([]),
+        lambda: engine.init_weights_update_group("host", 1, 0, 1, "weights", "nccl"),
+        lambda: engine.update_weights_from_distributed([], [], [], "weights"),
+        lambda: engine.load_lora_adapter_from_tensors("policy", "", {}),
+        lambda: engine.update_lora_from_distributed("policy", [], [], [], {}, "weights"),
+        lambda: engine.unload_lora_adapter("policy"),
+        lambda: engine.init_weights_send_group_for_remote_instance("host", [], 0, 1),
+        lambda: engine.send_weights_to_remote_instance("host", []),
+        lambda: engine.post_process_weights(),
+    ]
+    for operation in operations:
+        with pytest.raises(RuntimeError, match="Policy weight updates are forbidden"):
+            operation()
+    engine._make_request.assert_not_called()
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("genrm", [False, True])
+def test_static_engine_uses_common_startup_without_policy_load_plan(
+    monkeypatch, sglang_engine_module, external, genrm
+):
+    from unittest.mock import MagicMock
+
+    module = sglang_engine_module
+    cls = module.GenRMEngine if genrm else module.SGLangEngine
+    engine = cls(
+        SimpleNamespace(rollout_external=external, sglang_router_ip="", sglang_router_port=0),
+        rank=0,
+        weight_source="checkpoint",
+    )
+    compute = MagicMock(return_value=({"node_rank": 0, "host": "[::1]", "port": 8000}, ["model_path"]))
+    monkeypatch.setattr(module, "_compute_genrm_server_args" if genrm else "_compute_server_args", compute)
+    engine._init_normal = MagicMock()
+    engine._init_external = MagicMock()
+    engine.register_dcs = MagicMock()
+
+    engine.init("::1:8001", 8000, 8002, host="::1")
+
+    assert compute.call_args.args[2] == "[::1]:8001"
+    assert engine.server_host == "[::1]"
+    assert engine.checkpoint_engine_client is None
+    engine.register_dcs.assert_not_called()
+    if external:
+        engine._init_external.assert_called_once_with(
+            compute.return_value[0], external_engine_need_check_fields=["model_path"]
+        )
+        engine._init_normal.assert_not_called()
+    else:
+        engine._init_normal.assert_called_once_with(compute.return_value[0], apply_policy_load_plan=False)
+        engine._init_external.assert_not_called()
+    if genrm:
+        assert engine._skip_router_registration is True
+
+
+def test_genrm_engine_defaults_to_checkpoint_weights(sglang_engine_module):
+    engine = sglang_engine_module.GenRMEngine(SimpleNamespace(), rank=0)
+    assert engine.weight_source == sglang_engine_module.WeightSource.CHECKPOINT
+
+
 @pytest.mark.parametrize("worker_type", ["regular", "prefill", "decode"])
 def test_router_registration_preserves_pd_bootstrap_payload(monkeypatch, sglang_engine_module, worker_type):
     from unittest.mock import MagicMock

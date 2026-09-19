@@ -10,6 +10,8 @@ from relax.engine.inference.discovery import (
     snapshot_from_engine_urls,
     snapshot_from_legacy_engines,
 )
+from relax.engine.inference.routing import resolve_model, select_target
+from relax.engine.inference.types import Role, RoleSnapshot
 
 
 __all__ = [
@@ -19,4 +21,8 @@ __all__ = [
     "role_snapshot_from_dict",
     "snapshot_from_engine_urls",
     "snapshot_from_legacy_engines",
+    "Role",
+    "RoleSnapshot",
+    "resolve_model",
+    "select_target",
 ]

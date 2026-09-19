@@ -63,7 +63,7 @@ def snapshot_from_legacy_engines(
     """Adapt the legacy ``/engines`` response into a v2 snapshot.
 
     Legacy ``active`` only proves that an actor slot exists.  It therefore
-    becomes a replica with ``state=None`` and never implies model readiness.
+    becomes a replica in ``STARTING`` state and never implies model readiness.
     """
     model_states = model_states or {}
     admission = admission or {}
@@ -81,7 +81,7 @@ def snapshot_from_legacy_engines(
                     ReplicaSnapshot(
                         engine_id=engine_id,
                         base_url=engine.get("url"),
-                        state=LifecycleState.DEAD if engine.get("status") == "dead" else None,
+                        state=LifecycleState.DEAD if engine.get("status") == "dead" else LifecycleState.STARTING,
                         weight_version=engine.get("weight_version"),
                     )
                 )
@@ -129,7 +129,7 @@ def snapshot_from_engine_urls(
     model = ModelSnapshot(
         model_id=model_id,
         replicas=tuple(
-            ReplicaSnapshot(engine_id=f"{model_id}/replica-{rank}", base_url=url, state=None)
+            ReplicaSnapshot(engine_id=f"{model_id}/replica-{rank}", state=LifecycleState.STARTING, base_url=url)
             for rank, url in enumerate(urls)
         ),
         router_url=router_url,
@@ -156,7 +156,7 @@ def role_snapshot_from_dict(payload: Mapping[str, Any]) -> RoleSnapshot:
             ReplicaSnapshot(
                 engine_id=replica["engine_id"],
                 base_url=replica.get("base_url"),
-                state=LifecycleState(replica["state"]) if replica.get("state") else None,
+                state=LifecycleState(replica["state"]) if replica.get("state") else LifecycleState.STARTING,
                 weight_version=replica.get("weight_version"),
             )
             for replica in model_payload.get("engines", ())

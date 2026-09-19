@@ -3346,12 +3346,16 @@ class RolloutManager(ReloadableMixin):
     ) -> RoleSnapshot:
         """Adapt the legacy engine inventory into the common discovery type."""
         self._refresh_topology_revision()
+        engines = self.get_engines_info(model_name, status_filter)
+        model_names = tuple(engines.get("models", {}))
         return snapshot_from_legacy_engines(
-            self.get_engines_info(model_name, status_filter),
+            engines,
             role=Role.ROLLOUT,
             manager_epoch=self.manager_epoch,
             topology_revision=self.topology_revision,
             default_model=model_name or (next(iter(self.servers), None) if len(self.servers) == 1 else None),
+            allow_defer={name: True for name in model_names},
+            direct_eligible={name: False for name in model_names},
         )
 
     def _refresh_topology_revision(self) -> None:

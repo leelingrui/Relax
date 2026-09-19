@@ -12,6 +12,7 @@ from ray import serve
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from relax.components.inference_gateway import InferenceGatewayDeployment
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.placement_group import InfoActor, sort_key
 from relax.utils import device as device_utils
@@ -64,6 +65,9 @@ class Service:
         self._task_ref: Optional[Any] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
+        self._gateway_enabled = role in {"rollout", "genrm"}
+        self._backend_name = f"{role}_backend" if self._gateway_enabled else role
+        self._gateway_name = f"{role}_gateway" if self._gateway_enabled else None
         if actor_rollout_pgs is not None:
             pgs = actor_rollout_pgs
         elif num_gpus == 0:
@@ -107,7 +111,17 @@ class Service:
                 self.healthy, pgs, self.num_gpus, self.config, self.role, runtime_env=self.runtime_env
             )
         logger.info(f"[{self.role}] Deploying service...")
-        self.handle = serve.run(self.service, name=self.role, route_prefix=f"/{self.role}")
+        backend_prefix = f"/{self.role}/backend" if self._gateway_enabled else f"/{self.role}"
+        self.handle = serve.run(self.service, name=self._backend_name, route_prefix=backend_prefix)
+        if self._gateway_enabled:
+            backend_url = get_serve_url(backend_prefix)
+            gateway = InferenceGatewayDeployment.bind(
+                self.role,
+                discovery_url=backend_url,
+                upstream_url=backend_url,
+            )
+            self.gateway_handle = serve.run(gateway, name=self._gateway_name, route_prefix=f"/{self.role}")
+            logger.info(f"[{self.role}] CPU InferenceGateway deployed at /{self.role}; backend={backend_prefix}")
 
     def _start_heartbeat(self) -> None:
         """Start background heartbeat thread to report health status."""
@@ -241,8 +255,10 @@ class Service:
         except Exception as e:
             logger.warning(f"[{self.role}] Failed to gracefully stop old deployment: {e}")
         try:
-            serve.delete(self.role)
-            logger.info(f"[{self.role}] Ray Serve deployment deleted")
+            serve.delete(self._backend_name)
+            if self._gateway_enabled:
+                serve.delete(self._gateway_name)
+            logger.info(f"[{self.role}] Ray Serve deployment(s) deleted")
         except Exception as e:
             logger.warning(f"[{self.role}] Failed to delete Ray Serve deployment: {e}")
 

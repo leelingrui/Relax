@@ -8,6 +8,7 @@ from relax.core.service import create_placement_group
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+from relax.engine.inference.capabilities import WeightSource
 from relax.utils.env import Envs
 from relax.utils.http_utils import find_available_port
 from relax.utils.logging_utils import get_logger
@@ -170,6 +171,7 @@ class TeacherManager(MultiEngineManager):
             "sglang_overrides": self._overrides,
             "num_gpus_per_engine": self.gpus_per_replica,
             "register_sigterm_handler": False,
+            "weight_source": WeightSource.CHECKPOINT,
         }
 
     def _build_engine_init_kwargs(self, rank: int, addr_and_ports: dict) -> dict:

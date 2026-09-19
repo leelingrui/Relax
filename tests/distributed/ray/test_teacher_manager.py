@@ -182,3 +182,12 @@ def test_teacher_init_never_registers_static_weights_with_dcs_or_router(monkeypa
         addr, router_ip=None, router_port=None, skip_dcs_registration=True, skip_router_registration=True
     )
     assert "skip_dcs_registration" not in addr
+
+
+def test_teacher_constructor_declares_checkpoint_weight_source(monkeypatch):
+    module = _import_teacher_manager(monkeypatch)
+    cls = module.TeacherManager.__ray_metadata__.modified_class
+    manager = object.__new__(cls)
+    manager._overrides = {}
+    manager.gpus_per_replica = 2
+    assert manager._build_engine_ctor_kwargs(0)["weight_source"] == "checkpoint"

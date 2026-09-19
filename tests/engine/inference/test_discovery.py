@@ -53,6 +53,19 @@ def test_legacy_json_supports_status_filter() -> None:
     assert "worker_type" not in active["models"]["student"]["engine_groups"][0]
 
 
+def test_rollout_capability_fields_are_explicitly_published() -> None:
+    snapshot = snapshot_from_legacy_engines(
+        {"models": {"actor": {"engine_groups": []}}},
+        role=Role.ROLLOUT,
+        manager_epoch="epoch-a",
+        allow_defer={"actor": True},
+        direct_eligible={"actor": False},
+    )
+    model = snapshot.models[0]
+    assert model.allow_defer is True
+    assert model.direct_eligible is False
+
+
 def test_engine_url_adapter_and_state_publisher() -> None:
     snapshot = snapshot_from_engine_urls(
         ["http://teacher-0/generate"],

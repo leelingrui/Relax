@@ -239,6 +239,7 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
         shared_pg=shared_pg_enabled,
         runtime_env=runtime_env,
     )
+    args.opd_teacher_engine_urls = list(urls)
     args.opd_teacher_url = urls[0]
     args.opd_teacher_urls = list(urls)
     logger.info(
