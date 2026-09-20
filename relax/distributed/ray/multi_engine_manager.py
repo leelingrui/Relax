@@ -16,14 +16,24 @@ creates and tears down itself (e.g. a non-colocated OPD teacher). Subclasses
 express this via ``_resolve_placement``.
 """
 
+from dataclasses import replace
 from typing import Any, Optional
 
 import ray
 import requests
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from relax.engine.inference.discovery import new_manager_epoch, snapshot_from_engine_urls
-from relax.engine.inference.types import LifecycleState, Role, RoleSnapshot
+from relax.engine.inference.capabilities import WeightSource
+from relax.engine.inference.manager import InferenceManager, PreparationEvidence
+from relax.engine.inference.specs import model_spec_from_pool, replicas_from_slots
+from relax.engine.inference.types import (
+    LifecycleState,
+    ModelSnapshot,
+    ReplicaSnapshot,
+    Role,
+    RoleSnapshot,
+    RoutingSpec,
+)
 from relax.utils.logging_utils import get_logger
 
 
@@ -62,6 +72,33 @@ def _is_engine_dead(exc: BaseException) -> bool:
     return isinstance(exc, _ENGINE_DEAD_EXCEPTIONS)
 
 
+class _PoolRuntime:
+    def __init__(self, owner: "MultiEngineManager") -> None:
+        self.owner = owner
+
+    def health_check(self) -> bool:
+        return self.owner._health_check_engines()
+
+    def recover(self) -> set[int]:
+        self.owner._check_recovery_allowed()
+        return self.owner._recover_engines()
+
+    def is_onloaded(self) -> bool:
+        return self.owner._onloaded
+
+    def set_onloaded(self, value: bool) -> None:
+        self.owner._onloaded = value
+
+    def fanout(self, method: str, *, skip_ranks: set[int] | None = None, **kwargs: Any) -> list[int]:
+        return self.owner._fanout(method, skip_ranks=skip_ranks, **kwargs)
+
+    def retire(self, ranks: list[int]) -> None:
+        self.owner._retire_engines(ranks)
+
+    def shutdown(self) -> None:
+        self.owner._shutdown_engines()
+
+
 class MultiEngineManager:
     """Base class for managers of a fixed-size pool of engine replicas.
 
@@ -87,16 +124,19 @@ class MultiEngineManager:
         engine_actor_cls: type,
         skip_init: bool = False,
         log_prefix: str = "",
+        inference_manager: InferenceManager | None = None,
+        model_id: str = "default",
+        adapter: Any | None = None,
     ) -> None:
         self.args = args
-        self.manager_epoch = new_manager_epoch()
-        self.topology_revision = 0
-        self._topology_signature: tuple[tuple[int, bool], ...] | None = None
         self.engine_actor_cls = engine_actor_cls
-        self.nodes_per_engine = max(1, nodes_per_engine)
+        self.replica_specs = replicas_from_slots("engine", num_slots, nodes_per_engine)
+        self.nodes_per_engine = nodes_per_engine
         self._log_prefix = log_prefix
+        self.adapter = adapter or self
 
         self.all_engines: list[Any] = [None] * num_slots
+        self.num_new_engines = 0
         # Per-slot (pg_tuple, owns_pg) so shutdown()/_retire_engines() only
         # remove placement groups this manager itself created.
         self._engine_placements: dict[int, tuple] = {}
@@ -104,8 +144,77 @@ class MultiEngineManager:
         # Track memory-occupation state so repeated onload/offload calls become
         # safe no-ops. Engines start onloaded; callers may immediately offload.
         self._onloaded = True
+        self._memory_ready = True
+        self._owns_inference_manager = inference_manager is None
+        self.inference_manager = inference_manager or InferenceManager(
+            getattr(self.adapter, "inference_role", Role.GENRM)
+        )
+        model_path = (
+            getattr(self.adapter, "inference_model_path", None) or getattr(args, "hf_checkpoint", None) or "managed"
+        )
+        self.router_url = getattr(self.adapter, "router_url", None)
+        self.inference_model_id = model_id
+        self.model_spec = model_spec_from_pool(
+            model_id,
+            model_path,
+            weight_source=getattr(self.adapter, "inference_weight_source", WeightSource.CHECKPOINT),
+            num_slots=num_slots,
+            nodes_per_engine=nodes_per_engine,
+            num_gpus_per_engine=getattr(self.adapter, "inference_num_gpus_per_engine", 1),
+            overrides=tuple(sorted(getattr(self.adapter, "inference_overrides", {}).items())),
+            allow_defer=True,
+        )
+        self.replica_specs = self.model_spec.engine_groups[0].replicas
+        self.inference_manager.register_model(
+            self.model_spec,
+            operation_id=f"register:{model_id}",
+        )
+        self.inference_manager.bind_pool(model_id, _PoolRuntime(self))
+        if self._owns_inference_manager:
+            self.inference_manager.configure_routes(RoutingSpec(default_model=model_id), operation_id="routes")
+        self.manager_epoch = self.inference_manager.snapshot().manager_epoch
         if not skip_init:
-            self._init_engines(list(range(num_slots)))
+            self.initialize()
+
+    def initialize(self) -> None:
+        """Materialize the registered pool after the role routing is sealed."""
+        self.inference_manager.invalidate_model(self.inference_model_id, state=LifecycleState.STARTING)
+        self._init_engines([rank for rank, engine in enumerate(self.all_engines) if engine is None])
+        self.num_new_engines = len(self.engines)
+        self._publish_engine_state()
+
+    def _publish_engine_state(self) -> None:
+        """Observe complete logical replicas after an operation, never in
+        discovery."""
+        expected = self.inference_manager.snapshot((self.inference_model_id,)).models[0]
+        replicas = []
+        router_url = getattr(self, "router_url", None)
+        for spec in self.replica_specs:
+            head_rank = spec.node_ranks[0]
+            nodes = [self.all_engines[rank] for rank in spec.node_ranks]
+            state = LifecycleState.DEAD
+            observation = {}
+            if all(node is not None for node in nodes):
+                state = LifecycleState.SLEEPING if not self._onloaded else LifecycleState.STARTING
+                if self._memory_ready:
+                    try:
+                        result = ray.get(nodes[0].get_inference_observation.remote(), timeout=15)
+                        observation = result if isinstance(result, dict) else {}
+                    except Exception as exc:
+                        logger.warning("%s replica %s observation failed: %s", self._log_prefix, head_rank, exc)
+                    if observation.get("healthy") and observation.get("router_registered") and router_url:
+                        state = LifecycleState.READY
+            replicas.append(ReplicaSnapshot(spec.replica_id, state, observation.get("base_url")))
+        ready = any(replica.state == LifecycleState.READY for replica in replicas)
+        state = (
+            LifecycleState.READY
+            if ready
+            else (LifecycleState.SLEEPING if not self._onloaded else LifecycleState.STARTING)
+        )
+        if not any(engine is not None for engine in self.all_engines):
+            state = LifecycleState.DEAD
+        model = ModelSnapshot(self.inference_model_id, tuple(replicas), router_url, state, ready, allow_defer=True)
+        self.inference_manager.commit_observation(expected, model, evidence=PreparationEvidence(True, ready, ready))
 
     def get_discovery_snapshot(
         self,
@@ -117,58 +226,29 @@ class MultiEngineManager:
         phase: str | None = None,
         status_filter: str | None = None,
     ) -> RoleSnapshot:
-        """Publish a snapshot from current engine endpoints and health
-        evidence."""
+        """Project the cached pool snapshot under the legacy model alias."""
         if status_filter not in (None, "active", "dead"):
             raise ValueError("status_filter must be one of: active, dead")
-        self._refresh_topology_revision()
-        urls = []
-        if status_filter == "dead":
-            return snapshot_from_engine_urls(
-                [],
-                role=role,
-                model_id=model_id,
-                manager_epoch=self.manager_epoch,
-                topology_revision=self.topology_revision,
-                state=LifecycleState.DEAD,
-                admission=False,
-                allow_defer=allow_defer,
-                direct_eligible=direct_eligible,
-                phase=phase,
-            )
-        for engine in self.engines:
-            if engine is None:
-                continue
-            try:
-                urls.append(ray.get(engine.get_url.remote()))
-            except Exception:
-                continue
-        healthy = bool(urls) and self.health_check()
-        return snapshot_from_engine_urls(
-            urls,
-            role=role,
+        snapshot = self.inference_manager.snapshot((self.inference_model_id,))
+        model = snapshot.models[0]
+        model = replace(
+            model,
             model_id=model_id,
-            manager_epoch=self.manager_epoch,
-            topology_revision=self.topology_revision,
-            state=LifecycleState.READY if healthy and self._onloaded else LifecycleState.SLEEPING,
-            admission=healthy and self._onloaded,
+            replicas=tuple(
+                replace(replica, engine_id=f"{model_id}/{replica.engine_id.split('/', 1)[1]}")
+                for replica in model.replicas
+                if status_filter is None
+                or status_filter == ("dead" if replica.state == LifecycleState.DEAD else "active")
+            ),
             allow_defer=allow_defer,
             direct_eligible=direct_eligible,
-            phase=phase,
         )
+        return replace(snapshot, role=role, models=(model,), phase=phase, routing=RoutingSpec(default_model=model_id))
 
     @property
     def engines(self) -> list[Any]:
         """Return the head-node slot of each logical engine."""
         return self.all_engines[:: self.nodes_per_engine]
-
-    def _refresh_topology_revision(self) -> None:
-        signature = tuple((rank, engine is not None) for rank, engine in enumerate(self.all_engines))
-        if self._topology_signature is None:
-            self._topology_signature = signature
-        elif signature != self._topology_signature:
-            self.topology_revision += 1
-            self._topology_signature = signature
 
     # ------------------------------------------------------------------
     # Hooks -- subclasses must implement these.
@@ -226,6 +306,28 @@ class MultiEngineManager:
     # ------------------------------------------------------------------
 
     def _init_engines(self, ranks: list[int]) -> int:
+        """Roll back only slots acquired by this attempt, including pre-init
+        failures."""
+        pending = [rank for rank in ranks if self.all_engines[rank] is None]
+        try:
+            return self._create_engines(pending)
+        except Exception:
+            for rank in pending:
+                engine = self.all_engines[rank]
+                if engine is not None:
+                    try:
+                        ray.get(engine.shutdown.remote(), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
+                    except Exception as exc:
+                        logger.warning("%s partial startup shutdown failed: %s", self._log_prefix, exc)
+                    try:
+                        ray.kill(engine)
+                    except Exception as exc:
+                        logger.warning("%s partial startup actor cleanup failed: %s", self._log_prefix, exc)
+                    self.all_engines[rank] = None
+                self._remove_owned_pg(rank)
+            raise
+
+    def _create_engines(self, ranks: list[int]) -> int:
         """Create actors for the given slot ranks, fire init.remote() for all
         of them without blocking, then await everything in one ray.get so a
         large engine doesn't pay N x cold-load latency.
@@ -239,7 +341,8 @@ class MultiEngineManager:
             if self.all_engines[rank] is not None:
                 continue
 
-            pg_tuple, owns_pg, gpu_index = self._resolve_placement(rank)
+            pg_tuple, owns_pg, gpu_index = self.adapter._resolve_placement(rank)
+            self._engine_placements[rank] = (pg_tuple, owns_pg)
             pg, reordered_bundle_indices, reordered_gpu_ids = pg_tuple
             base_gpu_id = int(reordered_gpu_ids[gpu_index])
             scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -249,45 +352,32 @@ class MultiEngineManager:
             )
 
             engine = EngineActor.options(
-                **self._ray_resource_kwargs(rank),
+                **self.adapter._ray_resource_kwargs(rank),
                 scheduling_strategy=scheduling_strategy,
-                runtime_env={"env_vars": self._build_engine_env_vars()},
+                runtime_env={"env_vars": self.adapter._build_engine_env_vars()},
             ).remote(
-                self._engine_ctor_args(rank),
+                self.adapter._engine_ctor_args(rank),
                 rank=rank,
                 worker_type="regular",
                 base_gpu_id=base_gpu_id,
-                **self._build_engine_ctor_kwargs(rank),
+                **self.adapter._build_engine_ctor_kwargs(rank),
             )
             new_engines.append((rank, engine))
             self.all_engines[rank] = engine
-            self._engine_placements[rank] = (pg_tuple, owns_pg)
 
         num_new_engines = len(new_engines)
         if num_new_engines == 0:
             return num_new_engines
 
-        addr_and_ports = self._allocate_engine_addr_and_ports(new_engines=new_engines)
+        addr_and_ports = self.adapter._allocate_engine_addr_and_ports(new_engines=new_engines)
         for rank, _ in new_engines:
             self._engine_addr_and_ports[rank] = addr_and_ports[rank]
 
         init_handles = [
-            engine.init.remote(**self._build_engine_init_kwargs(rank, addr_and_ports[rank]))
+            engine.init.remote(**self.adapter._build_engine_init_kwargs(rank, addr_and_ports[rank]))
             for rank, engine in new_engines
         ]
-        try:
-            # Bounded: a bundle on a dead node never schedules, and an unbounded
-            # ray.get would block the training step forever.
-            ray.get(init_handles, timeout=_ENGINE_REBUILD_TIMEOUT_S)
-        except Exception:
-            for rank, engine in new_engines:
-                try:
-                    ray.kill(engine)
-                except Exception:
-                    pass
-                self.all_engines[rank] = None
-                self._remove_owned_pg(rank)
-            raise
+        ray.get(init_handles, timeout=_ENGINE_REBUILD_TIMEOUT_S)
 
         return num_new_engines
 
@@ -297,6 +387,8 @@ class MultiEngineManager:
             return
         pg_tuple, owns_pg = placement
         if not owns_pg:
+            return
+        if any(other[0][0] == pg_tuple[0] for other in self._engine_placements.values()):
             return
         try:
             from ray.util.placement_group import remove_placement_group
@@ -310,6 +402,11 @@ class MultiEngineManager:
     # ------------------------------------------------------------------
 
     def health_check(self) -> bool:
+        healthy = self.inference_manager.health_check(self.inference_model_id)
+        self._publish_engine_state()
+        return healthy
+
+    def _health_check_engines(self) -> bool:
         """Perform a health check on every engine."""
         health_results = []
         for engine in self.engines:
@@ -321,50 +418,23 @@ class MultiEngineManager:
                     health_results.append(False)
             else:
                 health_results.append(False)
-        return all(health_results)
+        return bool(health_results) and all(health_results)
 
     def onload(self, tags: Optional[list[str]] = None) -> None:
-        """Load engine weights to GPU.
-
-        Also the recovery point for engines that died since the last step: a
-        freshly built engine comes up onloaded, which is exactly the state this
-        phase wants.
-        """
-        rebuilt = self.recover()
-        if self._onloaded and tags is None:
-            logger.info(f"{self._log_prefix} engines already onloaded; skipping")
+        if self._onloaded and self._memory_ready and tags is None and all(self.all_engines):
             return
-        logger.info(f"{self._log_prefix} engines onload started with tags={tags}")
-        # Engines rebuilt just above are already onloaded -- resuming them
-        # again would be a double-resume, so only touch the ones that survived.
-        dead = self._fanout("resume_memory_occupation", skip_ranks=rebuilt, tags=tags)
-        if dead:
-            # An engine that died while offloaded is only discovered here
-            # (offload() short-circuits when already offloaded), so it missed
-            # the recover() above. Rebuild now rather than leaving the pool a
-            # man down for the whole next phase.
-            self._retire_engines(dead)
-            self.recover()
-        self._onloaded = True
-        logger.info(f"{self._log_prefix} engines onload completed")
+        if not getattr(self, "_memory_ready", True) and tags is None:
+            # Partial restores still occupy memory, but must not trigger the
+            # common full-onload no-op path.
+            self._onloaded = False
+        self._memory_ready = False
+        self.inference_manager.onload(self.inference_model_id, tags=tags)
+        self._memory_ready = not tags
+        self._publish_engine_state()
 
     def offload(self) -> None:
-        """Offload engine weights from GPU to free memory.
-
-        Dead engines are retired here but NOT rebuilt: this typically runs
-        while other ranks wait on a barrier, so keep it short and leave the
-        rebuild to the next onload().
-        """
-        if not self._onloaded:
-            logger.info(f"{self._log_prefix} engines already offloaded; skipping")
-            return
-        logger.info(f"{self._log_prefix} engines offload started")
-        dead = self._fanout("release_memory_occupation")
-        self._retire_engines(dead)
-        # Unconditional: the surviving engines did release, so the manager
-        # must not claim to still be onloaded just because one engine died.
-        self._onloaded = False
-        logger.info(f"{self._log_prefix} engines offload completed (retired {len(dead)} dead)")
+        self._memory_ready = False
+        self.inference_manager.offload(self.inference_model_id)
 
     def _fanout(self, method: str, *, skip_ranks: Optional[set] = None, **kwargs) -> list[int]:
         """Call ``method`` on every live engine; return the ranks that are
@@ -395,6 +465,8 @@ class MultiEngineManager:
     def _retire_engines(self, ranks: list[int]) -> None:
         """Tear down dead engines and null their slots so recover() rebuilds
         them."""
+        if ranks:
+            self.inference_manager.invalidate_model(self.inference_model_id, state=LifecycleState.STARTING)
         for rank in ranks:
             for i in range(rank, rank + self.nodes_per_engine):
                 engine = self.all_engines[i]
@@ -416,6 +488,18 @@ class MultiEngineManager:
                 logger.info(f"{self._log_prefix} engine rank={i} retired")
 
     def recover(self) -> set:
+        rebuilt = self.inference_manager.recover(self.inference_model_id)
+        self._publish_engine_state()
+        return rebuilt
+
+    def _check_recovery_allowed(self) -> None:
+        """Role-specific endpoint constraints are checked even during
+        onload."""
+        checker = getattr(type(self.adapter), "_check_recovery_allowed", None)
+        if checker is not None and self.adapter is not self:
+            checker(self.adapter)
+
+    def _recover_engines(self) -> set:
         """Rebuild engines whose slot is None. Returns the ranks rebuilt.
 
         ``_init_engines`` already skips non-None slots, so it rebuilds exactly
@@ -423,7 +507,13 @@ class MultiEngineManager:
         dedicated ones) and probing fresh ports (surviving engines' ports are
         bound, so they're skipped).
         """
-        dead = [i for i, engine in enumerate(self.all_engines) if engine is None]
+        incomplete = [
+            replica
+            for replica in self.replica_specs
+            if any(self.all_engines[rank] is None for rank in replica.node_ranks)
+        ]
+        self._retire_engines([replica.node_ranks[0] for replica in incomplete])
+        dead = [rank for replica in incomplete for rank in replica.node_ranks]
         if not dead:
             return set()
 
@@ -451,9 +541,13 @@ class MultiEngineManager:
         return self._onloaded
 
     def shutdown(self) -> None:
+        self._memory_ready = False
+        self.inference_manager.shutdown(self.inference_model_id)
+
+    def _shutdown_engines(self) -> None:
         """Tear down every engine and remove any placement group this manager
         created for it."""
-        for rank in range(0, len(self.all_engines), self.nodes_per_engine):
+        for rank in range(len(self.all_engines)):
             engine = self.all_engines[rank]
             if engine is not None:
                 try:

@@ -168,7 +168,15 @@ class RayTrainGroup:
 
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
+        manager = getattr(self, "_rollout_manager", None)
+        if manager is not None:
+            if not ray.get(manager.set_weight_updating.remote(True)):
+                raise RuntimeError("Rollout topology is draining; weight update must retry")
+        # On failure keep admission closed until a successful retry/recovery.
         ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+        if manager is not None:
+            ray.get(manager.set_weight_updating.remote(False))
+            ray.get(manager.refresh_inference_state.remote())
 
     def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:
         """Update weights in fully async mode (sends to rollout and
@@ -196,6 +204,7 @@ class RayTrainGroup:
 
     def set_rollout_manager(self, rollout_manager: Any):
         ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
+        self._rollout_manager = rollout_manager
 
     def set_genrm_manager(self, genrm_manager: Any):
         """Set the genRM manager for coordinated offload/onload.

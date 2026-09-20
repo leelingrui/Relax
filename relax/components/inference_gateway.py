@@ -3,6 +3,7 @@
 """CPU HTTP gateway shared by rollout, GenRM, and Teacher services."""
 
 import asyncio
+import hashlib
 import inspect
 import json
 from collections.abc import Awaitable, Callable, Mapping
@@ -60,19 +61,25 @@ class InferenceGateway:
         *,
         snapshot_provider: GatewaySnapshotProvider | None = None,
         manager_handles: Mapping[str, Any] | None = None,
+        role_manager_handle: Any | None = None,
         discovery_url: str | None = None,
         upstream_url: str | None = None,
+        genrm_backend_handle: Any | None = None,
         timeout: float = 1800.0,
     ) -> None:
         self.role = Role(role)
         self.snapshot_provider = snapshot_provider
         self.manager_handles = dict(manager_handles or {})
+        self.role_manager_handle = role_manager_handle
         self.discovery_url = discovery_url.rstrip("/") if discovery_url else None
         self.upstream_url = upstream_url.rstrip("/") if upstream_url else None
+        self.genrm_backend_handle = genrm_backend_handle
         self._client = httpx.AsyncClient(timeout=timeout, limits=httpx.Limits(max_connections=2048))
         self._logger = get_logger(__name__)
 
     async def _snapshot(self) -> RoleSnapshot:
+        if self.role_manager_handle is not None:
+            return await asyncio.to_thread(ray.get, self.role_manager_handle.get_role_snapshot.remote())
         if self.manager_handles:
             refs = [
                 manager.get_discovery_snapshot.remote(
@@ -87,9 +94,13 @@ class InferenceGateway:
             models = tuple(model for snapshot in snapshots for model in snapshot.models)
             route_key_to_model = tuple((model_id, model_id) for model_id in self.manager_handles)
             default_model = next(iter(self.manager_handles)) if len(self.manager_handles) == 1 else None
+            epochs = sorted(
+                (model_id, snapshot.manager_epoch)
+                for model_id, snapshot in zip(self.manager_handles, snapshots, strict=True)
+            )
             return RoleSnapshot(
                 role=self.role,
-                manager_epoch=max((snapshot.manager_epoch for snapshot in snapshots), default="gateway"),
+                manager_epoch=hashlib.sha256(json.dumps(epochs).encode()).hexdigest(),
                 topology_revision=max((snapshot.topology_revision for snapshot in snapshots), default=0),
                 models=models,
                 routing=RoutingSpec(default_model=default_model, route_key_to_model=route_key_to_model),
@@ -108,6 +119,10 @@ class InferenceGateway:
         return role_snapshot_from_dict(response.json())
 
     async def _target(self, payload: Mapping[str, Any] | None = None) -> str:
+        target, _ = await self._resolve_target(payload)
+        return target
+
+    async def _resolve_target(self, payload: Mapping[str, Any] | None = None) -> tuple[str, str]:
         snapshot = await self._snapshot()
         payload = payload or {}
         try:
@@ -117,11 +132,11 @@ class InferenceGateway:
                 route_key=payload.get("route_key"),
             )
             try:
-                return select_target(model).base_url.rstrip("/")
+                return select_target(model).base_url.rstrip("/"), model.model_id
             except RoutingError:
                 if self.role == Role.GENRM and model.admission and model.state and model.state.value == "ready":
                     if self.upstream_url:
-                        return self.upstream_url
+                        return self.upstream_url, model.model_id
                 raise
         except RoutingError as exc:
             raise HTTPException(
@@ -172,14 +187,38 @@ class InferenceGateway:
         if not isinstance(payload, dict):
             return _json_error(400, "Request body must be a JSON object", code="invalid_request")
 
+        messages_request = self.role == Role.GENRM and path == "generate" and "messages" in payload
+        if messages_request and ("input_ids" in payload or "text" in payload):
+            return _json_error(400, "messages cannot be combined with input_ids or text", code="invalid_request")
+        if messages_request and (
+            not isinstance(payload["messages"], list)
+            or (payload.get("sampling_params") is not None and not isinstance(payload["sampling_params"], dict))
+        ):
+            return _json_error(400, "Invalid messages or sampling_params", code="invalid_request")
+
         try:
-            target = await self._target(payload)
+            target, model_id = await self._resolve_target(payload)
         except HTTPException as exc:
             return _json_error(
                 exc.status_code, str(exc.detail), code="unavailable" if exc.status_code == 503 else "routing_error"
             )
 
-        return await self._forward(request, path, target, body)
+        payload.pop("route_key", None)
+        if path == "generate":
+            payload.pop("model", None)
+        wrap_response = False
+        if messages_request:
+            if target == self.upstream_url:
+                # The legacy backend owns both adaptation and response formatting.
+                payload["route_key"] = model_id
+            else:
+                if self.genrm_backend_handle is None:
+                    return _json_error(503, "GenRM adapter is not configured", code="unavailable")
+                payload = await self.genrm_backend_handle.prepare_generate_payload.remote(
+                    model_id, payload["messages"], payload.get("sampling_params")
+                )
+                wrap_response = True
+        return await self._forward(request, path, target, json.dumps(payload).encode(), wrap_response=wrap_response)
 
     async def proxy_backend(self, request: Request, path: str) -> Response:
         """Forward role control-plane endpoints to the internal service."""
@@ -187,11 +226,13 @@ class InferenceGateway:
             return _json_error(404, "Gateway backend is not configured", code="backend_unavailable")
         return await self._forward(request, path, self.upstream_url, await request.body())
 
-    async def _forward(self, request: Request, path: str, target: str, body: bytes) -> Response:
+    async def _forward(
+        self, request: Request, path: str, target: str, body: bytes, *, wrap_response: bool = False
+    ) -> Response:
         headers = {
             key: value
             for key, value in request.headers.items()
-            if key.lower() not in _HOP_BY_HOP_HEADERS and key.lower() != "host"
+            if key.lower() not in _HOP_BY_HOP_HEADERS and key.lower() not in {"host", "content-length"}
         }
         headers[GATEWAY_REQUEST_HEADER] = "1"
         upstream_url = f"{target}/{path.lstrip('/')}"
@@ -209,10 +250,11 @@ class InferenceGateway:
             response_headers = {
                 key: value for key, value in response.headers.items() if key.lower() not in _HOP_BY_HOP_HEADERS
             }
-            if self.role == Role.GENRM and path == "generate" and response.is_success:
+            if wrap_response and response.is_success:
                 data = json.loads(content)
-                if "response" not in data and "text" in data:
-                    data = {"response": data["text"]}
+                data = {"response": data.get("text", "").strip()}
+                response_headers.pop("content-length", None)
+                response_headers.pop("content-encoding", None)
                 return JSONResponse(data, status_code=response.status_code, headers=response_headers)
             return Response(
                 content=content, status_code=response.status_code, headers=response_headers, media_type=None

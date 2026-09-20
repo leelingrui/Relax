@@ -136,6 +136,19 @@ def _pick_teacher_url(args, sample=None) -> str:
     return args.opd_teacher_url
 
 
+def _teacher_request_target(args, sample, payload: dict) -> tuple[str, dict]:
+    # Validate legacy routing even when the actual request uses the Gateway.
+    teacher_url = _pick_teacher_url(args, sample)
+    gateway_url = getattr(args, "opd_teacher_gateway_url", None)
+    if not gateway_url:
+        return teacher_url, payload
+    payload = dict(payload)
+    if getattr(args, "opd_teacher_routes_map", None):
+        key_field = getattr(args, "opd_teacher_key", None) or "data_source"
+        payload["route_key"] = sample.metadata[key_field]
+    return f"{gateway_url.rstrip('/')}/generate", payload
+
+
 class OpdManager:
     def __init__(self, args):
         self.args = args
@@ -312,7 +325,7 @@ class OpdManager:
             if mm_fields:
                 payload.update(mm_fields)
 
-        teacher_url = _pick_teacher_url(self.args, sample)
+        teacher_url, payload = _teacher_request_target(self.args, sample, payload)
         resp_obj = await self._post_logprob(session, teacher_url, payload, sample, "teacher prefill")
         if resp_obj is None:
             return False

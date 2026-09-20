@@ -258,3 +258,44 @@ async def test_genrm_endpoint_preserves_route_and_strips_response():
 
     assert result.response == "score"
     replica._call_engine.assert_awaited_once_with("quality", request.messages, {"temperature": 0.1})
+
+
+@pytest.mark.asyncio
+async def test_genrm_prepare_payload_uses_instance_tokenizer_and_defaults():
+    from unittest.mock import Mock
+
+    cls = genrm_module.GenRM.func_or_class
+    replica = object.__new__(cls)
+    replica.genrm_managers = {"quality": object(), "safety": object()}
+    replica.instance_specs = {
+        "quality": {"sampling_config": {}},
+        "safety": {
+            "sampling_config": {
+                "temperature": 0.4,
+                "top_p": 0.8,
+                "top_k": 20,
+                "max_response_len": 512,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+        },
+    }
+    replica.tokenizers = {
+        "quality": SimpleNamespace(apply_chat_template=Mock(return_value=[1])),
+        "safety": SimpleNamespace(apply_chat_template=Mock(return_value={"input_ids": [2, 3]})),
+    }
+    messages = [genrm_module.Message(role="user", content="judge")]
+    payload = await replica.prepare_generate_payload("safety", messages, {"temperature": 0.1})
+    assert payload == {
+        "input_ids": [2, 3],
+        "sampling_params": {"temperature": 0.1, "top_p": 0.8, "top_k": 20, "max_new_tokens": 512},
+    }
+    replica.tokenizers["safety"].apply_chat_template.assert_called_once_with(
+        [{"role": "user", "content": "judge"}],
+        tokenize=True,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    replica.tokenizers["quality"].apply_chat_template.assert_not_called()
+    assert replica.instance_specs["safety"]["sampling_config"]["temperature"] == 0.4
+    payload = await replica.prepare_generate_payload("quality", messages)
+    assert payload["sampling_params"] == {"temperature": 0.2, "top_p": 1.0, "top_k": -1, "max_new_tokens": 1024}

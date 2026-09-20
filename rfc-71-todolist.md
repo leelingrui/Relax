@@ -57,7 +57,7 @@
 - [x] 保留 Rollout 聊天接口；允许 OPD 使用原始引擎 URL 或 Gateway URL。
 - [x] 休眠、排空或未就绪模型拒绝推理请求；返回 503 和重试指引，不自动唤醒。
 - [x] 将现有 Rollout/GenRM HTTP 入口接到 Gateway，避免产生重复路由或重复部署；Teacher 直连入口暂保留兼容路径。
-- [ ] 在 Controller/Service 启动链路注册并部署每个 role 的 Gateway 实例；Rollout/GenRM 已自动部署，Teacher 需等待 Router/模型注册路径完成后再接入。
+- [x] 在 Controller/Service 启动链路注册并部署每个 role 的 Gateway 实例；Phase 3 已补齐 Teacher Router、模型注册与 Gateway 接线。
 
 验收：
 
@@ -69,15 +69,47 @@
 
 目标：抽取公共引擎管理实现，保留旧 managers 的兼容门面。
 
-- [ ] 定义内部 Role/Model/EngineGroup/Replica spec，由现有配置转换，不新增统一用户配置体系。
-- [ ] 实现模型注册、路由配置、InferenceManager 引擎池、地址、健康、恢复、显存操作和关闭能力。
-- [ ] 明确逻辑副本与节点 actor 的对应关系。
-- [ ] 根据 weight source、route mode 等能力配置决定权重同步、DCS 与 Router 行为。
-- [ ] 合并 GenRM 专用引擎初始化到公共 SGLangEngine 路径。
-- [ ] 静态模型禁止注册 DCS 和参与动态策略权重更新。
-- [ ] 迁移 GenRM/Teacher 管理逻辑；Rollout 逐步委托公共实现，暂保留 workload 外壳。
-- [ ] 保留现有 Rollout 伸缩、故障恢复和权重同步能力。
-- [ ] 建立拓扑发布顺序：初始化、健康检查、必要权重同步、Router 更新完成后，再原子发布快照。
+- [x] 定义内部 Role/Model/EngineGroup/Replica spec，由现有配置转换，不新增统一用户配置体系。
+- [x] 实现模型注册、路由配置、InferenceManager 引擎池、地址、健康、恢复、显存操作和关闭能力。
+- [x] 明确逻辑副本与节点 actor 的对应关系。
+- [x] 根据 weight source、route mode 等能力配置决定权重同步、DCS 与 Router 行为。
+- [x] 合并 GenRM 专用引擎初始化到公共 SGLangEngine 路径。
+- [x] 静态模型禁止注册 DCS 和参与动态策略权重更新。
+- [x] 迁移 GenRM/Teacher 管理逻辑；Rollout 逐步委托公共实现，暂保留 workload 外壳。
+- [x] 保留现有 Rollout 伸缩、故障恢复和权重同步能力（CPU 回归通过，真实集群验证见下）。
+- [x] 建立拓扑发布顺序：初始化、健康检查、必要权重同步、Router 更新完成后，再原子发布快照。
+
+实现细分进度（包含 review 后结构收敛；不以 mock 测试替代硬件验收）：
+
+- [x] 将旧 ModelConfig/EngineGroupConfig 提取为三角色公共配置，删除 model_spec_from_rollout 转换；EngineGroupSpec 仅保存组标识与副本节点拓扑，不重复并行参数或 overrides。
+- [x] 实现公共模型注册、路由校验及 preparation 发布屏障，拒绝迟到的完成结果。
+- [x] GenRM/Teacher 的 health_check、recover、onload/offload、shutdown 经旧门面委托 InferenceManager；底层 RPC、放置和重建仍复用 MultiEngineManager。
+- [x] 多节点 shutdown 覆盖 follower actor；部分显存恢复不开放 discovery 准入，且仍允许清理显存。
+- [x] 补齐 Phase 2 延后接线：Teacher/GenRM 专用 Router、Teacher Gateway、即时 OPD/MOPD Gateway 路由和 GenRM messages/response 适配，保留原始地址与旧协议路径。
+- [x] GenRM/Teacher 每角色一个 CPU InferenceRoleManager，内部 ModelPool 共享模型注册、路由、生命周期与 discovery 状态；旧命名 actor 只转发，不另存模型状态。
+- [x] EngineGroupSpec 驱动运行时引擎创建；稳定副本身份及 PD Router 服务投影接入公共快照。
+- [x] Rollout 专用运行时适配，保留 weights/KV 分阶段恢复、权重锁、恢复五元组和伸缩协议。
+- [x] 实际初始化、健康检查、权重版本及 Router 注册结果接入 preparation 发布屏障；发现 default/缺失/不一致版本时不开放准入。
+- [x] 三类引擎池统一恢复与关闭的 CPU 回归；覆盖迟到观测、卸载中刷新、目标版本保护、关闭终态、多节点 follower、部分初始化失败及兼容门面。
+- [ ] 真实 Ray/Router、多节点 GPU 集成验证：未提供 RAY_ADDRESS、模型与硬件配置，本轮未运行远程训练，不能据 CPU/mock 回归勾选。
+
+本批验证：distributed/ray、engine/inference、backends/sglang、GenRM/Gateway 与即时 OPD 路由相关 CPU 回归 618 passed。训练侧权重同步、HTTP/排空及原参数兼容补充回归 73 passed、1 skipped：现有 test_sft_train_actor_eval.py 导入已不存在的 \_should_run_sft_eval，整模块跳过，不计为 SFT 验证通过。本次改动文件的 pre-commit（含 gitleaks）及 git diff --check 通过。使用获准的本地沙箱外执行解决 Ray/psutil 读取进程及 gitleaks 缓存权限问题；不涉及远程集群。
+
+Review 调用顺序：
+
+本轮 review 后的结构收敛：
+
+- [x] 复用公共 ModelConfig/EngineGroupConfig，删除 Rollout 到第二套模型配置的转换；副本拓扑单独表达。注册定义、操作去重参数及返回值深拷贝隔离调用方的可变配置。
+- [x] 生命周期串行化集中到 InferenceManager，移除角色宿主重复锁；忙碌请求在兼容门面异步等待，不占满角色 RPC 线程。Rollout 本地调用保留同步等待；状态锁不跨远端 RPC，关闭/Router 清理锁仅用于清理路径。
+- [x] 三角色接入 UnifiedServiceManager 与通用 ModelPool；去掉 GenRMModelPool/TeacherModelPool 类。GenRMEngineAdapter/TeacherEngineAdapter 保留后端放置、端口、参数及旧地址接口，静态引擎状态和生命周期统一委托 MultiEngineManager；Rollout 后端保留伸缩与权重栅栏。
+- [x] 完成配置、共享池、并发控制及旧调用链 CPU 回归和本次文件 pre-commit 检查。结构收敛后联合回归 640 passed；训练侧补充回归 73 passed、1 skipped（仍为上述 SFT 旧符号导入问题）。本轮文件 pre-commit 全部通过，git diff --check 通过；未做吞吐/延迟性能基准，不将并发正确性测试表述为无性能损耗证明。
+
+当前调用顺序：
+
+1. GenRM/Teacher 启动：现有配置工厂 → create_role_managers → InferenceRoleManager → 创建 CPU ModelPool 并 register_model/bind_pool → configure_routes → pool.initialize → SGLangEngine.init → 健康/Router 观测 → commit_observation → Gateway 读取角色快照。
+2. 旧控制入口：命名 ModelManagerFacade → 统一宿主 call → InferenceManager.dispatch（唯一模型操作锁）→ ModelPool → 后端 → 公共生命周期方法 → 节点 actor RPC。同线程重入同一把锁，不再外层套第二把模型锁；snapshot 独立并发组。
+3. Rollout：ModelConfig.resolved → 注册与路由 → EngineGroup.start_engines → ModelPool.from_runtime → UnifiedServiceManager；生命周期经 call_wait 进入公共 dispatch，保留旧五元组及伸缩协议。权重同步后 refresh_inference_state 收集健康、版本和 Router 证据再发布。
+4. 关闭：先关闭模型准入 → 关闭所有节点 actor → 清理自有 PG；角色全部模型关闭后再停止该角色 Router，保留借用 PG。完整资源规划/回滚仍归 Phase 4，请求 permit 与排空协调仍归 Phase 5，RolloutWorkload 完整拆分归 Phase 6。
 
 验收：
 
@@ -190,7 +222,7 @@
 - 迁移所有框架内裸引擎调用；defer 外部调用仅使用 Gateway。无法控制准入和排空的外部裸 URL 服务不得加入 defer 共享资源计划。
 - `direct_eligible=false` 不等于网络隔离，部署访问边界也要落实。Manager epoch 也不能自动阻止任意裸 HTTP 请求。
 - 当前 Gateway 不把 `direct_eligible` 作为 Router 请求条件，也不从 discovery 的 replica 地址选择直连目标；Router 缺失时直接返回 503。
-- Managed Teacher 当前仍向 OPD 注入原始 engine URL，作为非 defer/兼容路径；TeacherManager 当前不注册 Router，因此后续阶段必须先完成 Teacher 的 Router/模型注册与准入，再迁移 defer 请求。
+- Phase 3 已为 Managed Teacher 注册专用 Router 并接入角色 Gateway；即时 OPD/MOPD 默认使用 Gateway，原始 engine URL 仅保留为兼容元数据。defer 的请求许可与排空协议仍待 Phase 5。
 - 后续如开放 direct，必须单独定义直连准入和排空协议；当前不由 Phase 1 路由函数处理。
 - discovery 是观测快照，不预留资源使用权。
 

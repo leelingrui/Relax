@@ -124,12 +124,13 @@ def snapshot_from_engine_urls(
     direct_eligible: bool = False,
     required_weight_version: str | None = None,
     phase: str | None = None,
+    replica_state: LifecycleState = LifecycleState.STARTING,
 ) -> RoleSnapshot:
     """Adapt GenRM/Teacher URL lists that have no legacy group structure."""
     model = ModelSnapshot(
         model_id=model_id,
         replicas=tuple(
-            ReplicaSnapshot(engine_id=f"{model_id}/replica-{rank}", state=LifecycleState.STARTING, base_url=url)
+            ReplicaSnapshot(engine_id=f"{model_id}/replica-{rank}", state=replica_state, base_url=url)
             for rank, url in enumerate(urls)
         ),
         router_url=router_url,

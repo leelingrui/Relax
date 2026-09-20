@@ -718,12 +718,14 @@ class TestLegacyDiscoveryContract:
         manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
         manager.manager_epoch = "epoch-test"
 
+        manager.refresh_inference_state()
         initial = manager.get_discovery_snapshot()
         group.all_engines[1] = make_mock_engine()
+        assert manager.get_discovery_snapshot() == initial
+        manager.refresh_inference_state()
         updated = manager.get_discovery_snapshot()
 
-        assert initial.topology_revision == 0
-        assert updated.topology_revision == 1
+        assert updated.topology_revision > initial.topology_revision
 
     def test_rollout_discovery_rpc_failure_still_reports_active(self, patch_ray_get):
         engine = make_mock_engine()

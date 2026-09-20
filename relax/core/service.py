@@ -119,6 +119,7 @@ class Service:
                 self.role,
                 discovery_url=backend_url,
                 upstream_url=backend_url,
+                genrm_backend_handle=self.handle if self.role == "genrm" else None,
             )
             self.gateway_handle = serve.run(gateway, name=self._gateway_name, route_prefix=f"/{self.role}")
             logger.info(f"[{self.role}] CPU InferenceGateway deployed at /{self.role}; backend={backend_prefix}")

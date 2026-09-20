@@ -1,13 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""``_start_managed_multi_teacher`` was rewritten to delegate the GPU-budget
-carve-up to the domain-agnostic ``start_multi_instance_managers`` helper (also
-used by GenRM's multi-instance path).
-
-This must not change MOPD's observable
-contract: equal-split validation, one TeacherManager per data_source at a
-non-overlapping bundle_offset, and a ``(pg, list[manager])`` return shape.
-"""
+"""Role-manager migration preserves MOPD offsets, URLs and legacy handles."""
 
 import json
 import sys
@@ -16,7 +9,10 @@ from types import ModuleType
 
 
 def _install_fake_teacher_manager(monkeypatch, captured):
-    teacher_manager_module = ModuleType("relax.distributed.ray.teacher_manager")
+    from relax.utils.opd import opd_utils
+
+    monkeypatch.setattr(opd_utils, "_deploy_teacher_gateway", lambda managers: "http://gateway/teacher")
+    teacher_manager_module = ModuleType("relax.distributed.ray.inference_role")
 
     class _RemoteMethod:
         def __init__(self, name, owner):
@@ -33,25 +29,17 @@ def _install_fake_teacher_manager(monkeypatch, captured):
             self.get_urls = _RemoteMethod("get_urls", key)
             self.offload = _RemoteMethod("offload", key)
 
-    class _TeacherManagerActor:
-        @classmethod
-        def options(cls, **options):
-            return cls
+    def create_role_managers(args, role, pool_configs, **kwargs):
+        assert role == "teacher"
+        handles = {}
+        for model_id, config in pool_configs.items():
+            key = config["args"][0].teacher_hf_checkpoint
+            captured["ctor_calls"][key] = config["kwargs"]
+            handles[model_id] = _TeacherManagerHandle(key)
+        return handles
 
-        @classmethod
-        def remote(cls, args, num_replicas, gpus_per_replica, *, pg, shared_pg, bundle_offset):
-            key = args.teacher_hf_checkpoint
-            captured["ctor_calls"][key] = {
-                "num_replicas": num_replicas,
-                "gpus_per_replica": gpus_per_replica,
-                "pg": pg,
-                "shared_pg": shared_pg,
-                "bundle_offset": bundle_offset,
-            }
-            return _TeacherManagerHandle(key)
-
-    teacher_manager_module.TeacherManager = _TeacherManagerActor
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.teacher_manager", teacher_manager_module)
+    teacher_manager_module.create_role_managers = create_role_managers
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.inference_role", teacher_manager_module)
 
 
 def _base_args(**overrides):

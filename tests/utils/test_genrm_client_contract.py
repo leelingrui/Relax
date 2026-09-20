@@ -79,6 +79,4 @@ def test_genrm_client_reads_v2_discovery(status_filter: str | None) -> None:
     expected_params = {"schema_version": 2}
     if status_filter is not None:
         expected_params["status_filter"] = status_filter
-    client._sync_client.get.assert_called_once_with(
-        "http://genrm.test/genrm/engines", params=expected_params
-    )
+    client._sync_client.get.assert_called_once_with("http://genrm.test/genrm/engines", params=expected_params)

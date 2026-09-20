@@ -441,6 +441,25 @@ def test_genrm_engine_defaults_to_checkpoint_weights(sglang_engine_module):
     assert engine.weight_source == sglang_engine_module.WeightSource.CHECKPOINT
 
 
+def test_genrm_engine_registers_its_model_router_without_dcs(monkeypatch, sglang_engine_module):
+    from unittest.mock import MagicMock
+
+    module = sglang_engine_module
+    engine = module.GenRMEngine(SimpleNamespace(rollout_external=False), rank=0)
+    monkeypatch.setattr(
+        module,
+        "_compute_genrm_server_args",
+        lambda *args, **kwargs: ({"node_rank": 0, "host": "worker", "port": 8000}, []),
+    )
+    engine._init_normal = MagicMock()
+    engine.register_dcs = MagicMock()
+    engine.init("worker:8001", 8000, 8002, router_ip="judge-router", router_port=3100)
+    assert engine.router_ip == "judge-router"
+    assert engine.router_port == 3100
+    assert engine._skip_router_registration is False
+    engine.register_dcs.assert_not_called()
+
+
 @pytest.mark.parametrize("worker_type", ["regular", "prefill", "decode"])
 def test_router_registration_preserves_pd_bootstrap_payload(monkeypatch, sglang_engine_module, worker_type):
     from unittest.mock import MagicMock
@@ -456,6 +475,111 @@ def test_router_registration_preserves_pd_bootstrap_payload(monkeypatch, sglang_
     if worker_type == "prefill":
         payload["bootstrap_port"] = 9000
     post.assert_called_once_with("http://router:30000/workers", json=payload, timeout=30)
+
+
+@pytest.mark.parametrize("version", [None, "", "default"])
+def test_inference_observation_policy_unknown_version_does_not_register(monkeypatch, sglang_engine_module, version):
+    from unittest.mock import MagicMock
+
+    engine = _make_engine(sglang_engine_module)
+    engine.health_generate = MagicMock(return_value=True)
+    get = MagicMock(return_value=_Response(200, {"weight_version": version}))
+    post = MagicMock()
+    monkeypatch.setattr(sglang_engine_module.requests, "get", get)
+    monkeypatch.setattr(sglang_engine_module.requests, "post", post)
+
+    observation = engine.get_inference_observation(ensure_router=True)
+
+    assert observation == {
+        "base_url": "http://worker:8000",
+        "healthy": True,
+        "router_registered": False,
+        "weight_version": version,
+    }
+    engine.health_generate.assert_called_once_with(timeout=5.0)
+    get.assert_called_once_with("http://worker:8000/get_weight_version", timeout=5.0)
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize("ensure_router", [False, True])
+def test_inference_observation_policy_valid_version_registers_when_requested(
+    monkeypatch, sglang_engine_module, ensure_router
+):
+    from unittest.mock import MagicMock
+
+    engine = _make_engine(sglang_engine_module)
+    engine.health_generate = MagicMock(return_value=True)
+    get = MagicMock(return_value=_Response(200, {"weight_version": "v1"}))
+    post = MagicMock(return_value=_Response(200, {"worker_id": "worker-id"}))
+    monkeypatch.setattr(sglang_engine_module.requests, "get", get)
+    monkeypatch.setattr(sglang_engine_module.requests, "post", post)
+
+    observation = engine.get_inference_observation(ensure_router=ensure_router)
+
+    assert observation["healthy"] is True
+    assert observation["weight_version"] == "v1"
+    assert observation["router_registered"] is ensure_router
+    get.assert_called_once_with("http://worker:8000/get_weight_version", timeout=5.0)
+    if ensure_router:
+        post.assert_called_once_with(
+            "http://router:30000/workers",
+            json={"url": "http://worker:8000", "worker_type": "regular"},
+            timeout=30,
+        )
+        engine.get_inference_observation(ensure_router=True)
+        assert post.call_count == 1
+    else:
+        post.assert_not_called()
+
+
+def test_inference_observation_checkpoint_registers_without_weight_version(monkeypatch, sglang_engine_module):
+    from unittest.mock import MagicMock
+
+    engine = _make_engine(sglang_engine_module)
+    engine.weight_source = sglang_engine_module.WeightSource.CHECKPOINT
+    engine.health_generate = MagicMock(return_value=True)
+    get = MagicMock()
+    post = MagicMock(return_value=_Response(200, {"worker_id": "worker-id"}))
+    monkeypatch.setattr(sglang_engine_module.requests, "get", get)
+    monkeypatch.setattr(sglang_engine_module.requests, "post", post)
+
+    observation = engine.get_inference_observation(ensure_router=True)
+
+    assert observation["healthy"] is True
+    assert observation["weight_version"] is None
+    assert observation["router_registered"] is True
+    get.assert_not_called()
+    post.assert_called_once_with(
+        "http://router:30000/workers",
+        json={"url": "http://worker:8000", "worker_type": "regular"},
+        timeout=30,
+    )
+
+
+@pytest.mark.parametrize("weight_source", ["policy", "checkpoint"])
+@pytest.mark.parametrize("failure", ["http_error", "connection_error"])
+def test_inference_observation_registration_failure_has_no_ready_evidence(
+    monkeypatch, sglang_engine_module, weight_source, failure
+):
+    from unittest.mock import MagicMock
+
+    engine = _make_engine(sglang_engine_module)
+    engine.weight_source = sglang_engine_module.WeightSource(weight_source)
+    engine.health_generate = MagicMock(return_value=True)
+    get = MagicMock(return_value=_Response(200, {"weight_version": "v1"}))
+    post = MagicMock(return_value=_Response(503))
+    if failure == "connection_error":
+        post.side_effect = sglang_engine_module.requests.exceptions.ConnectionError("router unavailable")
+    monkeypatch.setattr(sglang_engine_module.requests, "get", get)
+    monkeypatch.setattr(sglang_engine_module.requests, "post", post)
+
+    observation = engine.get_inference_observation(ensure_router=True)
+
+    assert observation["healthy"] is True
+    assert observation["weight_version"] == ("v1" if weight_source == "policy" else None)
+    assert observation["router_registered"] is False
+    assert engine._router_registered is False
+    post.assert_called_once()
 
 
 @pytest.mark.parametrize("external", [False, True])

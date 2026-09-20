@@ -360,6 +360,7 @@ class SGLangEngine(RayActor):
         self._evicted = threading.Event()
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
+        self._router_registered = False
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -405,6 +406,7 @@ class SGLangEngine(RayActor):
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
         self._skip_router_registration = skip_router_registration
+        self._disaggregation_bootstrap_port = disaggregation_bootstrap_port
 
         host = host or get_host_info()[1]
 
@@ -562,7 +564,8 @@ class SGLangEngine(RayActor):
         )
         # Only register to router if skip_router_registration=False
         if not self._skip_router_registration:
-            self.register_to_router(bootstrap_port=bootstrap_port)
+            if not self.register_to_router(bootstrap_port=bootstrap_port):
+                raise RuntimeError("SGLang engine initialization failed to register with its Router")
 
     def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
         """Make a POST request to the specified endpoint with the given
@@ -860,6 +863,7 @@ class SGLangEngine(RayActor):
             return True
 
         worker_url = f"http://{self.server_host}:{self.server_port}"
+        self._router_registered = False
         try:
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
                 if self.worker_type != "regular":
@@ -909,6 +913,7 @@ class SGLangEngine(RayActor):
                 if self._router_worker_id is None:
                     logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
             self._router_unregister_submitted = False
+            self._router_registered = True
             logger.info(f"Registered engine {worker_url} to router {self.router_ip}:{self.router_port}")
             return True
         except Exception as e:
@@ -942,6 +947,7 @@ class SGLangEngine(RayActor):
             time.sleep(0.5)
 
     def unregister_from_router(self, wait_for_removal: bool = False, timeout: float = 30.0) -> bool:
+        self._router_registered = False
         if self.node_rank != 0 or not self.router_ip or not self.router_port:
             return True
         worker_url = f"http://{self.server_host}:{self.server_port}"
@@ -1032,6 +1038,29 @@ class SGLangEngine(RayActor):
         response = requests.get(url)
         response.raise_for_status()
         return response.json()["weight_version"]
+
+    def get_inference_observation(self, ensure_router: bool = False) -> dict:
+        """Return bounded runtime evidence for Manager topology publication."""
+        healthy = self.health_generate(timeout=5.0)
+        version = None
+        if healthy and self.node_rank == 0 and self.weight_source == WeightSource.POLICY:
+            response = requests.get(f"http://{self.server_host}:{self.server_port}/get_weight_version", timeout=5.0)
+            response.raise_for_status()
+            version = response.json().get("weight_version")
+        if (
+            ensure_router
+            and healthy
+            and self.node_rank == 0
+            and (self.weight_source != WeightSource.POLICY or version not in (None, "", "default"))
+            and not getattr(self, "_router_registered", False)
+        ):
+            self.register_to_router(bootstrap_port=getattr(self, "_disaggregation_bootstrap_port", None))
+        return {
+            "base_url": self.get_url(),
+            "healthy": healthy,
+            "router_registered": getattr(self, "_router_registered", False),
+            "weight_version": version,
+        }
 
     def release_memory_occupation(self):
         self.flush_cache()
@@ -1437,7 +1466,16 @@ class GenRMEngine(SGLangEngine):
         kwargs.pop("num_gpus_per_engine", None)
         return _compute_genrm_server_args(*args, **kwargs)
 
-    def init(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None):
+    def init(
+        self,
+        dist_init_addr,
+        port,
+        nccl_port,
+        host=None,
+        disaggregation_bootstrap_port=None,
+        router_ip="",
+        router_port=0,
+    ):
         """Compatibility facade for the common static-engine startup path."""
         return super().init(
             dist_init_addr,
@@ -1445,10 +1483,10 @@ class GenRMEngine(SGLangEngine):
             nccl_port,
             host=host,
             disaggregation_bootstrap_port=disaggregation_bootstrap_port,
-            router_ip="",
-            router_port=0,
+            router_ip=router_ip,
+            router_port=router_port,
             skip_dcs_registration=True,
-            skip_router_registration=True,
+            skip_router_registration=not bool(router_ip and router_port),
         )
 
     def release_memory_occupation(self):

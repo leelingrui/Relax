@@ -23,6 +23,8 @@ def _install_teacher_manager_stubs(monkeypatch):
 
     rollout = ModuleType("relax.distributed.ray.rollout")
     rollout._allocate_rollout_engine_addr_and_ports_normal = MagicMock()
+    rollout._start_router = MagicMock(return_value=("teacher-router", 3100))
+    rollout.stop_launched_routers = MagicMock()
 
     ray_utils = ModuleType("relax.distributed.ray.utils")
     ray_utils.NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = []
@@ -114,11 +116,13 @@ def test_teacher_manager_exposes_ray_actor_api(monkeypatch):
 
     assert hasattr(teacher_manager.TeacherManager, "remote")
     assert hasattr(teacher_manager.TeacherManager, "options")
+    for method in ("onload", "offload", "health_check", "recover", "shutdown", "is_onloaded", "get_urls"):
+        assert method in teacher_manager.TeacherManager.__ray_metadata__.method_meta.methods
 
 
 def test_teacher_recovery_reuses_original_endpoint(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
-    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager_cls = teacher_manager.TeacherEngineAdapter
     manager = object.__new__(manager_cls)
     manager._shared_pg = True
     original = {
@@ -139,7 +143,7 @@ def test_teacher_recovery_reuses_original_endpoint(monkeypatch):
 
 def test_dedicated_teacher_recovery_requires_global_restart(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
-    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager_cls = teacher_manager.TeacherEngineAdapter
     manager = object.__new__(manager_cls)
     manager._shared_pg = False
     manager.all_engines = [None]
@@ -151,7 +155,7 @@ def test_dedicated_teacher_recovery_requires_global_restart(monkeypatch):
 @pytest.mark.parametrize("shared", [False, True])
 def test_teacher_placement_preserves_owner_and_bundle_mapping(monkeypatch, shared):
     module = _import_teacher_manager(monkeypatch)
-    cls = module.TeacherManager.__ray_metadata__.modified_class
+    cls = module.TeacherEngineAdapter
     manager = object.__new__(cls)
     manager.args = SimpleNamespace(rollout_num_gpus=4, enable_affinity=False)
     manager.gpus_per_replica = 2
@@ -172,22 +176,36 @@ def test_teacher_placement_preserves_owner_and_bundle_mapping(monkeypatch, share
         module.create_placement_group.assert_called_once_with(num_gpus=2, node_group_affinity=False)
 
 
-def test_teacher_init_never_registers_static_weights_with_dcs_or_router(monkeypatch):
+def test_teacher_init_uses_own_router_without_dcs(monkeypatch):
     module = _import_teacher_manager(monkeypatch)
-    cls = module.TeacherManager.__ray_metadata__.modified_class
+    cls = module.TeacherEngineAdapter
     manager = object.__new__(cls)
+    manager.router_ip = "teacher-router"
+    manager.router_port = 3100
     addr = {"host": "teacher.test", "port": 15000, "nccl_port": 15001, "dist_init_addr": "teacher.test:15002"}
     result = manager._build_engine_init_kwargs(0, addr)
     assert result == dict(
-        addr, router_ip=None, router_port=None, skip_dcs_registration=True, skip_router_registration=True
+        addr, router_ip="teacher-router", router_port=3100, skip_dcs_registration=True, skip_router_registration=False
     )
     assert "skip_dcs_registration" not in addr
 
 
 def test_teacher_constructor_declares_checkpoint_weight_source(monkeypatch):
     module = _import_teacher_manager(monkeypatch)
-    cls = module.TeacherManager.__ray_metadata__.modified_class
+    cls = module.TeacherEngineAdapter
     manager = object.__new__(cls)
     manager._overrides = {}
     manager.gpus_per_replica = 2
     assert manager._build_engine_ctor_kwargs(0)["weight_source"] == "checkpoint"
+
+
+def test_teacher_shutdown_cleans_router_even_if_engine_cleanup_fails(monkeypatch):
+    module = _import_teacher_manager(monkeypatch)
+    cls = module.TeacherEngineAdapter
+    manager = object.__new__(cls)
+    manager._owns_inference_manager = True
+    manager.backend = object.__new__(module.MultiEngineManager)
+    monkeypatch.setattr(module.MultiEngineManager, "shutdown", MagicMock(side_effect=RuntimeError("cleanup")))
+    with pytest.raises(RuntimeError, match="cleanup"):
+        manager.shutdown()
+    sys.modules["relax.distributed.ray.rollout"].stop_launched_routers.assert_called_once()

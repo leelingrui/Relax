@@ -7,14 +7,19 @@ This module implements a simplified manager for genRM engines, built on top of
 onload/offload) with GenRM-specific placement and engine wiring.
 """
 
+import copy
 import logging
 
 import ray
 
 from relax.backends.sglang.sglang_engine import GenRMEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.distributed.ray.model_pool import ModelPool
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager, _is_engine_dead  # noqa: F401
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from relax.engine.inference.capabilities import WeightSource
+from relax.engine.inference.manager import InferenceManager
+from relax.engine.inference.types import Role
 from relax.utils.http_utils import init_http_client
 from relax.utils.logging_utils import get_logger
 
@@ -29,17 +34,26 @@ _GENRM_PORT_WINDOW_SIZE = 1000
 _MAX_PORT = 65535
 
 
-@ray.remote
-class GenRMManager(MultiEngineManager):
-    """Manager for GenRM engines.
+class GenRMEngineAdapter:
+    """GenRM placement, ports and engine environment configuration."""
 
-    This is a simplified version of RolloutManager focused on:
-    - Initializing genRM engines
-    - Health checking
-    - Onload/offload operations
-    """
+    inference_role = Role.GENRM
+    inference_weight_source = WeightSource.CHECKPOINT
 
-    def __init__(self, args, pg, bundle_offset: int = 0, port_window_index: int = 0):
+    def __init__(
+        self,
+        args,
+        pg,
+        bundle_offset: int = 0,
+        port_window_index: int = 0,
+        *,
+        inference_manager: InferenceManager | None = None,
+        model_id: str = "default",
+        defer_init: bool = False,
+    ):
+        args = copy.copy(args)
+        args.use_slime_router = False
+        self.args = args
         init_http_client(args)
 
         num_gpu_per_engine = min(args.genrm_num_gpus_per_engine, args.num_gpus_per_node)
@@ -50,22 +64,65 @@ class GenRMManager(MultiEngineManager):
         self.num_gpu_per_engine = num_gpu_per_engine
         self.bundle_offset = bundle_offset
         self.port_window_index = port_window_index
+        self.inference_model_path = args.genrm_model_path
+        self.inference_num_gpus_per_engine = args.genrm_num_gpus_per_engine
+        self.inference_overrides = getattr(args, "genrm_engine_config", None) or {}
 
-        super().__init__(
-            args,
-            num_slots=num_slots,
-            nodes_per_engine=nodes_per_engine,
-            engine_actor_cls=GenRMEngine,
-            skip_init=args.debug_train_only,
-            log_prefix="GenRM",
-        )
-        self.num_new_engines = len(self.engines)
+        from relax.distributed.ray.rollout import _start_router, stop_launched_routers
+
+        self.router_url = None
+        self.router_ip, self.router_port = "", 0
+        if not args.debug_train_only:
+            router_args = copy.copy(args)
+            router_args.use_slime_router = False
+            self.router_ip, self.router_port = _start_router(router_args, force_new=True)
+            self.router_url = f"http://{self.router_ip}:{self.router_port}"
+        try:
+            self.backend = MultiEngineManager(
+                args,
+                num_slots=num_slots,
+                nodes_per_engine=nodes_per_engine,
+                engine_actor_cls=GenRMEngine,
+                skip_init=True,
+                log_prefix="GenRM",
+                inference_manager=inference_manager,
+                model_id=model_id,
+                adapter=self,
+            )
+            if not args.debug_train_only and not defer_init:
+                self.backend.initialize()
+        except Exception:
+            try:
+                if hasattr(self, "all_engines"):
+                    self.backend.shutdown()
+            finally:
+                if inference_manager is None:
+                    stop_launched_routers()
+            raise
         self.genrm_engine_lock = Lock.options(
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
 
     def get_genrm_engines_and_lock(self):
         return self.engines, self.genrm_engine_lock, self.num_new_engines
+
+    def __getattr__(self, name):
+        backend = self.__dict__.get("backend")
+        if backend is None:
+            raise AttributeError(name)
+        return getattr(backend, name)
+
+    def _build_engine_init_kwargs(self, rank: int, addr_and_ports: dict) -> dict:
+        return {**addr_and_ports, "router_ip": self.router_ip, "router_port": self.router_port}
+
+    def shutdown(self) -> None:
+        from relax.distributed.ray.rollout import stop_launched_routers
+
+        try:
+            self.backend.shutdown()
+        finally:
+            if self._owns_inference_manager:
+                stop_launched_routers()
 
     def get_engine_hosts_ports(self):
         """Return a list of (host, port) tuples for each live genRM engine.
@@ -141,6 +198,17 @@ class GenRMManager(MultiEngineManager):
             new_engines=new_engines,
             port_window_index=self.port_window_index,
         )
+
+
+class _GenRMManager(ModelPool):
+    """Legacy Ray constructor forwarding to the common model pool."""
+
+    def __init__(self, *args, **kwargs):
+        adapter = GenRMEngineAdapter(*args, **kwargs)
+        super().__init__(adapter, inference_manager=adapter.inference_manager, model_id=adapter.inference_model_id)
+
+
+GenRMManager = ray.remote(_GenRMManager)
 
 
 def _allocate_genrm_engine_addr_and_ports(*, args, new_engines, port_window_index=0):

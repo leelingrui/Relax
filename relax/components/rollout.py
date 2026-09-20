@@ -677,6 +677,10 @@ class Rollout(Base):
         self.status = "running"
         await self.rollout_manager.set_weight_updating.remote(False)
 
+        # The update lease alone is not evidence of ready weights. Re-observe
+        # health, Router registration and engine-reported versions afterwards.
+        await self.rollout_manager.refresh_inference_state.remote()
+
     @app.get("/recover_rollout_engines")
     async def recover_rollout_engines(self):
         self._logger.info("Recovering rollout engines")

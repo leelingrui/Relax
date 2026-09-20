@@ -12,20 +12,29 @@ import random
 import threading
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import ray
 import transfer_queue as tq
-import yaml
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
-from relax.engine.inference.discovery import new_manager_epoch, snapshot_from_legacy_engines
-from relax.engine.inference.types import Role, RoleSnapshot
+from relax.engine.inference.config import EngineGroupConfig, ModelConfig, SglangConfig
+from relax.engine.inference.discovery import new_manager_epoch
+from relax.engine.inference.manager import InferenceManager, PreparationEvidence
+from relax.engine.inference.specs import EngineGroupSpec, replicas_from_slots
+from relax.engine.inference.types import (
+    LifecycleState,
+    ModelSnapshot,
+    ReplicaSnapshot,
+    Role,
+    RoleSnapshot,
+    RoutingSpec,
+)
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
@@ -89,158 +98,6 @@ def _resolve_rollout_engine_class(args):
     if class_path:
         return load_function(class_path)
     return SGLangEngine
-
-
-@dataclasses.dataclass
-class EngineGroupConfig:
-    """Configuration for a single engine group.
-
-    Attributes:
-        worker_type: One of "regular", "prefill", "decode", or "placeholder".
-                     "placeholder" reserves GPU slots without creating engines.
-        num_gpus: Total number of GPUs for this group.
-        num_gpus_per_engine: GPUs per engine for this group.  Overrides the
-                             model-level or global ``--rollout-num-gpus-per-engine``.
-        overrides: Optional dict of SGLang ``ServerArgs`` field overrides.
-                   These are applied on top of the base CLI ``--sglang-*``
-                   arguments in ``_compute_server_args``.
-    """
-
-    worker_type: str
-    num_gpus: int
-    num_gpus_per_engine: int | None = None
-    overrides: dict = dataclasses.field(default_factory=dict)
-
-    def __post_init__(self):
-        valid_types = {"regular", "prefill", "decode", "placeholder"}
-        assert self.worker_type in valid_types, (
-            f"Invalid worker_type '{self.worker_type}', must be one of {valid_types}"
-        )
-        assert self.num_gpus > 0, f"num_gpus must be > 0, got {self.num_gpus}"
-
-
-@dataclasses.dataclass
-class ModelConfig:
-    """Configuration for a single model deployment.
-
-    Attributes:
-        name: Unique name for this model (e.g. "actor", "reward").
-        model_path: HF checkpoint path.  Falls back to ``args.hf_checkpoint``.
-        num_gpus_per_engine: Default GPUs per engine for all groups in this
-                             model.  Individual groups can override.
-        engine_groups: Engine group configurations for this model.
-    """
-
-    name: str
-    model_path: str | None = None
-    num_gpus_per_engine: int | None = None
-    engine_groups: list[EngineGroupConfig] = dataclasses.field(default_factory=list)
-
-    def resolve(self, args) -> None:
-        """Resolve per-group defaults from model-level then args-level
-        values."""
-        default_gpus_per_engine = self.num_gpus_per_engine or args.rollout_num_gpus_per_engine
-        # `args.sglang_hf_checkpoint` lets INT4 QAT runs point SGLang at the
-        # source compressed-tensors directory while training-side consumers
-        # keep using the auto-cast `args.hf_checkpoint` (BF16 cache).
-        default_model_path = self.model_path or args.sglang_hf_checkpoint or args.hf_checkpoint
-        for g in self.engine_groups:
-            if g.num_gpus_per_engine is None:
-                g.num_gpus_per_engine = default_gpus_per_engine
-            # Inject model_path into overrides so _compute_server_args picks it up.
-            if "model_path" not in g.overrides:
-                g.overrides["model_path"] = default_model_path
-
-    @property
-    def has_pd_disaggregation(self) -> bool:
-        return any(g.worker_type in ("prefill", "decode") for g in self.engine_groups)
-
-    @property
-    def total_num_gpus(self) -> int:
-        return sum(g.num_gpus for g in self.engine_groups)
-
-
-@dataclasses.dataclass
-class SglangConfig:
-    """Configuration for SGLang engine deployment.
-
-    Loaded from ``--sglang-config`` YAML file.
-
-    **Config format**::
-
-        sglang:
-          - name: actor
-            model_path: /path/to/actor
-            num_gpus_per_engine: 2
-            engine_groups:
-              - worker_type: prefill
-                num_gpus: 4
-                num_gpus_per_engine: 2
-              - worker_type: decode
-                num_gpus: 8
-                num_gpus_per_engine: 4
-          - name: reward
-            model_path: /path/to/reward
-            engine_groups:
-              - worker_type: regular
-                num_gpus: 4
-
-    Each model gets its own router.  ``placeholder`` groups reserve GPU
-    slots without creating engines.  ``overrides`` are ``ServerArgs``
-    field names applied on top of the base ``--sglang-*`` CLI args.
-    """
-
-    models: list[ModelConfig]
-
-    @staticmethod
-    def from_yaml(path: str) -> "SglangConfig":
-        with open(path) as f:
-            data = yaml.safe_load(f)
-
-        assert "sglang" in data, (
-            f"sglang config must have a 'sglang' key, got {list(data.keys())}. "
-            f"Wrap your engine_groups inside a model entry under 'sglang'."
-        )
-        models = []
-        for m in data["sglang"]:
-            groups = [EngineGroupConfig(**g) for g in m.get("engine_groups", [])]
-            models.append(
-                ModelConfig(
-                    name=m["name"],
-                    model_path=m.get("model_path"),
-                    num_gpus_per_engine=m.get("num_gpus_per_engine"),
-                    engine_groups=groups,
-                )
-            )
-        return SglangConfig(models=models)
-
-    @staticmethod
-    def from_prefill_num_servers(args) -> "SglangConfig":
-        """Build a config equivalent to the legacy --prefill-num-servers
-        flag."""
-        total_gpus = args.rollout_num_gpus
-        prefill_gpus = args.prefill_num_servers * args.rollout_num_gpus_per_engine
-        decode_gpus = total_gpus - prefill_gpus
-        assert decode_gpus > 0, f"No decode GPUs: total {total_gpus}, prefill {prefill_gpus}"
-        return SglangConfig(
-            models=[
-                ModelConfig(
-                    name="default",
-                    engine_groups=[
-                        EngineGroupConfig(worker_type="prefill", num_gpus=prefill_gpus),
-                        EngineGroupConfig(worker_type="decode", num_gpus=decode_gpus),
-                    ],
-                )
-            ]
-        )
-
-    @property
-    def has_pd_disaggregation(self) -> bool:
-        return any(m.has_pd_disaggregation for m in self.models)
-
-    @property
-    def total_num_gpus(self) -> int:
-        return sum(m.total_num_gpus for m in self.models)
 
 
 class ScaleOutStatus(str, enum.Enum):
@@ -454,6 +311,21 @@ class EngineGroup:
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
     lifecycle_status: EngineGroupLifecycle = EngineGroupLifecycle.ACTIVE
     eviction_requested: bool = False
+    spec: EngineGroupSpec | None = None
+    on_topology_change: Callable[[], None] | None = dataclasses.field(default=None, repr=False)
+
+    def notify_topology_change(self) -> None:
+        if self.on_topology_change is not None:
+            self.on_topology_change()
+
+    def __post_init__(self) -> None:
+        if self.spec is None:
+            self.spec = EngineGroupSpec(
+                f"group-{self.rank_offset}",
+                replicas_from_slots(f"group-{self.rank_offset}", len(self.all_engines), self.nodes_per_engine),
+            )
+        elif sum(len(replica.node_ranks) for replica in self.spec.replicas) != len(self.all_engines):
+            raise ValueError("EngineGroup slots do not match its replica specification")
 
     @property
     def nodes_per_engine(self):
@@ -500,7 +372,7 @@ class EngineGroup:
         RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
 
         rollout_engines = []
-        for i in range(len(self.all_engines)):
+        for i in (rank for replica in self.spec.replicas for rank in replica.node_ranks):
             if self.all_engines[i] is not None:
                 continue
 
@@ -654,6 +526,7 @@ class EngineGroup:
         This removes the engines from the group and unregisters them from
         router and DCS.
         """
+        self.notify_topology_change()
         for i in indices:
             engine = self.all_engines[i]
             if engine is not None:
@@ -712,6 +585,7 @@ class RolloutServer:
     router_ip: str | None = None
     router_port: int | None = None
     model_name: str = "default"
+    model_spec: ModelConfig | None = None
 
     @property
     def engines(self):
@@ -839,6 +713,49 @@ class RolloutServer:
         return ray.get(handles) if handles else []
 
 
+class _RolloutPoolRuntime:
+    """Preserve Rollout's split restore and explicit training-side recovery."""
+
+    recover_on_onload = False
+    always_resume = True
+
+    def __init__(self, server: RolloutServer) -> None:
+        self.server = server
+        self._onloaded = True
+
+    def health_check(self) -> bool:
+        return bool(self.server.engines) and all(
+            not group.healthcheck_engines() for group in self.server.engine_groups if group.engines
+        )
+
+    def recover(self) -> set[int]:
+        self.server.recover()
+        return set()
+
+    def is_onloaded(self) -> bool:
+        return self._onloaded
+
+    def set_onloaded(self, value: bool) -> None:
+        self._onloaded = value
+
+    def fanout(self, method: str, *, skip_ranks: set[int] | None = None, **kwargs: Any) -> list[int]:
+        if method == "resume_memory_occupation":
+            self.server.onload(kwargs.get("tags"))
+        elif method == "release_memory_occupation":
+            self.server.offload()
+        else:
+            raise ValueError(f"Unsupported Rollout pool operation: {method}")
+        return []
+
+    def retire(self, ranks: list[int]) -> None:
+        if ranks:
+            raise ValueError("Rollout retirement must preserve its weight-update fence")
+
+    def shutdown(self) -> None:
+        for group in self.server.engine_groups:
+            group.shutdown_engines(set(range(len(group.all_engines))))
+
+
 # In-process singleton set inside RolloutManager.__init__. Only meaningful
 # from code running inside the RolloutManager actor's own process (e.g., a
 # custom_reward_post_process function loaded there). Cross-process access
@@ -921,11 +838,41 @@ class RolloutManager(ReloadableMixin):
 
             init_agentic_resident_pipeline(self.args, self.data_source, self.data_system_client)
 
+        self.inference_manager = InferenceManager(Role.ROLLOUT)
+        from relax.distributed.ray.inference_role import UnifiedServiceManager
+        from relax.distributed.ray.model_pool import ModelPool
+
+        pools = {}
         if self.args.debug_train_only:
             self.servers: dict[str, RolloutServer] = {}
         else:
             init_http_client(args)
-            self.servers = start_rollout_servers(args, pg)
+            self.servers = start_rollout_servers(args, pg, inference_manager=self.inference_manager)
+        if self.servers:
+            for server in self.servers.values():
+                spec = server.model_spec
+                self.inference_manager.register_model(
+                    spec,
+                    operation_id=f"register:{spec.model_id}",
+                )
+                pools[spec.model_id] = ModelPool.from_runtime(
+                    self.inference_manager, spec.model_id, _RolloutPoolRuntime(server)
+                )
+                for group in server.engine_groups:
+                    group.on_topology_change = lambda name=spec.model_id: self.inference_manager.invalidate_model(
+                        name, state=LifecycleState.STARTING
+                    )
+            model_names = tuple(self.servers)
+            self.inference_manager.configure_routes(
+                RoutingSpec(
+                    default_model=model_names[0] if len(model_names) == 1 else None,
+                    route_key_to_model=tuple((name, name) for name in model_names),
+                ),
+                operation_id="routes:startup",
+            )
+        self.service_manager = UnifiedServiceManager(
+            Role.ROLLOUT, inference_manager=self.inference_manager, pools=pools
+        )
         self.rollout_engine_lock = Lock.options(
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
@@ -1027,7 +974,7 @@ class RolloutManager(ReloadableMixin):
         self._stop_eviction_monitor()
         for monitor in self._health_monitors:
             monitor.stop()
-        self._shutdown_all_engines()
+        self.service_manager.shutdown()
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.
@@ -1266,8 +1213,8 @@ class RolloutManager(ReloadableMixin):
             logger.info("Rollout already offloaded; skipping")
             return
         self.health_monitoring_pause()
-        for srv in self.servers.values():
-            srv.offload()
+        for name in self.servers:
+            self.service_manager.call_wait(name, "offload")
         self.status = "offload"
 
     async def onload(self, tags: list[str] | None = None):
@@ -1276,12 +1223,14 @@ class RolloutManager(ReloadableMixin):
     def _onload_local(self, tags: list[str] | None = None):
         """Sync body of onload(); safe to call directly from code running
         inside this actor's process (e.g. custom_reward_post_process)."""
-        for srv in self.servers.values():
-            srv.onload(tags)
+        self.status = "onloading"
+        for name in self.servers:
+            self.service_manager.call_wait(name, "onload", tags)
         # Full onload transitions status; per-tag calls leave status for the
         # dedicated wrappers below (onload_weights / onload_kv).
         if tags is None:
             self.status = "onload"
+            self.refresh_inference_state()
 
     async def onload_weights(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
@@ -1289,6 +1238,7 @@ class RolloutManager(ReloadableMixin):
     async def onload_kv(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
         self.status = "onload"
+        self.refresh_inference_state()
 
     def get_status(self):
         return self.status
@@ -1305,7 +1255,7 @@ class RolloutManager(ReloadableMixin):
             gpu_offsets = srv.engine_gpu_offsets if srv else []
             return engines, self.rollout_engine_lock, (srv.num_new_engines if srv else 0), gpu_counts, gpu_offsets
 
-        srv.recover()
+        self.service_manager.call_wait(srv.model_name, "recover")
         return (
             srv.engines,
             self.rollout_engine_lock,
@@ -2369,6 +2319,9 @@ class RolloutManager(ReloadableMixin):
 
         # Step 6: Add to server
         srv.engine_groups.append(engine_group)
+        engine_group.on_topology_change = lambda: self.inference_manager.invalidate_model(
+            request.model_name, state=LifecycleState.STARTING
+        )
         engine_group.num_new_engines = 0
 
         # Step 7: Register health monitor
@@ -2382,6 +2335,7 @@ class RolloutManager(ReloadableMixin):
             f"Total engine_groups: {len(srv.engine_groups)}, "
             f"total engines: {sum(len(g.all_engines) for g in srv.engine_groups)}"
         )
+        await asyncio.to_thread(self.refresh_inference_state)
         return EngineFinalizeResult(True, group=engine_group)
 
     def _update_scale_out_final_status(
@@ -3344,19 +3298,135 @@ class RolloutManager(ReloadableMixin):
     def get_discovery_snapshot(
         self, model_name: Optional[str] = None, status_filter: Optional[str] = None
     ) -> RoleSnapshot:
-        """Adapt the legacy engine inventory into the common discovery type."""
-        self._refresh_topology_revision()
-        engines = self.get_engines_info(model_name, status_filter)
-        model_names = tuple(engines.get("models", {}))
-        return snapshot_from_legacy_engines(
-            engines,
-            role=Role.ROLLOUT,
-            manager_epoch=self.manager_epoch,
-            topology_revision=self.topology_revision,
-            default_model=model_name or (next(iter(self.servers), None) if len(self.servers) == 1 else None),
-            allow_defer={name: True for name in model_names},
-            direct_eligible={name: False for name in model_names},
-        )
+        """Read the last committed topology; filters never change admission."""
+        if status_filter not in (None, "active", "dead"):
+            raise ValueError("status_filter must be one of: active, dead")
+        snapshot = self.inference_manager.snapshot((model_name,) if model_name else None)
+        if status_filter is not None:
+            snapshot = dataclasses.replace(
+                snapshot,
+                models=tuple(
+                    dataclasses.replace(
+                        model,
+                        replicas=tuple(
+                            replica
+                            for replica in model.replicas
+                            if status_filter == ("dead" if replica.state == LifecycleState.DEAD else "active")
+                        ),
+                    )
+                    for model in snapshot.models
+                ),
+            )
+        return dataclasses.replace(snapshot, phase=self.status)
+
+    def invalidate_inference_state(self) -> None:
+        """Close admission before backend-owned policy weight transactions."""
+        self._inference_sync_pending = True
+        for name in self.servers:
+            self.inference_manager.invalidate_model(name, state=LifecycleState.STARTING)
+
+    def complete_inference_weight_update(self) -> None:
+        """Called only after a backend-owned weight transaction succeeds."""
+        self._inference_sync_pending = False
+        self.refresh_inference_state()
+
+    def refresh_inference_state(self) -> None:
+        """Publish observed health, registration and non-default policy
+        versions."""
+        for name, server in self.servers.items():
+            expected = self.inference_manager.snapshot((name,)).models[0]
+            replicas = []
+            router_members_ready = True
+            pd_workers: dict[str, list[ReplicaSnapshot]] = {"prefill": [], "decode": []}
+            for group in tuple(server.engine_groups):
+                if group.worker_type == "placeholder":
+                    continue
+                for replica_index in range(0, len(group.all_engines), group.nodes_per_engine):
+                    nodes = group.all_engines[replica_index : replica_index + group.nodes_per_engine]
+                    head = nodes[0] if nodes else None
+                    alive = len(nodes) == group.nodes_per_engine and all(node is not None for node in nodes)
+                    observation = {}
+                    if alive:
+                        try:
+                            result = ray.get(
+                                head.get_inference_observation.remote(
+                                    ensure_router=self.status not in ("offload", "onloading")
+                                    and not self._is_weight_updating
+                                    and not getattr(self, "_inference_sync_pending", False)
+                                ),
+                                timeout=45,
+                            )
+                            observation = result if isinstance(result, dict) else {}
+                        except Exception:
+                            alive = False
+                    version = observation.get("weight_version")
+                    ready = bool(
+                        alive
+                        and observation.get("healthy")
+                        and observation.get("router_registered")
+                        and version not in (None, "", "default")
+                        and group.lifecycle_status == EngineGroupLifecycle.ACTIVE
+                    )
+                    if observation.get("router_registered") and not ready:
+                        router_members_ready = False
+                    if not alive:
+                        # An unreachable worker may still be registered at the Router.
+                        router_members_ready = False
+                    replica = ReplicaSnapshot(
+                        f"{name}/replica-{group.rank_offset + replica_index}",
+                        LifecycleState.READY if ready else (LifecycleState.STARTING if alive else LifecycleState.DEAD),
+                        observation.get("base_url"),
+                        version,
+                    )
+                    if group.worker_type in pd_workers:
+                        pd_workers[group.worker_type].append(replica)
+                    else:
+                        replicas.append(replica)
+            router_url = (
+                f"http://{server.router_ip}:{server.router_port}" if server.router_ip and server.router_port else None
+            )
+            if any(pd_workers.values()):
+                # PD workers are not complete generation replicas. Expose the
+                # Router-backed service path, keeping worker topology internal.
+                workers = [worker for values in pd_workers.values() for worker in values]
+                pd_ready = all(
+                    any(worker.state == LifecycleState.READY for worker in values) for values in pd_workers.values()
+                )
+                versions = {worker.weight_version for worker in workers if worker.state == LifecycleState.READY}
+                pd_ready = pd_ready and len(versions) == 1
+                replicas.append(
+                    ReplicaSnapshot(
+                        f"{name}/pd-service",
+                        LifecycleState.READY if pd_ready else LifecycleState.STARTING,
+                        router_url,
+                        next(iter(versions)) if len(versions) == 1 else None,
+                    )
+                )
+            versions = {replica.weight_version for replica in replicas if replica.state == LifecycleState.READY}
+            ready = bool(
+                len(versions) == 1
+                and router_members_ready
+                and router_url
+                and self.status not in ("offload", "onloading")
+                and not self._is_weight_updating
+                and not getattr(self, "_inference_sync_pending", False)
+                and not self.args.debug_train_only
+            )
+            model = ModelSnapshot(
+                name,
+                tuple(replicas),
+                router_url,
+                LifecycleState.READY
+                if ready
+                else (LifecycleState.SLEEPING if self.status == "offload" else LifecycleState.STARTING),
+                ready,
+                True,
+                False,
+                next(iter(versions)) if len(versions) == 1 else None,
+            )
+            self.inference_manager.commit_observation(
+                expected, model, evidence=PreparationEvidence(True, ready, ready, ready)
+            )
 
     def _refresh_topology_revision(self) -> None:
         if not hasattr(self, "topology_revision"):
@@ -3569,6 +3639,9 @@ class RolloutManager(ReloadableMixin):
             ):
                 return False
             self._training_weight_updating = is_updating
+            if is_updating and hasattr(self, "inference_manager"):
+                for name in self.servers:
+                    self.inference_manager.invalidate_model(name, state=LifecycleState.STARTING)
             return True
 
     @ray.method(concurrency_group="scale_in")
@@ -4102,6 +4175,8 @@ class RolloutManager(ReloadableMixin):
         live_actors: list[tuple[int, object]],
         shutdown_timeout: float,
     ) -> None:
+        group.notify_topology_change()
+
         async def _shutdown(engine):
             return await asyncio.wait_for(engine.shutdown.remote(), timeout=shutdown_timeout)
 
@@ -4120,6 +4195,7 @@ class RolloutManager(ReloadableMixin):
         with self._engine_lifecycle_lock:
             for i, _ in live_actors:
                 group.all_engines[i] = None
+        await asyncio.to_thread(self.refresh_inference_state)
 
     async def _remove_engine(self, group, node0_idx: int, shutdown_timeout: float) -> None:
         engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
@@ -4162,6 +4238,7 @@ class RolloutManager(ReloadableMixin):
                 group.lifecycle_status = EngineGroupLifecycle.REMOVED
 
         if groups_to_remove:
+            self.refresh_inference_state()
             logger.info(f"[ScaleIn] Cleaned up {len(groups_to_remove)} empty engine groups")
 
     @ray.method(concurrency_group="scale_in")
@@ -4701,7 +4778,7 @@ def _wait_engine_init_with_progress(
     logger.info(f"[engine-init-barrier:{model_name}] all {total} engines ready")
 
 
-def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
+def start_rollout_servers(args, pg, *, inference_manager: InferenceManager | None = None) -> dict[str, RolloutServer]:
     """Start rollout servers: one per model, each with its own router.
 
     Each model defined in the sglang config gets its own router and set
@@ -4715,14 +4792,24 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     as the HTTP client is shared across all servers.
     """
     config = _resolve_sglang_config(args)
+    models = [dataclasses.replace(model.resolved(args), allow_defer=True) for model in config.models]
+    registry = inference_manager if inference_manager is not None else InferenceManager(Role.ROLLOUT)
+    for spec in models:
+        registry.register_model(spec, operation_id=f"register:{spec.model_id}")
+    model_names = tuple(spec.model_id for spec in models)
+    registry.configure_routes(
+        RoutingSpec(
+            default_model=model_names[0] if len(model_names) == 1 else None,
+            route_key_to_model=tuple((name, name) for name in model_names),
+        ),
+        operation_id="routes:startup",
+    )
 
     servers: dict[str, RolloutServer] = {}
     gpu_offset = 0
     engine_offset = 0
 
-    for model_idx, model_cfg in enumerate(config.models):
-        model_cfg.resolve(args)
-
+    for model_idx, model_cfg in enumerate(models):
         has_pd = model_cfg.has_pd_disaggregation
         router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
 
@@ -4749,9 +4836,11 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 worker_type=group_cfg.worker_type,
                 rank_offset=engine_offset,
                 gpu_offset=gpu_offset,
-                sglang_overrides=group_cfg.overrides,
+                sglang_overrides=dict(group_cfg.overrides),
                 router_ip=router_ip,
                 router_port=router_port,
+                spec=group_cfg.topology,
+                skip_router_registration=True,
             )
             handles, port_cursors = group.start_engines(port_cursors)
             all_init_handles.extend(handles)
@@ -4773,6 +4862,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             router_ip=router_ip,
             router_port=router_port,
             model_name=model_cfg.name,
+            model_spec=model_cfg,
         )
 
     return servers

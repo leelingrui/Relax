@@ -1,14 +1,18 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 
+import copy
+
 import ray
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.service import create_placement_group
+from relax.distributed.ray.model_pool import ModelPool
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from relax.engine.inference.capabilities import WeightSource
+from relax.engine.inference.types import Role
 from relax.utils.env import Envs
 from relax.utils.http_utils import find_available_port
 from relax.utils.logging_utils import get_logger
@@ -56,9 +60,11 @@ def _build_teacher_engine_env(args) -> dict[str, str]:
     return env_vars
 
 
-@ray.remote
-class TeacherManager(MultiEngineManager):
-    """Launch and own Relax-managed OPD teacher SGLang engine(s)."""
+class TeacherEngineAdapter:
+    """Teacher placement, ports, environment and endpoint recovery policy."""
+
+    inference_role = Role.TEACHER
+    inference_weight_source = WeightSource.CHECKPOINT
 
     def __init__(
         self,
@@ -68,9 +74,17 @@ class TeacherManager(MultiEngineManager):
         pg: tuple | None = None,
         shared_pg: bool = False,
         bundle_offset: int = 0,
+        *,
+        inference_manager=None,
+        model_id: str = "default",
+        defer_init: bool = False,
     ) -> None:
+        self.args = args
         assert num_replicas >= 1, f"num_replicas must be >= 1, got {num_replicas}."
         assert gpus_per_replica > 0, f"gpus_per_replica must be > 0, got {gpus_per_replica}."
+        if gpus_per_replica > args.num_gpus_per_node and gpus_per_replica % args.num_gpus_per_node:
+            raise ValueError("Multi-node teacher replicas must occupy complete nodes")
+        nodes_per_engine = max(1, gpus_per_replica // args.num_gpus_per_node)
         if shared_pg:
             assert pg is not None, "shared_pg=True requires the full actor/rollout placement group."
             _pg, bundle_indices, gpu_ids = pg
@@ -88,20 +102,55 @@ class TeacherManager(MultiEngineManager):
 
         overrides = build_teacher_overrides(args, colocate_sync=shared_pg)
         self._overrides = overrides
+        self.inference_model_path = overrides["model_path"]
+        self.inference_num_gpus_per_engine = gpus_per_replica
+        self.inference_overrides = overrides
         self._teacher_args = build_teacher_engine_args(args, overrides)
+        self._teacher_args.use_slime_router = False
         logger.info(
             f"[OPD teacher] launching {num_replicas} replica(s), "
             f"TP={gpus_per_replica}, model={overrides['model_path']}, "
             f"shared_pg={shared_pg}, mem_fraction_static={overrides.get('mem_fraction_static')}"
         )
 
-        super().__init__(
-            args,
-            num_slots=num_replicas,
-            nodes_per_engine=1,
-            engine_actor_cls=SGLangEngine,
-            log_prefix="[OPD teacher]",
-        )
+        from relax.distributed.ray.rollout import _start_router, stop_launched_routers
+
+        router_args = copy.copy(args)
+        router_args.use_slime_router = False
+        self.router_ip, self.router_port = _start_router(router_args, force_new=True)
+        self.router_url = f"http://{self.router_ip}:{self.router_port}"
+        try:
+            self.backend = MultiEngineManager(
+                args,
+                num_slots=num_replicas * nodes_per_engine,
+                nodes_per_engine=nodes_per_engine,
+                engine_actor_cls=SGLangEngine,
+                log_prefix="[OPD teacher]",
+                skip_init=True,
+                inference_manager=inference_manager,
+                model_id=model_id,
+                adapter=self,
+            )
+            if not defer_init:
+                self.backend.initialize()
+        except Exception:
+            try:
+                if hasattr(self, "backend"):
+                    self.backend.shutdown()
+            finally:
+                if inference_manager is None:
+                    stop_launched_routers()
+            raise
+
+    def shutdown(self) -> None:
+        from relax.distributed.ray.rollout import stop_launched_routers
+
+        try:
+            self.backend.shutdown()
+        finally:
+            # Router registry is local to this dedicated Manager actor process.
+            if self._owns_inference_manager:
+                stop_launched_routers()
 
     def get_urls(self) -> list[str]:
         urls = []
@@ -112,7 +161,17 @@ class TeacherManager(MultiEngineManager):
             urls.append(f"{base_url}/generate")
         return urls
 
+    def __getattr__(self, name):
+        backend = self.__dict__.get("backend")
+        if backend is None:
+            raise AttributeError(name)
+        return getattr(backend, name)
+
     def recover(self) -> set:
+        self._check_recovery_allowed()
+        return self.backend.recover()
+
+    def _check_recovery_allowed(self) -> None:
         """Recover in place only when the teacher's endpoint can stay
         stable."""
         dead = [rank for rank, engine in enumerate(self.all_engines) if engine is None]
@@ -124,14 +183,15 @@ class TeacherManager(MultiEngineManager):
             raise RuntimeError(
                 f"Dedicated OPD teacher engines died at ranks={dead}; global restart is required to refresh URLs."
             )
-        return super().recover()
 
     # ------------------------------------------------------------------
     # MultiEngineManager hooks.
     # ------------------------------------------------------------------
 
     def _resolve_placement(self, rank: int):
-        replica = rank
+        nodes_per_engine = getattr(self, "nodes_per_engine", 1)
+        replica, node_rank = divmod(rank, nodes_per_engine)
+        node_offset = node_rank * min(self.gpus_per_replica, self.args.num_gpus_per_node) if node_rank else 0
         if self._shared_pg:
             # Colocate: teachers share the actor placement group, which the
             # controller owns and removes → owns_pg=False.
@@ -142,12 +202,17 @@ class TeacherManager(MultiEngineManager):
                 shared_pg=True,
                 bundle_offset=self._bundle_offset,
             )
-            return self._shared_pg_tuple, False, gpu_index
+            return self._shared_pg_tuple, False, gpu_index + node_offset
 
         # Dedicated: this replica creates and owns its own placement group.
-        pg_tuple = create_placement_group(
-            num_gpus=self.gpus_per_replica,
-            node_group_affinity=getattr(self.args, "enable_affinity", True),
+        existing = getattr(self, "_engine_placements", {}).get(replica * nodes_per_engine)
+        pg_tuple = (
+            existing[0]
+            if existing
+            else create_placement_group(
+                num_gpus=self.gpus_per_replica,
+                node_group_affinity=getattr(self.args, "enable_affinity", True),
+            )
         )
         gpu_index = _resolve_teacher_gpu_index(
             args=self.args,
@@ -155,7 +220,7 @@ class TeacherManager(MultiEngineManager):
             gpus_per_replica=self.gpus_per_replica,
             shared_pg=False,
         )
-        return pg_tuple, True, gpu_index
+        return pg_tuple, True, gpu_index + node_offset
 
     def _ray_resource_kwargs(self, rank: int) -> dict:
         return {"num_cpus": 0.2, "num_gpus": 0.2}
@@ -175,18 +240,18 @@ class TeacherManager(MultiEngineManager):
         }
 
     def _build_engine_init_kwargs(self, rank: int, addr_and_ports: dict) -> dict:
-        # The teacher is standalone: do NOT register to the rollout router and
-        # do NOT register to DCS (it receives no weight sync).
+        # Static weights never join DCS; traffic uses this teacher's own Router.
         return {
             **addr_and_ports,
-            "router_ip": None,
-            "router_port": None,
+            "router_ip": self.router_ip,
+            "router_port": self.router_port,
             "skip_dcs_registration": True,
-            "skip_router_registration": True,
+            "skip_router_registration": False,
         }
 
     def _allocate_engine_addr_and_ports(self, *, new_engines: list[tuple]) -> dict[int, dict]:
         addr_and_ports: dict[int, dict] = {}
+        pending = []
         for rank, engine in new_engines:
             # OPD consumers receive teacher URLs once during startup. Preserve
             # the original endpoint across recovery instead of silently moving
@@ -194,14 +259,26 @@ class TeacherManager(MultiEngineManager):
             if self._shared_pg and rank in self._engine_addr_and_ports:
                 addr_and_ports[rank] = dict(self._engine_addr_and_ports[rank])
                 continue
-            base_port = find_available_port(15000)
-            per_engine_addr_and_ports, _ = _allocate_rollout_engine_addr_and_ports_normal(
+            pending.append((rank, engine))
+        if pending:
+            allocated, _ = _allocate_rollout_engine_addr_and_ports_normal(
                 args=self._teacher_args,
-                rollout_engines=[(0, engine)],
+                rollout_engines=pending,
                 worker_type="regular",
                 num_gpus_per_engine=self.gpus_per_replica,
                 rank_offset=0,
-                base_port=base_port,
+                base_port=find_available_port(15000),
             )
-            addr_and_ports[rank] = per_engine_addr_and_ports[0]
+            addr_and_ports.update(allocated)
         return addr_and_ports
+
+
+class _TeacherManager(ModelPool):
+    """Legacy Ray constructor forwarding to the common model pool."""
+
+    def __init__(self, *args, **kwargs):
+        adapter = TeacherEngineAdapter(*args, **kwargs)
+        super().__init__(adapter, inference_manager=adapter.inference_manager, model_id=adapter.inference_model_id)
+
+
+TeacherManager = ray.remote(_TeacherManager)

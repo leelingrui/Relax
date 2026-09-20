@@ -19,9 +19,7 @@ class InferenceDiscoveryClient:
         self._client = client or httpx.Client(timeout=timeout)
         self._owns_client = client is None
 
-    def get_snapshot(
-        self, role: str, *, schema_version: int = 2, status_filter: str | None = None
-    ) -> RoleSnapshot:
+    def get_snapshot(self, role: str, *, schema_version: int = 2, status_filter: str | None = None) -> RoleSnapshot:
         params: dict[str, Any] = {"schema_version": schema_version}
         if status_filter is not None:
             params["status_filter"] = status_filter
