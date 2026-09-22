@@ -180,37 +180,58 @@ Phase 3 验收：
 
 ### 5A：LifecycleCoordinator 与 GenRM defer
 
-- [ ] 实现统一六态与幂等 activate/drain/deactivate/shutdown；补齐 switch_model、阶段占用与操作查询。
-- [ ] Coordinator 根据 placement 和阶段计划控制激活权限，禁止冲突角色同时占用共享 GPU。
-- [ ] 定义并实现停止接单、在途请求处理、显存释放、加载与 READY 发布的完整顺序。
-- [ ] 纳入权重同步、训练 ranks 同步和分阶段恢复 weights/KV cache 的现有约束。
-- [ ] 从 Actor、Rollout 和示例脚本迁移跨角色切换逻辑。
-- [ ] 将 GenRM defer 整合到框架阶段，取消示例对命名 actor 的直接依赖。
-- [ ] 处理超时、取消、重复操作和阶段失败；失败时不继续激活冲突角色。
+- [x] 实现统一六态与幂等 activate/drain/deactivate/shutdown；补齐 switch_model、阶段占用与操作查询。`InferenceManager.drain/deactivate/activate/shutdown_models` 按 `operation_id` 幂等（同参复放、异参 conflict），`LifecycleCoordinator` 提供 `switch_model/transition/enter_phase/finish_phase/get_operation/get_activation_group`。
+
+- [x] Coordinator 根据 placement 和阶段计划控制激活权限，禁止冲突角色同时占用共享 GPU。互斥关系由 placement 账本的 `contended_phases()` 推导，不手写读 args；`validate_placement` 拒绝无法把争用阶段分开的计划。
+
+- [x] 定义并实现停止接单、在途请求处理、显存释放、加载与 READY 发布的完整顺序。固定步序 `admission_closed → drained → deactivated → release_confirmed → activation_granted → activated → ready_published`，结果只报告已确认的步，不报告尝试过的步。
+
+- [x] 纳入权重同步、训练 ranks 同步和分阶段恢复 weights/KV cache 的现有约束。Actor 保留 gloo 屏障与 weights/KV 两段恢复；`_confirm_training_release` 以屏障为证据上报全部 ranks，未确认时 `blocked_by="training"` 绝对拒绝下一次激活。policy 模型缺权重证据时 activate 停在 `activated`，不冒充 READY。
+
+- [x] 从 Actor、Rollout 和示例脚本迁移跨角色切换逻辑。Actor 的 `train()` 经 coordinator 释放全部 activation group；`update_weights` 在 coordinator 拥有该阶段时不再私自 onload teacher/GenRM；示例不再 `ray.get_actor("relax_genrm_manager")`。
+
+- [x] 将 GenRM defer 整合到框架阶段，取消示例对命名 actor 的直接依赖。`post_process_rewards` 在 `scoring_phase(PHASE_GENRM)` 内调用用户 hook，框架负责排空/卸载/唤醒/回睡与释放确认。
+
+- [x] 处理超时、取消、重复操作和阶段失败；失败时不继续激活冲突角色。drain 超时留在 DRAINING 并报 timeout，不移交资源；`finish_phase` 重复调用返回原结果；`enter_phase` 期间冲突切换返回 busy。
+
+- [x] 取消只发起中止，不把中止当作完成：Gateway 为 native `generate` 注入 `rid`（调用方已给则不覆盖），取消时先向 Router 背后的 worker 广播 `POST /abort_request {"rid": ...}`，再让统一 Manager 把该登记标记为 aborting 并**保留**（不报告为已完成）。仅 `dispatched=False`（请求从未到达引擎）才清除登记。
+
+  已中止的请求**不阻塞控制面 drain**，与基线 `2a8d2ed` 保持一致：断连时基线控制面完全不参与，安全性由引擎的 release 路径提供——`sglang_engine.py::release_memory_occupation` 先 `/pause_generation(mode="abort")` 停止接单并中止全部在途，再 `abort_requests` + `/flush_cache` 循环直到 200，由 `_GENRM_OFFLOAD_DRAIN_TIMEOUT_S=120s` 兜底且失败响亮。SGLang 在 scheduler 仍有 pending/running 请求时对 `/flush_cache` 返回 400，因此 **200 本身就是"无请求在跑"的确认证据**。控制面若在此二次判定，只会把客户端断连变成卡死的 activation group，而基线没有这个行为。drain 只等待仍可能自行完成的请求，被中止的在错误信息与 owner 日志中列出；`deactivate` 在释放确认后清除这些登记（引擎已报告不再占用显存），`shutdown_models` 在关闭确认后同样清除。
 
 验收：
 
-- GenRM defer 无需用户脚本手工控制模型切换。
-- 在途请求、重复调用、阶段中断、资源互斥有针对性测试。
-- split、hybrid、fully async 不因新增 Coordinator 被错误串行化。
+- GenRM defer 无需用户脚本手工控制模型切换：示例只打分，阶段切换在框架内。
+- 在途请求、重复调用、阶段中断、资源互斥有针对性测试：`tests/engine/inference/test_lifecycle.py`、`tests/distributed/ray/test_lifecycle_coordination.py`。
+- split、hybrid、fully async 不因新增 Coordinator 被错误串行化：无共享 slice 且无 defer 时 `create_coordinator` 返回空 epoch，不创建 coordinator；co-resident GenRM（共享 bundle 但不 defer）不进入阶段计划。
+
+未纳入 5A（记录原因，不算完成）：
+
+- 真实 Ray/多节点 GPU 下的阶段切换验收未执行：未提供集群、模型与硬件配置，CPU 回归不替代。
+- Rollout 的 generate 阶段仍由训练路径 onload（Phase 6 迁移），5A 用 `adopt_phase` 让 coordinator 记录该占用；这是迁移期接线，不是最终架构。
 
 ### 5B：Deferred OPD 数据闭环
 
-- [ ] 实现 submit/wait/get/cancel_deferred 与批次发布契约，将 Teacher prefill 移到独立评分阶段。
-- [ ] 保存样本标识、Teacher 输入、路由、多模态信息和 token-selection 所需数据。
-- [ ] Student 排空卸载后激活 Teacher，完成评分及结果关联。
-- [ ] 写回 sampled-token/top-k 等对应训练字段，验证长度、顺序、token 对齐与 mask。
-- [ ] 对需要 Student 二次 prefill 的模式，安排明确的后续激活阶段。
-- [ ] 默认在评分字段完整后再提交可训练数据；同步调整队列目标、生产完成信号和训练等待条件，避免相互等待。
-- [ ] 定义部分失败与重试策略，禁止未完成评分的样本被当作正常完整数据训练。
-- [ ] 保留现有即时 OPD 路径。
+- [x] 实现 submit/wait/get/cancel_deferred 与批次发布契约，将 Teacher prefill 移到独立评分阶段。`relax/engine/rollout/deferred.py` 的 `DeferredExecutor` 按固定状态序执行，批间串行（无跨批流水线）；`OpdManager` 拆出 `prepare_teacher_inputs/score_teacher/score_student_at_teacher/assemble_transfer`。
+- [x] 保存样本标识、Teacher 输入、路由、多模态信息和 token-selection 所需数据。`seal_batch` 在提交时封存 `sample_index/group_index/response_length/prompt_length/route_key/has_multimodal/token_selection/required_fields`，保持有效到终态。
+- [x] Student 排空卸载后激活 Teacher，完成评分及结果关联。评分在 `async_scoring_phase(PHASE_TEACHER)` 内进行：先排空并卸载 generate 阶段、确认释放，再唤醒 teacher；结果按 sample 身份关联，乱序完成不影响字段。
+- [x] 写回 sampled-token/top-k 等对应训练字段，验证长度、顺序、token 对齐与 mask。`validate_scored_batch` 校验存在性、顺序、重复、response_length 变化、每个必需字段的行数与 loss_mask 长度。
+- [x] 对需要 Student 二次 prefill 的模式，安排明确的后续激活阶段。`student_at_teacher` 模式在 teacher 阶段结束后经 `async_activate_phase(PHASE_GENERATE)` 显式重新激活 student，再做第二遍 prefill；重新激活失败则批次失败。
+- [x] 默认在评分字段完整后再提交可训练数据；同步调整队列目标、生产完成信号和训练等待条件，避免相互等待。批次在步内 staging、步末 flush 后才 `async_put`，`is_last` 随 staged 记录一起保留，队列目标与训练等待条件无需改动；colocate 下默认启用延迟评分，hybrid/fully async 默认即时。
+- [x] 定义部分失败与重试策略，禁止未完成评分的样本被当作正常完整数据训练。任一 eligible 样本未评分即整批失败并抛错，不自动重放结果未知的评分请求；成功样本只保留用于诊断。
+- [x] 保留现有即时 OPD 路径。未启用延迟评分、agentic resident pipeline 与专用 teacher GPU 仍走 `OpdManager.prefill` 内联路径。
 
 验收：
 
-- 同一批 GPU 可以串行完成 Student → Teacher → Trainer。
-- 固定样本与模型权重，比较即时/延迟评分的训练字段及 OPD 计算结果。
-- 覆盖乱序返回、部分失败、多教师路由、多模态和 top-k。
-- Teacher 结果写回前，训练不能消费该批数据。
+- 同一批 GPU 可以串行完成 Student → Teacher → Trainer：阶段切换与释放确认已实现并有 CPU 回归；真实共享 slice 的 GPU 验收待硬件。
+- 固定样本与模型权重，比较即时/延迟评分的训练字段及 OPD 计算结果：`tests/engine/rollout/test_deferred_opd_equivalence.py` 用同一批样本与确定性 teacher 响应，逐字段对比两条路径及 `produce_opd_transfer_data` 投影。
+- 覆盖乱序返回、部分失败、多教师路由、多模态和 top-k：见 `test_deferred_opd_equivalence.py`（乱序、MOPD 路由、多模态、student_topk/student_sampled）与 `test_deferred_opd.py`（部分失败、取消、重复提交、批间串行）。
+- Teacher 结果写回前，训练不能消费该批数据：发布在 VALIDATING 通过之后，未通过则不 `async_put`。
+
+未纳入 5B（记录原因，不算完成）：
+
+- `--opd-deferred-scoring` 开关尚未加入 `relax/utils/arguments.py`（参数解析属受保护改动，需单独确认）。当前读 `getattr(args, "opd_deferred_scoring", None)`：未设置时 colocate 默认启用、其他模式默认即时，因此默认行为已生效，仅缺显式命令行覆盖入口。
+- 让 teacher 与 rollout 复用同一批 bundle（`rollout_num_gpus == teacher_gpus == actor_gpus`）目前仍被 `validate_managed_opd_teacher_colocate_args` 拒绝；放开该布局需改参数校验，属受保护改动，未在本期进行。Planner 与 Coordinator 已支持跨阶段复用同一 slice。
+- Agentic resident pipeline 的延迟评分未实现：它自有 group 生命周期与 transfer domain，需要单独接线。
 
 ## Phase 6：完成 RolloutWorkload 与统一 EnginePool 迁移
 
@@ -628,7 +649,7 @@ GenRM defer 示例在后处理内执行 Rollout offload → named GenRM onload �
 
 - 当前必须定义的接口已列出：配置适配、注册/路由、Planner/materialize/rollback、生命周期、请求准入/完成/取消、模型切换、阶段占用、训练交接、Deferred 操作、发布与操作查询。
 - Phase 1 先实现无 Ray 副作用的公共类型和纯路由；三类 manager 适配只作为临时 characterization，Phase 2 必须替换为同一 Manager/Gateway 状态源。
-- 后续能力待实现验证，不作为缺失设计接口：引擎 abort 完成证据、Router/PD 版本适配、多节点释放、OPD 数值等价、队列发布确认。
+- 后续能力待实现验证，不作为缺失设计接口：引擎 abort 完成证据、Router/PD 版本适配、多节点释放、OPD 数值等价、队列发布确认。abort 的**发送**已在 Gateway 实现（per-rid 广播到 worker）；按 rid 查询是否已离开运行批次的公共契约仍不存在，但引擎 release 路径的 `/flush_cache` 200 已是模型级的"无请求在跑"确认，控制面据此在释放确认后清除被中止的登记，不另行推断单个 rid 的终止。
 - 首版明确排除：运行中新增/替换模型、GenRM/Teacher 新增弹性、跨批流水线、跨组联合事务、控制面透明恢复、公开 HTTP 生命周期控制。
 - 参数解析、Controller/Service/Launcher、新依赖、公开 API 删除/重命名仍为独立评审点，实施前提交具体差异并确认；Phase 0/首批纯类型与路由不触及这些受保护修改。
 - 多节点 GPU 集成测试未运行：未提供目标 Ray 集群、模型目录及多节点硬件信息；本期不启动训练，CPU mock 结果不能替代硬件验收。
@@ -680,3 +701,9 @@ GenRM defer 示例在后处理内执行 Rollout offload → named GenRM onload �
   - `relax/distributed/ray/rollout.py`：`RolloutManager -> start_rollout_servers/scale-out/scale-in -> task owner PlacementPlanner`；其 workload/runtime 生命周期已明确迁移到 Phase 6，role-local fallback 的最终删除归 Phase 7。
   - `relax/engine/inference/placement.py`：`plan -> _validate_parallel_layout/_validate_node_boundaries -> 同阶段重叠检查 -> PlacementSlice`；`release -> PlacementRelease.remove_placement_group`；`contended_phases -> PhaseContention`。
   - `relax/distributed/ray/placement_ledger.py`：`plan_placement/release_placement -> task owner actor 或角色自持 PlacementPlanner`，全部角色的唯一账本入口。
+- 2026-09-22 Phase 5A LifecycleCoordinator：新增 `relax/engine/inference/lifecycle.py`（六态步序、ActivationToken/PhaseHandle、PhasePlan、OperationResult/PhaseResult、ReleaseEvidence/HandoffResult、LifecycleCoordinator）与 `relax/engine/inference/phase_plans.py`（从 args 取模型身份、从 placement 账本取互斥关系）。`InferenceManager` 增加 `drain/deactivate/activate/shutdown_models` 与按模型的在途请求索引：drain 等待 `complete_request` 通知而不是定时器，deactivate 的 `release_confirmed` 来自 pool 的占用查询。`TaskInferenceManager` 实现 coordinator 的 manager port，permit 收敛到统一控制面（仅未注册的 legacy discovery host 保留兼容登记，并对其管理型 transition 返回 unsupported）。
+- 2026-09-22 Phase 5A review 修正（`cancel_request` 缺陷，由 review 指出）：原实现把 `cancel_request` 直接委托给 `complete_request`，既没有向引擎发送中止，又立即移除了在途登记——docstring 声称的"只发起中止、确认前维持在途"两条都不成立。后果：客户端断连或流中断后，并发 drain 会认为该模型已排空，deactivate 随即在请求仍在生成时 `release_memory_occupation`。同一类缺陷还有两处：`_forward` 把 `httpx.RequestError` 转成 502 返回后，`proxy` 仍按"非流式响应"调用 `complete_request`，即把上游连接/读取失败当作完成；流式 `body()` 的异常分支同样只清登记不发中止。修法见上条；`cancelling_requests` 的默认值曾用 `()` 与 set 做 `&`（TypeError），由新增回归抓到。首版修法曾让被中止的登记无限阻塞 drain（直到引擎重启），经 review 指出与基线不一致后改为交给引擎 release drain，见上条。
+- 2026-09-22 Phase 5A 修正的真实缺陷：`_ExternalPoolRuntime.is_onloaded` 原先返回本地缓存，等于"调用过 offload 就算释放"，现改为向 host 查询且不可达时报告仍占用；`RolloutManager.call("onload"/"offload")` 原先直达 pool，绕过 `_offload_local` 的健康监控暂停与 `status`，现改走自身入口；`TaskInferenceManagerActor` 原为单并发槽，drain 会因等不到 `complete_request` 而必然超时，现设 `max_concurrency` 并为非 RPC 的复合更新加锁。阻塞原因区分 `inference`/`training`：推理侧未确认释放可由重试排空恢复，训练侧 ranks 未确认则绝对拒绝（重排推理引擎对训练占用的显存无效）。
+- 2026-09-22 Phase 5A 接线：`Controller.register_all_serve` 末尾创建任务级 coordinator（已获确认的受保护改动）；`Service.set_inference_manager` → `Actor` → `ActorGroup` → `TrainRayActor` 注入 owner handle；megatron actor 的 `train()`/`update_weights()` 经 coordinator 释放与上报，保留 gloo 屏障与 weights/KV 两段恢复。
+- 2026-09-22 Phase 5B Deferred OPD：新增 `relax/engine/rollout/deferred.py`（sealed BatchRef、固定状态序、校验、批间串行执行器）、`relax/engine/rollout/deferred_opd.py`（步内 staging、步末 flush、teacher/student 两阶段）与 `relax/engine/rollout/scoring_phase.py`（同步/异步阶段上下文）。`OpdManager` 拆出可独立调度的评分阶段，即时路径行为不变。修正 `is_last` 未从 staged 记录传入 `submit_deferred` 的缺陷（会让流式分区永不关闭）。
+- 2026-09-22 Phase 5 回归：新增 `tests/engine/inference/test_lifecycle.py`(30)、`test_phase_plans.py`(8)、`test_gateway_cancellation.py`(9)、`tests/distributed/ray/test_lifecycle_coordination.py`(13)、`tests/engine/rollout/test_deferred_opd.py`(19)、`test_deferred_opd_session.py`(8)、`test_deferred_opd_equivalence.py`(5)。`tests/core` 修正一处测试缺陷：`test_controller_s3_cleanup_runs_after_initial_sync_before_service_run` 用 `__new__` 手工装配 Controller，未跟上新增的 `_inference_manager_handle`（生产代码 `__init__` 已初始化，故修测试）。真实 Ray/多节点 GPU 阶段切换验收未执行：未提供集群与硬件配置。

@@ -81,6 +81,24 @@ def is_managed_opd_teacher_enabled(args: Any) -> bool:
     )
 
 
+def parse_opd_teacher_routes(routes_json: str | None) -> dict[str, str]:
+    """Parse ``--opd-teacher-routes`` into ``{data_source: checkpoint}``.
+
+    One parser for the flag keeps the launch path and the phase plan from
+    disagreeing about which teachers exist.
+    """
+    if routes_json is None:
+        return {}
+    routes_map = json.loads(routes_json)
+    if not routes_map:
+        raise ValueError("--opd-teacher-routes must be a non-empty JSON object.")
+    return routes_map
+
+
+def resolve_opd_teacher_routes(args: Any) -> dict[str, str]:
+    return parse_opd_teacher_routes(getattr(args, "opd_teacher_routes", None))
+
+
 def is_managed_opd_teacher_colocate(args: Any) -> bool:
     return (
         is_managed_opd_teacher_enabled(args)
@@ -321,9 +339,7 @@ def _start_managed_multi_teacher(
 
     import ray
 
-    routes_map: dict[str, str] = json.loads(routes_json)
-    if not routes_map:
-        raise ValueError("--opd-teacher-routes must be a non-empty JSON object.")
+    routes_map: dict[str, str] = parse_opd_teacher_routes(routes_json)
 
     num_teachers = len(routes_map)
     _, total_teacher_gpus = args.resource["teacher"]

@@ -218,6 +218,9 @@ class Service:
     async def set_genrm_manager(self, genrm_manager: Any) -> None:
         await self.handle.set_genrm_manager.remote(genrm_manager)
 
+    async def set_inference_manager(self, inference_manager_handle: Any) -> None:
+        await self.handle.set_inference_manager.remote(inference_manager_handle)
+
     async def get_genrm_manager(self, route_key: Optional[str] = None) -> Any:
         """Get the GenRM manager selected by ``route_key``."""
         return await self.handle.get_genrm_manager.remote(route_key)

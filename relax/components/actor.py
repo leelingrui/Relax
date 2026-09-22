@@ -142,6 +142,11 @@ class Actor(Base):
         self.actor_model.set_genrm_manager(self.genrm_manager)
         self._logger.info("GenRM manager(s) set on Actor for coordinated offload/onload")
 
+    def set_inference_manager(self, inference_manager_handle: Any) -> None:
+        """Attach the task inference control plane for phase coordination."""
+        self.actor_model.set_inference_manager(inference_manager_handle)
+        self._logger.info("Inference control plane set on Actor for phase coordination")
+
     def set_teacher_manager(self, teacher_manager: Any) -> None:
         """Set the managed OPD teacher manager for coordinated
         offload/onload."""

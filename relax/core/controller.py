@@ -31,6 +31,7 @@ from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.inference_role import create_task_inference_manager
+from relax.engine.inference.phase_plans import deferred_phases, phase_targets_from_args
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -820,6 +821,32 @@ class Controller:
 
         logger.info(f"All {len(self.serve_dict)} services registered successfully: {list(self.serve_dict.keys())}")
 
+        self._create_lifecycle_coordinator()
+
+    def _create_lifecycle_coordinator(self) -> None:
+        """Give the task one coordinator over whatever inference GPUs are
+        shared.
+
+        The exclusions come from the placement ledger rather than from these
+        flags, so a layout that gave each role its own GPUs gets no coordinator
+        and keeps running its roles concurrently. A plan that cannot keep two
+        contending phases apart is a configuration error and fails here, before
+        any phase switch has happened.
+        """
+        if self._inference_manager_handle is None:
+            return
+        phase_targets = phase_targets_from_args(self.config, roles=self.serve_dict)
+        if not phase_targets:
+            return
+        session_id = ray.get_runtime_context().get_job_id()
+        epoch = ray.get(
+            self._inference_manager_handle.create_coordinator.remote(
+                session_id, phase_targets, deferred=deferred_phases(self.config)
+            )
+        )
+        if epoch:
+            logger.info(f"Inference lifecycle coordinator created: epoch={epoch}, phases={sorted(phase_targets)}")
+
     def _report_error_to_metrics_service(self, error: Exception):
         """Report error to metrics service for Apprise notification.
 
@@ -875,6 +902,12 @@ class Controller:
                     self._teacher_manager,
                     self.config,
                 )
+
+                # Phase coordination replaces the actor's direct cross-role
+                # offload/onload wherever a coordinator exists; with none, the
+                # client reports no phases and the direct path stays in use.
+                if self._inference_manager_handle is not None and ROLES.actor in self.serve_dict:
+                    await self.serve_dict[ROLES.actor].set_inference_manager(self._inference_manager_handle)
 
                 # Always set rollout_manager for both sync and async modes
                 # (needed for scaled-out engine weight sync in fully_async mode)

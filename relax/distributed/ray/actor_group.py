@@ -206,6 +206,14 @@ class RayTrainGroup:
         ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
         self._rollout_manager = rollout_manager
 
+    def set_inference_manager(self, inference_manager_handle: Any):
+        """Attach the task inference control plane to every training rank.
+
+        All ranks need it: rank 0 drives the phase switch, and the others gate
+        on the same barrier that already guards a colocated static pool.
+        """
+        ray.get([actor.set_inference_manager.remote(inference_manager_handle) for actor in self._actor_handlers])
+
     def set_genrm_manager(self, genrm_manager: Any):
         """Set the genRM manager for coordinated offload/onload.
 

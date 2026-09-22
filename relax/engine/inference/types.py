@@ -24,6 +24,22 @@ class LifecycleState(str, Enum):
 
 
 @dataclass(frozen=True)
+class ModelRef:
+    """A model identity across roles: ``(role, model_id)``, never a path."""
+
+    role: Role
+    model_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "role", Role(self.role))
+        if not self.model_id:
+            raise ValueError("A model reference requires a model ID")
+
+    def __str__(self) -> str:
+        return f"{self.role.value}/{self.model_id}"
+
+
+@dataclass(frozen=True)
 class ReplicaSnapshot:
     # Stable logical replica identity; it survives replacement of the process.
     engine_id: str

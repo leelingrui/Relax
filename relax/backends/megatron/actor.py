@@ -29,7 +29,9 @@ from transformers import AutoConfig, AutoTokenizer
 
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
+from relax.distributed.ray.lifecycle_client import PHASE_DRAIN_TIMEOUT_S
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.engine.inference.phase_plans import PHASE_GENERATE, PHASE_GENRM, PHASE_TEACHER
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
@@ -365,6 +367,8 @@ class MegatronTrainRayActor(TrainRayActor):
         prepare_model_maybe_update_args(args)
 
         self.genrm_manager = None
+        self._phase_adopt_seq = 0
+        self._phase_release_seq = 0
 
         if repatch is not None:
             repatch(args)
@@ -920,21 +924,75 @@ class MegatronTrainRayActor(TrainRayActor):
         """Backward-compatible name kept for existing internal call sites."""
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
+    def _release_inference_for_training(self, rollout_id: int) -> None:
+        """Free the shared inference GPUs and confirm the release.
+
+        Every phase the coordinator sequences is released through it, so the
+        release is confirmed per model instead of assumed from a returned RPC.
+        The direct manager handles stay for the roles it does not sequence -- a
+        co-resident GenRM, or a teacher that has its own GPUs.
+        """
+        coordinated = set(self.coordinated_phases())
+        if coordinated:
+            results = self.phase_client.release_all(
+                operation_id=f"train-release:{rollout_id}", timeout_s=PHASE_DRAIN_TIMEOUT_S
+            )
+            unconfirmed = [result for result in results if not result.release_confirmed]
+            if unconfirmed:
+                # Training must not start on GPUs whose release nobody confirmed.
+                raise RuntimeError(
+                    "Inference phases did not confirm their release before training: "
+                    + "; ".join(
+                        f"{result.activation_group}: step={result.last_confirmed_step} error={result.error}"
+                        for result in unconfirmed
+                    )
+                )
+        handles = []
+        if self.genrm_manager is not None and PHASE_GENRM not in coordinated:
+            # A list of one or more GenRM manager handles (one per instance).
+            handles.extend(m.offload.remote() for m in self.genrm_manager)
+        if PHASE_TEACHER not in coordinated:
+            append_managed_opd_teacher_offload_handle(handles, self)
+        if handles:
+            ray.get(handles)
+
+    def _confirm_training_release(self) -> None:
+        """Report that every training rank released the shared GPUs.
+
+        The gloo barrier is the evidence: a rank that has not reached it has
+        not released, and rank 0 answering for the others would be exactly the
+        assumption the deferred plans must not make. Only after this does the
+        control plane reopen the slice to an inference phase.
+        """
+        from relax.engine.inference.lifecycle import ReleaseEvidence
+
+        process_group = get_gloo_group()
+        world_size = dist.get_world_size(group=process_group)
+        dist.barrier(group=process_group)
+        if dist.get_rank(group=process_group) != 0:
+            return
+        self._phase_release_seq += 1
+        self.phase_client.confirm_training_release(
+            ReleaseEvidence(True, confirmed_ranks=tuple(range(world_size)), total_ranks=world_size),
+            operation_id=f"train-release-confirmed:{self._phase_release_seq}",
+        )
+
+    def _needs_inference_release_barrier(self) -> bool:
+        """Whether the other ranks must wait for rank 0 to free inference
+        memory."""
+        return (
+            self.genrm_manager is not None or has_managed_opd_teacher_manager(self) or bool(self.coordinated_phases())
+        )
+
     def train(self, rollout_id: int) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
-            pre_train_offload_handles = []
-            if self.genrm_manager is not None:
-                # A list of one or more GenRM manager handles (one per instance).
-                pre_train_offload_handles.extend(m.offload.remote() for m in self.genrm_manager)
-            append_managed_opd_teacher_offload_handle(pre_train_offload_handles, self)
-            if pre_train_offload_handles:
-                ray.get(pre_train_offload_handles)
+            self._release_inference_for_training(rollout_id)
 
         # Gate all ranks behind rank-0's GenRM/OPD-teacher offload: otherwise
         # other ranks wake_up() and reclaim GPU memory while colocated GenRM or
         # teacher still holds its static pool, causing cuMemCreate OOM (mirrors
         # the update_weights barrier).
-        if self.args.offload_rollout and (self.genrm_manager is not None or has_managed_opd_teacher_manager(self)):
+        if self.args.offload_rollout and self._needs_inference_release_barrier():
             dist.barrier(group=get_gloo_group())
 
         if self.args.offload_train and self._per_step_rollout:
@@ -2430,13 +2488,20 @@ class MegatronTrainRayActor(TrainRayActor):
             # still hold GPU memory, causing cuMemCreate OOM in SGLang schedulers.
             dist.barrier(group=get_gloo_group())
 
+        coordinated_phases = set(self.coordinated_phases())
+        if coordinated_phases:
+            # Reopen the shared slice only once every rank confirmed its release.
+            self._confirm_training_release()
         if self.args.offload_rollout and dist.get_rank() == 0:
             # Onload rollout weights. genRM (no NCCL weight sync — the reward
             # model is static) is deferred to after the weight all-gather: in
             # colocate mode its static pool would collide with the all-gather's
             # temp buffers and OOM. See onload_kv below (post_sync_handles).
             onload_handles = [self.rollout_manager.onload_weights.remote()]
-            append_managed_opd_teacher_onload_handle(onload_handles, self)
+            if PHASE_TEACHER not in coordinated_phases:
+                # A sequenced teacher is activated by its scoring phase instead,
+                # so waking it here would hold memory through the whole step.
+                append_managed_opd_teacher_onload_handle(onload_handles, self)
             ray.get(onload_handles)
 
         if self.args.use_fault_tolerance:
@@ -2508,7 +2573,11 @@ class MegatronTrainRayActor(TrainRayActor):
             post_sync_handles = []
             if self._per_step_rollout:
                 post_sync_handles.append(self.rollout_manager.onload_kv.remote())
-            if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
+            if (
+                self.genrm_manager is not None
+                and PHASE_GENRM not in coordinated_phases
+                and not getattr(self.args, "defer_reward_to_post_process", False)
+            ):
                 # A list of one or more GenRM manager handles (one per instance).
                 post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
             if post_sync_handles:
@@ -2516,6 +2585,14 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if dist.get_rank(group=get_gloo_group()) == 0:
             ray.get(self.rollout_manager.complete_inference_weight_update.remote())
+
+        if PHASE_GENERATE in coordinated_phases and dist.get_rank() == 0:
+            # Rollout restores its own weights and KV in two stages through the
+            # training path (Phase 6 moves that into the Manager). Until then the
+            # coordinator has to be told the slice is occupied, or the next phase
+            # switch would leave these engines resident alongside the next role.
+            self._phase_adopt_seq += 1
+            self.phase_client.adopt(PHASE_GENERATE, operation_id=f"generate-adopt:{self._phase_adopt_seq}")
 
     @timer("wait update_weights_fully_async")
     def _check_services_health(self) -> tuple[bool, bool]:

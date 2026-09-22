@@ -35,6 +35,41 @@ _HOP_BY_HOP_HEADERS = {
 }
 GATEWAY_REQUEST_HEADER = "x-relax-inference-gateway"
 
+# Errors that prove the request never reached an engine. Anything else that
+# fails after the request was sent leaves its fate unknown, which is not the
+# same thing and must not clear the registration.
+_NOT_DISPATCHED_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.UnsupportedProtocol)
+
+_ABORT_TIMEOUT_S = 10.0
+
+
+class _UpstreamAttempt:
+    """What we actually know about one upstream request.
+
+    ``dispatched`` means bytes reached an engine, so its fate is unknown until
+    something terminal is observed. ``terminal`` means a complete upstream
+    response was received, which is the only completion evidence a gateway has.
+    """
+
+    __slots__ = ("dispatched", "terminal")
+
+    def __init__(self) -> None:
+        self.dispatched = False
+        self.terminal = False
+
+
+def _permit_request_id(permit: Any) -> str | None:
+    """Read the request identity from a permit, whatever shape it arrives
+    in."""
+    if permit is None:
+        return None
+    if isinstance(permit, str):
+        return permit
+    value = getattr(permit, "request_id", None)
+    if value is None and isinstance(permit, Mapping):
+        value = permit.get("request_id")
+    return str(value) if value else None
+
 
 def _json_error(status_code: int, message: str, *, code: str) -> JSONResponse:
     return JSONResponse(
@@ -186,11 +221,17 @@ class InferenceGateway:
             )
 
         permit = await self._admit(request, model_id, target)
+        attempt = _UpstreamAttempt()
 
         try:
             payload.pop("route_key", None)
             if path == "generate":
                 payload.pop("model", None)
+                # Give the engine the permit identity as its own request id, so a
+                # cancel has something to abort. Without an addressable rid the
+                # only abort available is "abort everything".
+                if permit is not None and not payload.get("rid"):
+                    payload["rid"] = _permit_request_id(permit)
             wrap_response = False
             if messages_request:
                 if self.genrm_backend_handle is None:
@@ -200,14 +241,24 @@ class InferenceGateway:
                 )
                 wrap_response = True
             response = await self._forward(
-                request, path, target, json.dumps(payload).encode(), wrap_response=wrap_response, permit=permit
+                request,
+                path,
+                target,
+                json.dumps(payload).encode(),
+                wrap_response=wrap_response,
+                permit=permit,
+                attempt=attempt,
             )
             if permit is not None and not isinstance(response, StreamingResponse):
-                await self._complete(permit)
+                if attempt.terminal:
+                    await self._complete(permit)
+                else:
+                    # A 502 from a failed upstream call is not a completion.
+                    await self._cancel(permit, target, dispatched=attempt.dispatched)
             return response
         except Exception:
             if permit is not None:
-                await self._cancel(permit)
+                await self._cancel(permit, target, dispatched=attempt.dispatched)
             raise
 
     async def _manager_call(self, method: str, **kwargs: Any) -> Any:
@@ -240,8 +291,58 @@ class InferenceGateway:
     async def _complete(self, permit: Any) -> None:
         await self._manager_call("complete_request", permit=permit)
 
-    async def _cancel(self, permit: Any) -> None:
-        await self._manager_call("cancel_request", permit=permit)
+    async def _cancel(self, permit: Any, target: str | None, *, dispatched: bool = True) -> None:
+        """Abort the upstream request first, then record the cancel.
+
+        Order matters: the registration stays in flight until something
+        confirms the request ended, so sending the abort is the only thing that
+        can make that happen. A failed abort is logged and still recorded,
+        because a request nobody could abort is exactly the one that must keep
+        blocking a drain.
+        """
+        if dispatched and target is not None:
+            await self._abort_upstream(target, _permit_request_id(permit))
+        await self._manager_call("cancel_request", permit=permit, dispatched=dispatched)
+
+    async def _abort_upstream(self, target: str, request_id: str | None) -> None:
+        """Send an abort for ``request_id`` to the workers behind ``target``.
+
+        The router does not proxy aborts, so it is broadcast to its workers,
+        the same way the rollout and Agentic paths do it. An ACK only proves
+        the scheduler received it, never that the request left the running
+        batch.
+        """
+        if not request_id:
+            return
+        try:
+            urls = await self._worker_base_urls(target)
+        except Exception as exc:
+            self._logger.warning("Could not resolve engines behind %s to abort %s: %s", target, request_id, exc)
+            return
+        results = await asyncio.gather(
+            *(
+                self._client.post(f"{url}/abort_request", json={"rid": request_id}, timeout=_ABORT_TIMEOUT_S)
+                for url in urls
+            ),
+            return_exceptions=True,
+        )
+        for url, result in zip(urls, results, strict=False):
+            if isinstance(result, BaseException):
+                self._logger.warning("Abort of %s at %s failed: %s", request_id, url, result)
+
+    async def _worker_base_urls(self, target: str) -> list[str]:
+        from relax.utils.http_utils import router_worker_base_urls
+
+        base = target.rstrip("/")
+        try:
+            response = await self._client.get(f"{base}/workers", timeout=_ABORT_TIMEOUT_S)
+            response.raise_for_status()
+            urls = [worker["url"] for worker in response.json()["workers"] if worker.get("url")]
+        except Exception:
+            response = await self._client.get(f"{base}/list_workers", timeout=_ABORT_TIMEOUT_S)
+            response.raise_for_status()
+            urls = list(response.json()["urls"])
+        return router_worker_base_urls(urls)
 
     async def proxy_backend(self, request: Request, path: str) -> Response:
         """Forward role control-plane endpoints to the internal service."""
@@ -258,6 +359,7 @@ class InferenceGateway:
         *,
         wrap_response: bool = False,
         permit: Any = None,
+        attempt: _UpstreamAttempt | None = None,
     ) -> Response:
         headers = {
             key: value
@@ -272,12 +374,17 @@ class InferenceGateway:
         response: httpx.Response | None = None
         try:
             response = await self._client.send(upstream, stream=True)
+            if attempt is not None:
+                # Response headers are back, so the engine has the request.
+                attempt.dispatched = True
             if response.headers.get("content-type", "").startswith("text/event-stream"):
-                stream_response = self._stream_response(response, permit)
+                stream_response = self._stream_response(response, permit, target)
                 permit = None
                 response = None
                 return stream_response
             content = await response.aread()
+            if attempt is not None:
+                attempt.terminal = True
             response_headers = {
                 key: value for key, value in response.headers.items() if key.lower() not in _HOP_BY_HOP_HEADERS
             }
@@ -291,19 +398,26 @@ class InferenceGateway:
                 content=content, status_code=response.status_code, headers=response_headers, media_type=None
             )
         except httpx.RequestError as exc:
+            if attempt is not None and not isinstance(exc, _NOT_DISPATCHED_ERRORS):
+                attempt.dispatched = True
             return _json_error(502, f"Failed to connect to inference router: {exc}", code="upstream_unavailable")
         finally:
             if response is not None and not response.is_closed:
                 await response.aclose()
 
-    def _stream_response(self, response: httpx.Response, permit: Any = None) -> StreamingResponse:
+    def _stream_response(
+        self, response: httpx.Response, permit: Any = None, target: str | None = None
+    ) -> StreamingResponse:
         async def body():
             try:
                 async for chunk in response.aiter_raw():
                     yield chunk
             except BaseException:
+                # The stream broke or the client went away. The engine is still
+                # generating until the abort takes effect, so the registration
+                # stays in flight.
                 if permit is not None:
-                    await self._cancel(permit)
+                    await self._cancel(permit, target, dispatched=True)
                 raise
             else:
                 if permit is not None:

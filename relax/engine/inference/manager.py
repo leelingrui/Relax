@@ -6,15 +6,30 @@ owners."""
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from threading import RLock, get_ident
-from typing import Any, Callable, Iterator, Mapping, Protocol
+from threading import Condition, RLock, get_ident
+from time import monotonic
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 from uuid import uuid4
 
 from relax.engine.inference.capabilities import WeightSource
 from relax.engine.inference.config import ModelConfig
 from relax.engine.inference.discovery import new_manager_epoch
+from relax.engine.inference.lifecycle import (
+    STEP_ACTIVATED,
+    STEP_ADMISSION_CLOSED,
+    STEP_DEACTIVATED,
+    STEP_DRAINED,
+    STEP_READY_PUBLISHED,
+    STEP_RELEASE_CONFIRMED,
+    ActivationToken,
+    ErrorCode,
+    LifecycleError,
+    OperationError,
+    OperationResult,
+    OperationStatus,
+)
 from relax.engine.inference.specs import validate_routes
-from relax.engine.inference.types import LifecycleState, ModelSnapshot, Role, RoleSnapshot, RoutingSpec
+from relax.engine.inference.types import LifecycleState, ModelRef, ModelSnapshot, Role, RoleSnapshot, RoutingSpec
 
 
 @dataclass(frozen=True)
@@ -521,6 +536,16 @@ class InferenceManager:
         self._default_role = Role(role) if role is not None else None
         self._roles: dict[Role, _RoleInferenceState] = {}
         self._permits: dict[str, RequestPermit] = {}
+        # In-flight requests per model. Draining waits on this index rather than
+        # on a timer: a deadline proves nothing about whether a request finished.
+        self._inflight: dict[ModelRef, set[str]] = {}
+        # Registrations whose abort was sent and whose termination is not
+        # confirmed. They stay in flight: an abort ACK is not a completion.
+        self._cancelling: set[str] = set()
+        self._inflight_cv = Condition(self._lock)
+        self._lifecycle_ops: dict[str, tuple[tuple, OperationResult]] = {}
+        # Shared by reference so a role-scoped view sees the same authority.
+        self._authority: dict[str, str | None] = {"coordinator_epoch": None}
         if self._default_role is not None:
             self._state(self._default_role)
 
@@ -544,6 +569,11 @@ class InferenceManager:
         view._default_role = Role(role)
         view._roles = self._roles
         view._permits = self._permits
+        view._inflight = self._inflight
+        view._cancelling = self._cancelling
+        view._inflight_cv = self._inflight_cv
+        view._lifecycle_ops = self._lifecycle_ops
+        view._authority = self._authority
         view._state(view._default_role)
         return view
 
@@ -733,21 +763,539 @@ class InferenceManager:
             if existing is not None and existing != permit:
                 raise ValueError(f"Request already exists: {rid}")
             self._permits[rid] = permit
+            self._inflight.setdefault(ModelRef(selected, model_id), set()).add(rid)
             return permit
 
     def complete_request(self, permit: RequestPermit | str) -> None:
         request_id = permit if isinstance(permit, str) else permit.request_id
-        with self._lock:
+        with self._inflight_cv:
             current = self._permits.get(request_id)
             if current is None:
                 return
             if not isinstance(permit, str) and current != permit:
                 raise ValueError("Request permit does not belong to this manager epoch and target")
             self._permits.pop(request_id, None)
+            self._cancelling.discard(request_id)
+            pending = self._inflight.get(ModelRef(current.role, current.model_id))
+            if pending is not None:
+                pending.discard(request_id)
+                if not pending:
+                    self._inflight.pop(ModelRef(current.role, current.model_id), None)
+            self._inflight_cv.notify_all()
 
-    def cancel_request(self, permit: RequestPermit | str) -> None:
-        self.complete_request(permit)
+    def cancel_request(self, permit: RequestPermit | str, *, dispatched: bool = True) -> RequestPermit | None:
+        """Record that an abort was started; the request is not yet complete.
+
+        A cancel is not a completion: sending an abort only proves the engine's
+        scheduler received it, never that the request left the running batch. So
+        the registration is kept and reported as aborting -- this control plane
+        never claims the request finished.
+
+        It deliberately does *not* keep blocking a drain. The evidence that an
+        aborted request really stopped belongs to the engine's release path,
+        which pauses admission, aborts what is in flight and then waits for
+        ``/flush_cache`` to return 200 -- and SGLang answers 400 while the
+        scheduler still has pending or running requests, so that 200 *is* the
+        confirmation. Second-guessing it here would turn a client disconnect into
+        a stuck activation group, which is not how this behaved before the
+        control plane existed.
+
+        ``dispatched=False`` means the request never reached an engine, so there
+        is nothing to abort or to track.
+
+        Returns the registration still in flight, or ``None`` once it is gone.
+        """
+        request_id = permit if isinstance(permit, str) else permit.request_id
+        if not dispatched:
+            self.complete_request(permit)
+            return None
+        with self._inflight_cv:
+            current = self._permits.get(request_id)
+            if current is None:
+                return None
+            if not isinstance(permit, str) and current != permit:
+                raise ValueError("Request permit does not belong to this manager epoch and target")
+            self._cancelling.add(request_id)
+            return current
 
     def get_request(self, request_id: str) -> RequestPermit | None:
         with self._lock:
             return self._permits.get(request_id)
+
+    def inflight_requests(self, target: ModelRef) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._inflight.get(target, ())))
+
+    def cancelling_requests(self, target: ModelRef) -> tuple[str, ...]:
+        """Registrations whose abort was sent but whose end is unconfirmed."""
+        with self._lock:
+            return tuple(sorted(self._inflight.get(target, set()) & self._cancelling))
+
+    def _waiting_requests(self, targets: Sequence[ModelRef]) -> dict[str, set[str]]:
+        """In-flight registrations that are still expected to complete."""
+        return {str(target): self._inflight.get(target, set()) - self._cancelling for target in targets}
+
+    def _discard_aborted(self, target: ModelRef) -> tuple[str, ...]:
+        """Drop aborted registrations once the release is confirmed.
+
+        A confirmed release means the engine reported it no longer occupies
+        device memory, which on the colocated paths is only true after its own
+        pause/abort/flush sequence succeeded. The aborted request is therefore
+        provably over, and keeping its registration would only leak.
+        """
+        with self._inflight_cv:
+            pending = self._inflight.get(target)
+            if not pending:
+                return ()
+            dropped = tuple(sorted(pending & self._cancelling))
+            for request_id in dropped:
+                pending.discard(request_id)
+                self._permits.pop(request_id, None)
+                self._cancelling.discard(request_id)
+            if not pending:
+                self._inflight.pop(target, None)
+            if dropped:
+                self._inflight_cv.notify_all()
+            return dropped
+
+    def _discard_registrations(self, target: ModelRef) -> tuple[str, ...]:
+        """Drop registrations because the engine process is confirmed gone.
+
+        Process exit is the one piece of evidence stronger than a drain:
+        nothing of that request is running any more.
+        """
+        with self._inflight_cv:
+            dropped = tuple(sorted(self._inflight.pop(target, set())))
+            for request_id in dropped:
+                self._permits.pop(request_id, None)
+                self._cancelling.discard(request_id)
+            if dropped:
+                self._inflight_cv.notify_all()
+            return dropped
+
+    # ------------------------------------------------------------------
+    # Unified lifecycle: the six states and the fixed transition order.
+    # ------------------------------------------------------------------
+    def bind_coordinator(self, coordinator_epoch: str) -> None:
+        """Require an activation token for every shared-resource transition.
+
+        Before a Coordinator exists, the legacy call sites move models
+        directly; once one is bound, an untokened activate/deactivate is
+        rejected so a user script cannot take a slice behind the Coordinator's
+        back.
+        """
+        if not coordinator_epoch:
+            raise ValueError("A coordinator epoch is required")
+        with self._lock:
+            current = self._authority["coordinator_epoch"]
+            if current is not None and current != coordinator_epoch:
+                raise LifecycleError(
+                    OperationError(ErrorCode.CONFLICT, "Another coordinator already owns this control plane")
+                )
+            self._authority["coordinator_epoch"] = coordinator_epoch
+
+    @property
+    def coordinator_epoch(self) -> str | None:
+        return self._authority["coordinator_epoch"]
+
+    def _model_refs(
+        self, model_names: str | ModelRef | Sequence[str | ModelRef], role: Role | str | None
+    ) -> tuple[ModelRef, ...]:
+        if isinstance(model_names, (str, ModelRef)):
+            model_names = [model_names]
+        refs: list[ModelRef] = []
+        for item in model_names:
+            if isinstance(item, ModelRef):
+                refs.append(item)
+                continue
+            selected = Role(role) if role is not None else self._default_role
+            if selected is None:
+                raise LifecycleError(
+                    OperationError(ErrorCode.INVALID_ARGUMENT, "A model name requires an inference role")
+                )
+            refs.append(ModelRef(selected, item))
+        if len(set(refs)) != len(refs):
+            raise LifecycleError(OperationError(ErrorCode.INVALID_ARGUMENT, "Duplicate lifecycle targets"))
+        return tuple(refs)
+
+    def _authorize(self, token: ActivationToken | None, targets: Sequence[ModelRef]) -> None:
+        with self._lock:
+            authority = self._authority["coordinator_epoch"]
+        if authority is None:
+            return
+        if token is None:
+            raise LifecycleError(
+                OperationError(ErrorCode.INVALID_ARGUMENT, "A coordinator is bound; an activation token is required")
+            )
+        if token.coordinator_epoch != authority:
+            raise LifecycleError(
+                OperationError(ErrorCode.STALE_GENERATION, "Activation token belongs to an earlier coordinator")
+            )
+        missing = [str(target) for target in targets if not token.covers(target)]
+        if missing:
+            raise LifecycleError(
+                OperationError(ErrorCode.INVALID_ARGUMENT, f"Activation token does not cover {sorted(missing)}")
+            )
+
+    def _replay_lifecycle(self, operation_id: str, signature: tuple) -> OperationResult | None:
+        if not operation_id:
+            raise LifecycleError(OperationError(ErrorCode.INVALID_ARGUMENT, "An operation ID is required"))
+        with self._lock:
+            record = self._lifecycle_ops.get(operation_id)
+        if record is None:
+            return None
+        if record[0] != signature:
+            raise LifecycleError(
+                OperationError(ErrorCode.CONFLICT, f"Operation {operation_id} was used for other arguments")
+            )
+        return record[1]
+
+    def _record_lifecycle(self, operation_id: str, signature: tuple, result: OperationResult) -> OperationResult:
+        with self._lock:
+            self._lifecycle_ops[operation_id] = (signature, result)
+        return result
+
+    def _result(
+        self,
+        operation_id: str,
+        kind: str,
+        targets: Sequence[ModelRef],
+        *,
+        status: OperationStatus,
+        step: str | None = None,
+        error: OperationError | None = None,
+        release_confirmed: bool = False,
+    ) -> OperationResult:
+        return OperationResult(
+            operation_id=operation_id,
+            owner_epoch=self.manager_epoch,
+            status=status,
+            kind=kind,
+            targets=tuple(targets),
+            last_confirmed_step=step,
+            error=error,
+            release_confirmed=release_confirmed,
+        )
+
+    def _model_state(self, target: ModelRef) -> ModelSnapshot:
+        snapshot = self._state(target.role).snapshot((target.model_id,))
+        return snapshot.models[0]
+
+    def _pool_of(self, target: ModelRef) -> EnginePoolRuntime | None:
+        return self._state(target.role)._pools.get(target.model_id)
+
+    def _dispatchable(self, target: ModelRef, method: str) -> bool:
+        pool = self._state(target.role)._dispatch_pools.get(target.model_id)
+        return pool is not None and callable(getattr(pool, method, None))
+
+    def drain(
+        self,
+        model_names: str | ModelRef | Sequence[str | ModelRef],
+        *,
+        operation_id: str,
+        activation_token: ActivationToken | None = None,
+        timeout_s: float | None = None,
+        role: Role | str | None = None,
+    ) -> OperationResult:
+        """Close model admission and wait for the registered requests to end.
+
+        Success leaves the models in ``DRAINING``: draining does not release
+        memory, and a timeout keeps them there with an error rather than
+        handing the resource on.
+        """
+        targets = self._model_refs(model_names, role)
+        signature = ("drain", targets, timeout_s)
+        replay = self._replay_lifecycle(operation_id, signature)
+        if replay is not None:
+            return replay
+        self._authorize(activation_token, targets)
+        try:
+            for target in targets:
+                model = self._model_state(target)
+                if model.state in (LifecycleState.SLEEPING, LifecycleState.DEAD):
+                    continue
+                self.invalidate_model(target.model_id, state=LifecycleState.DRAINING, role=target.role)
+        except ModelBusyError as exc:
+            return self._record_lifecycle(
+                operation_id,
+                signature,
+                self._result(
+                    operation_id,
+                    "drain",
+                    targets,
+                    status=OperationStatus.FAILED,
+                    error=OperationError(ErrorCode.BUSY, str(exc), retryable=True),
+                ),
+            )
+        deadline = None if timeout_s is None else monotonic() + float(timeout_s)
+        with self._inflight_cv:
+            # Wait only for requests still expected to finish on their own. An
+            # aborted one belongs to the engine release path, not to this wait;
+            # see cancel_request.
+            while any(self._waiting_requests(targets).values()):
+                remaining = None if deadline is None else deadline - monotonic()
+                if remaining is not None and remaining <= 0:
+                    break
+                # Completion notifies, so the bounded wait is only a liveness
+                # re-check; it never concludes that a request finished.
+                self._inflight_cv.wait(min(remaining, 1.0) if remaining is not None else 1.0)
+            waiting = {name: sorted(requests) for name, requests in self._waiting_requests(targets).items()}
+            aborting = {
+                str(target): sorted(self._inflight.get(target, set()) & self._cancelling) for target in targets
+            }
+        outstanding = {name: requests for name, requests in waiting.items() if requests}
+        aborted = {name: requests for name, requests in aborting.items() if requests}
+        if outstanding:
+            return self._record_lifecycle(
+                operation_id,
+                signature,
+                self._result(
+                    operation_id,
+                    "drain",
+                    targets,
+                    status=OperationStatus.FAILED,
+                    step=STEP_ADMISSION_CLOSED,
+                    error=OperationError(
+                        ErrorCode.TIMEOUT,
+                        f"Requests are still in flight: {outstanding}"
+                        + (f"; aborted, left to the engine release drain: {aborted}" if aborted else ""),
+                        retryable=True,
+                    ),
+                ),
+            )
+        return self._record_lifecycle(
+            operation_id,
+            signature,
+            self._result(operation_id, "drain", targets, status=OperationStatus.COMPLETED, step=STEP_DRAINED),
+        )
+
+    def deactivate(
+        self,
+        model_names: str | ModelRef | Sequence[str | ModelRef],
+        *,
+        operation_id: str,
+        activation_token: ActivationToken | None = None,
+        role: Role | str | None = None,
+        observe: Callable[[Sequence[ModelRef]], None] | None = None,
+    ) -> OperationResult:
+        """Release device memory and confirm it, model by model.
+
+        ``release_confirmed`` is only true when every target's pool reports
+        that it no longer occupies memory. An exception, an unreachable actor
+        or a pool that still reports occupation all leave it false.
+        """
+        targets = self._model_refs(model_names, role)
+        signature = ("deactivate", targets)
+        replay = self._replay_lifecycle(operation_id, signature)
+        if replay is not None:
+            return replay
+        self._authorize(activation_token, targets)
+        error: OperationError | None = None
+        for target in targets:
+            pool = self._pool_of(target)
+            if pool is None:
+                error = OperationError(
+                    ErrorCode.NOT_FOUND, f"No engine pool is bound for {target}", model_id=target.model_id
+                )
+                break
+            try:
+                if self._dispatchable(target, "offload"):
+                    self.dispatch(target.model_id, "offload", wait=True, role=target.role)
+                else:
+                    self.offload(target.model_id, role=target.role)
+            except ModelBusyError as exc:
+                error = OperationError(ErrorCode.BUSY, str(exc), retryable=True, model_id=target.model_id)
+                break
+            except Exception as exc:
+                error = OperationError(ErrorCode.UNAVAILABLE, f"{type(exc).__name__}: {exc}", model_id=target.model_id)
+                break
+        if observe is not None:
+            # Let an owner commit the backend's own observation before the
+            # result is evaluated, so one operation produces one recorded state.
+            try:
+                observe(targets)
+            except Exception as exc:
+                error = error or OperationError(ErrorCode.UNAVAILABLE, f"{type(exc).__name__}: {exc}")
+        confirmed = error is None and all(self._release_confirmed(target) for target in targets)
+        if confirmed:
+            for target in targets:
+                self._discard_aborted(target)
+        if error is None and not confirmed:
+            error = OperationError(
+                ErrorCode.UNKNOWN_COMPLETION, "A pool still reports occupied device memory after deactivation"
+            )
+        return self._record_lifecycle(
+            operation_id,
+            signature,
+            self._result(
+                operation_id,
+                "deactivate",
+                targets,
+                status=OperationStatus.COMPLETED if error is None else OperationStatus.FAILED,
+                step=STEP_RELEASE_CONFIRMED if confirmed else STEP_DEACTIVATED,
+                error=error,
+                release_confirmed=confirmed,
+            ),
+        )
+
+    def _release_confirmed(self, target: ModelRef) -> bool:
+        pool = self._pool_of(target)
+        if pool is None:
+            return False
+        try:
+            return not bool(pool.is_onloaded())
+        except Exception:
+            # An unreachable pool is not proof of a release.
+            return False
+
+    def activate(
+        self,
+        model_names: str | ModelRef | Sequence[str | ModelRef],
+        *,
+        operation_id: str,
+        activation_token: ActivationToken | None = None,
+        tags: list[str] | None = None,
+        role: Role | str | None = None,
+        observe: Callable[[Sequence[ModelRef]], None] | None = None,
+    ) -> OperationResult:
+        """Restore device memory for the targets and report what was confirmed.
+
+        ``ready_published`` is only reported when every target actually reached
+        ``READY``. A policy model whose weights the trainer has yet to
+        synchronize legitimately stops at ``activated``; a target that ends up
+        ``DEAD`` fails.
+        """
+        targets = self._model_refs(model_names, role)
+        signature = ("activate", targets, tuple(tags or ()))
+        replay = self._replay_lifecycle(operation_id, signature)
+        if replay is not None:
+            return replay
+        self._authorize(activation_token, targets)
+        error: OperationError | None = None
+        for target in targets:
+            model = self._model_state(target)
+            if model.state == LifecycleState.READY and tags is None and self._pool_is_onloaded(target):
+                continue
+            try:
+                if self._dispatchable(target, "onload"):
+                    self.dispatch(target.model_id, "onload", tags, wait=True, role=target.role)
+                else:
+                    self.onload(target.model_id, tags, role=target.role)
+            except ModelBusyError as exc:
+                error = OperationError(ErrorCode.BUSY, str(exc), retryable=True, model_id=target.model_id)
+                break
+            except Exception as exc:
+                error = OperationError(ErrorCode.UNAVAILABLE, f"{type(exc).__name__}: {exc}", model_id=target.model_id)
+                break
+        if observe is not None:
+            try:
+                observe(targets)
+            except Exception as exc:
+                error = error or OperationError(ErrorCode.UNAVAILABLE, f"{type(exc).__name__}: {exc}")
+        states = {target: self._model_state(target).state for target in targets}
+        dead = [str(target) for target, state in states.items() if state == LifecycleState.DEAD]
+        if error is None and dead:
+            error = OperationError(ErrorCode.UNAVAILABLE, f"Activation left models dead: {sorted(dead)}")
+        ready = all(state == LifecycleState.READY for state in states.values())
+        return self._record_lifecycle(
+            operation_id,
+            signature,
+            self._result(
+                operation_id,
+                "activate",
+                targets,
+                status=OperationStatus.COMPLETED if error is None else OperationStatus.FAILED,
+                step=STEP_READY_PUBLISHED if error is None and ready else STEP_ACTIVATED,
+                error=error,
+                release_confirmed=False,
+            ),
+        )
+
+    def _pool_is_onloaded(self, target: ModelRef) -> bool:
+        pool = self._pool_of(target)
+        if pool is None:
+            return False
+        try:
+            return bool(pool.is_onloaded())
+        except Exception:
+            return False
+
+    def shutdown_models(
+        self,
+        model_names: str | ModelRef | Sequence[str | ModelRef],
+        *,
+        operation_id: str,
+        activation_token: ActivationToken | None = None,
+        timeout_s: float | None = None,
+        role: Role | str | None = None,
+    ) -> OperationResult:
+        """Drain, then tear the pools down and confirm the release.
+
+        A deliberate shutdown still drains first: closing a pool with requests
+        in flight would report a completion this control plane never observed.
+        """
+        targets = self._model_refs(model_names, role)
+        signature = ("shutdown", targets, timeout_s)
+        replay = self._replay_lifecycle(operation_id, signature)
+        if replay is not None:
+            return replay
+        self._authorize(activation_token, targets)
+        drained = self.drain(
+            targets, operation_id=f"{operation_id}:drain", activation_token=activation_token, timeout_s=timeout_s
+        )
+        error = None if drained.succeeded else drained.error
+        teardown_error: OperationError | None = None
+        for target in targets:
+            try:
+                self._close_pool(target.model_id, wait=True, role=target.role)
+            except Exception as exc:
+                teardown_error = teardown_error or OperationError(
+                    ErrorCode.UNAVAILABLE, f"{type(exc).__name__}: {exc}", model_id=target.model_id
+                )
+        confirmed = all(self._release_confirmed(target) for target in targets)
+        if teardown_error is None and confirmed:
+            # The pool is down and the release is confirmed, so the requests it
+            # was running are provably over. Process exit supersedes a drain
+            # that could not confirm them; this is the deliberate-abort path,
+            # not a way to pretend a drain succeeded.
+            for target in targets:
+                self._discard_registrations(target)
+            error = None
+        else:
+            error = error or teardown_error
+        return self._record_lifecycle(
+            operation_id,
+            signature,
+            self._result(
+                operation_id,
+                "shutdown",
+                targets,
+                status=OperationStatus.COMPLETED if error is None and confirmed else OperationStatus.FAILED,
+                step=STEP_RELEASE_CONFIRMED if confirmed else STEP_DEACTIVATED,
+                error=error
+                or (
+                    None
+                    if confirmed
+                    else OperationError(ErrorCode.UNKNOWN_COMPLETION, "Shutdown did not confirm the memory release")
+                ),
+                release_confirmed=confirmed,
+            ),
+        )
+
+    def get_lifecycle_operation(self, operation_id: str) -> OperationResult:
+        with self._lock:
+            record = self._lifecycle_ops.get(operation_id)
+        if record is None:
+            raise LifecycleError(OperationError(ErrorCode.NOT_FOUND, f"Unknown operation: {operation_id}"))
+        return record[1]
+
+    def model_states(self) -> dict[ModelRef, LifecycleState | None]:
+        """Project every registered model's lifecycle state for a
+        Coordinator."""
+        with self._lock:
+            roles = tuple(self._roles)
+        return {
+            ModelRef(role, model.model_id): model.state
+            for role in roles
+            for model in self._state(role).snapshot().models
+        }

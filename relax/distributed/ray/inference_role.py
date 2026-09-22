@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
+from threading import RLock
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -14,6 +15,20 @@ import ray
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.engine.inference.config import ModelConfig
 from relax.engine.inference.discovery import new_manager_epoch
+from relax.engine.inference.lifecycle import (
+    ActivationGroupSnapshot,
+    ActivationToken,
+    ErrorCode,
+    HandoffResult,
+    LifecycleCoordinator,
+    OperationError,
+    OperationResult,
+    OperationStatus,
+    PhaseHandle,
+    PhasePlan,
+    PhaseResult,
+    ReleaseEvidence,
+)
 from relax.engine.inference.manager import (
     EnginePoolRuntime,
     InferenceManager,
@@ -22,6 +37,7 @@ from relax.engine.inference.manager import (
     PreparationEvidence,
     RequestPermit,
 )
+from relax.engine.inference.phase_plans import phase_plans_from_contentions
 from relax.engine.inference.placement import (
     PhaseContention,
     PlacementGroupView,
@@ -30,7 +46,7 @@ from relax.engine.inference.placement import (
     PlacementRequest,
     PlacementSlice,
 )
-from relax.engine.inference.types import LifecycleState, Role, RoleSnapshot, RoutingSpec
+from relax.engine.inference.types import LifecycleState, ModelRef, Role, RoleSnapshot, RoutingSpec
 from relax.utils.logging_utils import get_logger
 
 
@@ -64,6 +80,18 @@ class _ExternalPoolRuntime(EnginePoolRuntime):
         return set(self._call("recover"))
 
     def is_onloaded(self) -> bool:
+        """Ask the host, because having called offload is not a release.
+
+        An unreachable host answers "still occupied": handing the slice on
+        because a call failed is exactly how two engines end up on one GPU.
+        """
+        if getattr(self.host, "call", None) is None:
+            return self._onloaded
+        try:
+            self._onloaded = bool(self._call("is_onloaded"))
+        except Exception as exc:
+            logger.warning("Inference host %s could not confirm occupation: %s", self.model_id, exc)
+            return True
         return self._onloaded
 
     def set_onloaded(self, value: bool) -> None:
@@ -77,12 +105,41 @@ class _ExternalPoolRuntime(EnginePoolRuntime):
     def retire(self, ranks: list[int]) -> None:
         self._call("retire", ranks)
 
+    def onload(self, tags: list[str] | None = None) -> Any:
+        result = self._call("onload", tags)
+        self._onloaded = True
+        return result
+
+    def offload(self) -> Any:
+        result = self._call("offload")
+        # The host confirmed the release call returned; the task owner still
+        # verifies occupation separately before granting the slice to anyone.
+        self._onloaded = False
+        return result
+
     def shutdown(self) -> None:
         if getattr(self.host, "call", None) is None:
             # Registration may precede backend binding; there is no worker to
             # close in that transitional state.
+            self._onloaded = False
             return
         self._call("shutdown")
+        self._onloaded = False
+
+
+class _FixedReleaseAdapter:
+    """Carry already-collected training evidence to the Coordinator."""
+
+    def __init__(self, evidence: ReleaseEvidence) -> None:
+        self._evidence = evidence
+
+    def prepare_training_handoff(
+        self, batch_id: str, policy_version: str | None, *, operation_id: str, activation_token: Any
+    ) -> HandoffResult:
+        return HandoffResult(operation_id, batch_id, True, policy_version)
+
+    def release_training_resources(self, *, operation_id: str, activation_token: Any) -> ReleaseEvidence:
+        return self._evidence
 
 
 class TaskInferenceManager:
@@ -95,26 +152,35 @@ class TaskInferenceManager:
     """
 
     def __init__(self) -> None:
+        # Guards only compound updates that do not cross a remote call: a drain
+        # blocks inside this actor while the Gateway reports completions on
+        # another thread, so nothing may hold a lock across an RPC.
+        self._lock = RLock()
         self._hosts: dict[Role, Any] = {}
         self.manager_epoch = new_manager_epoch()
         self._snapshots: dict[Role, RoleSnapshot] = {}
-        self._permits: dict[str, RequestPermit] = {}
         self._placement_planner = PlacementPlanner()
         self._control_manager = InferenceManager()
         self._operations: dict[str, OperationSnapshot] = {}
         self._role_pools: dict[Role, dict[str, Any]] = {}
         self._external_roles: set[Role] = set()
+        self._coordinator: LifecycleCoordinator | None = None
+        # Compatibility-only request ledger for a legacy discovery host that
+        # never registered its models here. Such a model has no pool bound, so
+        # it also has no managed lifecycle; Phase 7 removes the path entirely.
+        self._legacy_permits: dict[str, RequestPermit] = {}
 
     def register_role(self, role: Role | str, host: Any) -> None:
         role = Role(role)
-        previous = self._hosts.get(role)
-        if previous is not None:
-            if previous != host:
-                logger.debug("Keeping existing inference host for role %s", role.value)
-            return
-        self._hosts[role] = host
-        if role not in self._role_pools and role not in self._external_roles:
-            self._attach_external_role(role, host)
+        with self._lock:
+            previous = self._hosts.get(role)
+            if previous is not None:
+                if previous != host:
+                    logger.debug("Keeping existing inference host for role %s", role.value)
+                return
+            self._hosts[role] = host
+            if role not in self._role_pools and role not in self._external_roles:
+                self._attach_external_role(role, host)
 
     def _attach_external_role(self, role: Role, host: Any) -> None:
         registered = self._control_manager.snapshot(role=role)
@@ -301,34 +367,337 @@ class TaskInferenceManager:
         role: Role | str,
         target: str | None = None,
     ) -> RequestPermit:
+        """Admit against a freshly committed observation, then register it.
+
+        Registration lives in the one control manager so a drain waits on the
+        same in-flight index the Gateway reports completions to.
+        """
         role = Role(role)
         snapshot = self.snapshot(role=role)
+        if self._is_registered(role):
+            return self._control_manager.admit_request(model_id, request_id, role=role, target=target)
         model = next((item for item in snapshot.models if item.model_id == model_id), None)
         if model is None:
             raise KeyError(f"Unknown model: {model_id}")
         if not model.admission or model.state is None or model.state.value != "ready":
             raise RuntimeError(f"Model {model_id} is not ready for inference")
         permit = RequestPermit(request_id or uuid4().hex, self.manager_epoch, role, model_id, target)
-        previous = self._permits.get(permit.request_id)
-        if previous is not None and previous != permit:
-            raise ValueError(f"Request already exists: {permit.request_id}")
-        self._permits[permit.request_id] = permit
+        with self._lock:
+            previous = self._legacy_permits.get(permit.request_id)
+            if previous is not None and previous != permit:
+                raise ValueError(f"Request already exists: {permit.request_id}")
+            self._legacy_permits[permit.request_id] = permit
         return permit
+
+    def _is_registered(self, role: Role) -> bool:
+        """Whether this owner holds the model definitions for ``role``."""
+        return bool(self._control_manager.snapshot(role=role).models)
 
     def complete_request(self, permit: RequestPermit | str) -> None:
         request_id = permit if isinstance(permit, str) else permit.request_id
-        current = self._permits.get(request_id)
-        if current is None:
-            return
-        if not isinstance(permit, str) and current != permit:
-            raise ValueError("Request permit does not belong to this manager epoch and target")
-        self._permits.pop(request_id, None)
+        with self._lock:
+            current = self._legacy_permits.get(request_id)
+            if current is not None:
+                if not isinstance(permit, str) and current != permit:
+                    raise ValueError("Request permit does not belong to this manager epoch and target")
+                self._legacy_permits.pop(request_id, None)
+                return
+        self._control_manager.complete_request(permit)
 
-    def cancel_request(self, permit: RequestPermit | str) -> None:
-        self.complete_request(permit)
+    def cancel_request(self, permit: RequestPermit | str, *, dispatched: bool = True) -> Any:
+        """Start an abort without claiming the request finished.
+
+        ``dispatched=False`` means the request never reached an engine, which
+        is the only case where dropping the registration is honest.
+        """
+        request_id = permit if isinstance(permit, str) else permit.request_id
+        with self._lock:
+            if request_id in self._legacy_permits:
+                legacy = True
+            else:
+                legacy = False
+        if legacy:
+            self.complete_request(permit)
+            return None
+        return self._control_manager.cancel_request(permit, dispatched=dispatched)
 
     def get_request(self, request_id: str) -> RequestPermit | None:
-        return self._permits.get(request_id)
+        legacy = self._legacy_permits.get(request_id)
+        return legacy if legacy is not None else self._control_manager.get_request(request_id)
+
+    # ------------------------------------------------------------------
+    # Unified lifecycle: the owner implements the Coordinator's manager port.
+    # ------------------------------------------------------------------
+    def _resync(self, targets: Sequence[ModelRef]) -> None:
+        """Commit the backend observation for every externally hosted
+        target."""
+        for role in {target.role for target in targets}:
+            if role in self._external_roles and role not in self._role_pools:
+                self.snapshot(role=role)
+
+    def _unsupported(self, kind: str, targets: Sequence[ModelRef], operation_id: str) -> OperationResult | None:
+        """Refuse a managed transition for a model this owner cannot control.
+
+        A legacy host that never registered its models has no bound pool, so
+        there is no way to close admission or confirm a release for it. Saying
+        ``unsupported`` is the only answer that does not fake a completion.
+        """
+        unmanaged = sorted(str(target) for target in targets if not self._is_registered(target.role))
+        if not unmanaged:
+            return None
+        return OperationResult(
+            operation_id=operation_id,
+            owner_epoch=self.manager_epoch,
+            status=OperationStatus.FAILED,
+            kind=kind,
+            targets=tuple(targets),
+            error=OperationError(ErrorCode.UNSUPPORTED, f"Models are not registered with the task owner: {unmanaged}"),
+        )
+
+    def drain(
+        self,
+        targets: Sequence[ModelRef],
+        *,
+        operation_id: str,
+        activation_token: ActivationToken | None = None,
+        timeout_s: float | None = None,
+    ) -> OperationResult:
+        refusal = self._unsupported("drain", targets, operation_id)
+        if refusal is not None:
+            return refusal
+        for target in targets:
+            aborted = self._control_manager.cancelling_requests(target)
+            if aborted:
+                # Not a drain failure: the engine's release path pauses
+                # admission, aborts in flight and waits for flush_cache to
+                # confirm the scheduler is empty. Say so rather than hiding it.
+                logger.info(
+                    "Draining %s past %d aborted request(s) left to the engine release drain: %s",
+                    target,
+                    len(aborted),
+                    list(aborted[:8]),
+                )
+        return self._control_manager.drain(
+            targets, operation_id=operation_id, activation_token=activation_token, timeout_s=timeout_s
+        )
+
+    def deactivate(
+        self,
+        targets: Sequence[ModelRef],
+        *,
+        operation_id: str,
+        activation_token: ActivationToken | None = None,
+    ) -> OperationResult:
+        refusal = self._unsupported("deactivate", targets, operation_id)
+        if refusal is not None:
+            return refusal
+        return self._control_manager.deactivate(
+            targets, operation_id=operation_id, activation_token=activation_token, observe=self._resync
+        )
+
+    def activate(
+        self,
+        targets: Sequence[ModelRef],
+        *,
+        operation_id: str,
+        activation_token: ActivationToken | None = None,
+        tags: list[str] | None = None,
+    ) -> OperationResult:
+        refusal = self._unsupported("activate", targets, operation_id)
+        if refusal is not None:
+            return refusal
+        return self._control_manager.activate(
+            targets,
+            operation_id=operation_id,
+            activation_token=activation_token,
+            tags=tags,
+            observe=self._resync,
+        )
+
+    def shutdown_models(
+        self,
+        targets: Sequence[ModelRef],
+        *,
+        operation_id: str,
+        activation_token: ActivationToken | None = None,
+        timeout_s: float | None = None,
+    ) -> OperationResult:
+        refusal = self._unsupported("shutdown_models", targets, operation_id)
+        if refusal is not None:
+            return refusal
+        for target in targets:
+            aborted = self._control_manager.cancelling_requests(target)
+            if aborted:
+                logger.warning(
+                    "Shutting down %s while %d aborted request(s) are unconfirmed: %s",
+                    target,
+                    len(aborted),
+                    list(aborted[:8]),
+                )
+        return self._control_manager.shutdown_models(
+            targets, operation_id=operation_id, activation_token=activation_token, timeout_s=timeout_s
+        )
+
+    def get_lifecycle_operation(self, operation_id: str) -> OperationResult:
+        if self._coordinator is not None:
+            try:
+                return self._coordinator.get_operation(operation_id)
+            except Exception:
+                pass
+        return self._control_manager.get_lifecycle_operation(operation_id)
+
+    def model_states(self) -> dict[ModelRef, LifecycleState | None]:
+        return self._control_manager.model_states()
+
+    # ------------------------------------------------------------------
+    # Phase coordination.
+    # ------------------------------------------------------------------
+    def create_coordinator(
+        self,
+        session_id: str,
+        phase_targets: Mapping[str, Sequence[ModelRef]] | None = None,
+        plans: Sequence[PhasePlan] = (),
+        deferred: Sequence[str] = (),
+    ) -> str:
+        """Create the one Coordinator for this task and take activation
+        authority.
+
+        The mutual exclusions come from this owner's own placement ledger:
+        ``phase_targets`` says which models each planner phase owns, and the
+        ledger says which of those phases actually share GPUs. ``deferred`` adds
+        the phases that sleep outside their own scoring stage even when they
+        share nothing. Binding the Coordinator to the control manager is what
+        stops a user script from onloading a colocated role behind its back.
+
+        Returns the coordinator epoch, or an empty string when the layout needs
+        no sequencing at all -- no shared slice means no plan, and creating one
+        would only serialize roles that were given their own GPUs.
+        """
+        with self._lock:
+            contentions = self._placement_planner.contended_phases()
+            derived = tuple(plans)
+            if phase_targets:
+                derived += phase_plans_from_contentions(phase_targets, contentions, deferred=deferred)
+            if self._coordinator is None:
+                if not derived:
+                    logger.info("No contended inference phases; the task runs without a lifecycle coordinator")
+                    return ""
+                self._coordinator = LifecycleCoordinator(
+                    self,
+                    session_id=session_id,
+                    plans=derived,
+                    readiness=lambda target: self.model_states().get(target) or LifecycleState.STARTING,
+                )
+                self._control_manager.bind_coordinator(self._coordinator.coordinator_epoch)
+            else:
+                for plan in derived:
+                    self._coordinator.register_plan(plan)
+            self._coordinator.validate_placement(contentions)
+            return self._coordinator.coordinator_epoch
+
+    def locate_phase(self, phase_id: str) -> tuple[str, str] | None:
+        """Resolve a planner phase label to ``(plan_id, activation_group)``.
+
+        Callers name the phase they need -- ``genrm``, ``teacher`` -- because
+        the activation group is named after the shared slice and is therefore
+        only known once placement resolved.
+        """
+        if self._coordinator is None:
+            return None
+        for plan in self._coordinator.plans():
+            if any(phase.phase_id == phase_id for phase in plan.phases):
+                return plan.plan_id, plan.activation_group
+        return None
+
+    def _coordinator_or_raise(self) -> LifecycleCoordinator:
+        if self._coordinator is None:
+            raise RuntimeError("No lifecycle coordinator has been created for this task")
+        return self._coordinator
+
+    def has_coordinator(self) -> bool:
+        return self._coordinator is not None
+
+    def register_phase_plan(self, plan: PhasePlan) -> PhasePlan:
+        return self._coordinator_or_raise().register_plan(plan)
+
+    def switch_model(
+        self,
+        activation_group: str,
+        target: ModelRef | Sequence[ModelRef],
+        *,
+        operation_id: str,
+        timeout_s: float | None = None,
+        tags: list[str] | None = None,
+    ) -> PhaseResult:
+        return self._coordinator_or_raise().switch_model(
+            activation_group, target, operation_id=operation_id, timeout_s=timeout_s, tags=tags
+        )
+
+    def transition(
+        self,
+        activation_group: str,
+        target_phase: str,
+        *,
+        operation_id: str,
+        timeout_s: float | None = None,
+        tags: list[str] | None = None,
+    ) -> PhaseResult:
+        return self._coordinator_or_raise().transition(
+            activation_group, target_phase, operation_id=operation_id, timeout_s=timeout_s, tags=tags
+        )
+
+    def enter_phase(
+        self,
+        plan_id: str,
+        phase_id: str,
+        *,
+        operation_id: str,
+        timeout_s: float | None = None,
+        tags: list[str] | None = None,
+    ) -> PhaseHandle:
+        return self._coordinator_or_raise().enter_phase(
+            plan_id, phase_id, operation_id=operation_id, timeout_s=timeout_s, tags=tags
+        )
+
+    def finish_phase(
+        self,
+        handle: PhaseHandle,
+        *,
+        operation_id: str,
+        outcome: str = "completed",
+        timeout_s: float | None = None,
+    ) -> PhaseResult:
+        return self._coordinator_or_raise().finish_phase(
+            handle, operation_id=operation_id, outcome=outcome, timeout_s=timeout_s
+        )
+
+    def get_activation_group(self, activation_group: str) -> ActivationGroupSnapshot:
+        return self._coordinator_or_raise().get_activation_group(activation_group)
+
+    def confirm_training_release(
+        self, activation_group: str, evidence: ReleaseEvidence, *, operation_id: str
+    ) -> ReleaseEvidence:
+        """Record training's own release evidence for a shared activation
+        group.
+
+        The evidence is produced by the training backend, which is the only
+        side that can speak for all of its ranks; this owner only records it,
+        and an unconfirmed release keeps the group closed to the next role.
+        """
+        coordinator = self._coordinator_or_raise()
+        return coordinator.release_training_resources(
+            activation_group, _FixedReleaseAdapter(evidence), operation_id=operation_id
+        )
+
+    def adopt_phase(self, activation_group: str, phase_id: str, *, operation_id: str) -> PhaseResult:
+        return self._coordinator_or_raise().adopt_phase(activation_group, phase_id, operation_id=operation_id)
+
+    def activation_groups(self) -> tuple[str, ...]:
+        return () if self._coordinator is None else self._coordinator.activation_groups()
+
+    def coordinated_phases(self) -> tuple[str, ...]:
+        """The planner phase labels this task actually sequences."""
+        return () if self._coordinator is None else self._coordinator.phase_ids()
 
     def plan_placement(
         self,
@@ -459,11 +828,24 @@ class TaskInferenceManager:
 
 TaskInferenceManagerActor = ray.remote(num_cpus=1, num_gpus=0)(TaskInferenceManager)
 
+# A drain blocks inside this actor until the registered requests report
+# completion, and those reports arrive as calls on this same actor. One
+# execution slot would therefore make every drain time out by construction.
+_TASK_MANAGER_CONCURRENCY = 8
+
 
 def create_task_inference_manager(args: Any, runtime_env: dict[str, Any] | None = None) -> Any:
     """Create the single task-level CPU inference control-plane actor."""
     return TaskInferenceManagerActor.options(
-        **with_control_plane_affinity(args, {"num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env})
+        **with_control_plane_affinity(
+            args,
+            {
+                "num_cpus": 1,
+                "num_gpus": 0,
+                "runtime_env": runtime_env,
+                "max_concurrency": _TASK_MANAGER_CONCURRENCY,
+            },
+        )
     ).remote()
 
 

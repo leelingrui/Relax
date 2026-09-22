@@ -3408,7 +3408,13 @@ class RolloutManager(ReloadableMixin):
 
     @ray.method(concurrency_group="control")
     def call(self, model_id: str, method: str, /, *args: Any, **kwargs: Any) -> Any:
-        """Forward compatibility lifecycle calls through the shared owner."""
+        """Forward compatibility lifecycle calls through the shared owner.
+
+        Memory transitions go through this manager's own entry points rather
+        than straight to the pool: they also pause health monitoring and move
+        ``status``, and skipping that would let the monitor rebuild engines
+        that were deliberately put to sleep.
+        """
         if method not in {
             "health_check",
             "recover",
@@ -3424,6 +3430,10 @@ class RolloutManager(ReloadableMixin):
             "set_onloaded",
         }:
             raise ValueError(f"Unsupported inference pool method: {method}")
+        if method == "offload":
+            return self._offload_local()
+        if method == "onload":
+            return self._onload_local(*args, **kwargs)
         return self.inference_manager.dispatch(model_id, method, *args, wait=True, **kwargs)
 
     def invalidate_inference_state(self) -> None:

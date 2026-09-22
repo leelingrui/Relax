@@ -469,6 +469,8 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
         ROLES.reference: Service(ROLES.reference),
     }
     instance._teacher_manager = None
+    # Hand-assembled Controller: keep the fields training_loop reads in step.
+    instance._inference_manager_handle = None
     instance._pending_task_refs = []
     instance._pending_task_refs_lock = threading.Lock()
     instance._restarting = False
