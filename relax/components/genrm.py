@@ -134,6 +134,7 @@ class GenRM(Base):
         config: Namespace,
         role: str,
         runtime_env: Optional[dict] = None,
+        inference_manager_handle: Any | None = None,
     ) -> None:
         """Initialize GenRM service.
 
@@ -152,7 +153,9 @@ class GenRM(Base):
 
         # {route_key: GenRMManager handle}. Single-instance configs (the legacy
         # --genrm-model-path path) resolve to exactly {"__default__": manager}.
-        self.genrm_managers = create_genrm_managers(config, pg, runtime_env=runtime_env)
+        self.genrm_managers = create_genrm_managers(
+            config, pg, runtime_env=runtime_env, inference_manager_handle=inference_manager_handle
+        )
         self._role_manager = next(iter(self.genrm_managers.values()))
         self._manager_epoch = new_manager_epoch()
         self.instance_specs = config._genrm_instances_resolved
@@ -217,6 +220,10 @@ class GenRM(Base):
             },
             "models": {model.model_id: model.to_dict() for snapshot in snapshots for model in snapshot.models},
         }
+
+    async def get_role_snapshot(self) -> Any:
+        """Expose the shared role snapshot to the task inference owner."""
+        return await asyncio.to_thread(ray.get, self._role_manager.get_role_snapshot.remote())
 
     def run(self):
         """GenRM is a passive HTTP service, no background loop needed.

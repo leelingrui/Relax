@@ -21,6 +21,12 @@ from typing import Any, Callable
 
 import ray
 
+from relax.engine.inference.placement import (
+    PlacementGroupView,
+    PlacementOwner,
+    PlacementPlanner,
+    PlacementRequest,
+)
 from relax.utils.logging_utils import get_logger
 
 
@@ -34,6 +40,10 @@ def start_multi_instance_managers(
     build_manager_args: Callable[[Any, str, dict], Any],
     spawn_manager: Callable[[str, Any, int, dict], Any],
     region_offset: int = 0,
+    placement_group: tuple | None = None,
+    placement_owner: PlacementOwner = PlacementOwner.CONTROLLER,
+    worker_type: str = "regular",
+    num_gpus_per_node: int | None = None,
 ) -> dict[str, Any]:
     """Launch one manager per entry in ``instance_specs``, each at a non-
     overlapping GPU offset within whatever shared placement group
@@ -62,20 +72,47 @@ def start_multi_instance_managers(
         region_offset: GPU offset within the shared placement group where the
             first instance's region starts (e.g. ``rollout_num_gpus``, to skip
             a rollout region that precedes all instances).
+        placement_group: Optional reordered ``(pg, bundle_indices, gpu_ids)``
+            view. When supplied, all instance slices are validated before any
+            manager is spawned.
 
     Returns:
         ``{key: manager_handle}`` in ``instance_specs`` iteration order.
     """
+    offsets: dict[str, int] = {}
     managers: dict[str, Any] = {}
     bundle_offset = region_offset
     for key, spec in instance_specs.items():
-        per_instance_args = build_manager_args(args, key, spec)
-        manager = spawn_manager(key, per_instance_args, bundle_offset, spec)
-        managers[key] = manager
-        logger.info(f"Launched instance '{key}': bundle_offset={bundle_offset}, num_gpus={spec['num_gpus']}")
-        # Prefix sum, not idx * num_gpus: instances may have unequal GPU
-        # budgets, so each region must start where the previous one ended.
+        offsets[key] = bundle_offset
         bundle_offset += spec["num_gpus"]
+
+    if placement_group is not None:
+        if num_gpus_per_node is None or num_gpus_per_node < 1:
+            raise ValueError("num_gpus_per_node is required when validating shared placement")
+        pg_view = PlacementGroupView(
+            tuple(placement_group[1]), tuple(placement_group[2]), placement_owner, identity=placement_group[0]
+        )
+        PlacementPlanner().plan(
+            tuple(
+                PlacementRequest(
+                    group_id=f"{worker_type}/{key}",
+                    worker_type=worker_type,
+                    num_gpus=spec["num_gpus"],
+                    num_gpus_per_engine=spec.get("num_gpus_per_engine", spec["num_gpus"]),
+                    num_gpus_per_node=num_gpus_per_node,
+                    bundle_offset=offset,
+                )
+                for key, spec in instance_specs.items()
+                for offset in (offsets[key],)
+            ),
+            pg_view,
+        )
+
+    for key, spec in instance_specs.items():
+        per_instance_args = build_manager_args(args, key, spec)
+        manager = spawn_manager(key, per_instance_args, offsets[key], spec)
+        managers[key] = manager
+        logger.info(f"Launched instance '{key}': bundle_offset={offsets[key]}, num_gpus={spec['num_gpus']}")
 
     if getattr(args, "offload_rollout", False):
         ray.get([m.offload.remote() for m in managers.values()])

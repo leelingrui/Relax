@@ -77,10 +77,14 @@ class ModelPool:
     def get_discovery_snapshot(self, *args: Any, **kwargs: Any) -> Any:
         return self.backend.get_discovery_snapshot(*args, **kwargs)
 
-    def __getattr__(self, name: str) -> Any:
-        # Keep role-specific data-plane helpers (URLs, engine locks and
-        # discovery) available without making them part of the common API.
-        return getattr(self.backend, name)
+    def fanout(self, method: str, **kwargs: Any) -> Any:
+        return self.backend.fanout(method, **kwargs)
+
+    def retire(self, ranks: list[int]) -> Any:
+        return self.backend.retire(ranks)
+
+    def set_onloaded(self, value: bool) -> Any:
+        return self.backend.set_onloaded(value)
 
 
 def create_model_pool(

@@ -30,6 +30,7 @@ from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
+from relax.distributed.ray.inference_role import create_task_inference_manager
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -166,6 +167,7 @@ class Controller:
         self.config = config
         self.serve_dict = {}
         self._teacher_manager = None
+        self._inference_manager_handle = None
         # Initialize health management system
         self.runtime_env = runtime_env
         self._health_check_enabled = getattr(config, "use_health_check", False)
@@ -487,6 +489,7 @@ class Controller:
                 actor_rollout_pgs=actor_rollout_pgs if actor_rollout_pgs and role in actor_rollout_pg_roles else None,
                 defer_deploy=defer_deploy,
                 runtime_env=self.runtime_env,
+                inference_manager_handle=self._inference_manager_handle,
             )
             logger.info(f"Service {role} has been created successfully")
             return (role, service, None)
@@ -727,9 +730,12 @@ class Controller:
     def register_all_serve(self):
         validate_ppo_config(self.config)
 
+        self._inference_manager_handle = create_task_inference_manager(self.config, self.runtime_env)
+
         actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
             self.config,
             runtime_env=self.runtime_env,
+            inference_manager_handle=self._inference_manager_handle,
         )
 
         algo_key = resolve_sft_algo_key(self.config)
@@ -1003,6 +1009,16 @@ class Controller:
                 logger.warning(f"Failed to dispose RolloutManager: {e}")
 
         shutdown_managed_opd_teacher(self._teacher_manager)
+
+        # The task-scoped CPU owner is the final lifecycle authority for
+        # rollout, GenRM, and Teacher compatibility hosts.  Keep this call
+        # after workload teardown so in-flight GPU operations have drained,
+        # while still closing the owner before Serve/Router cleanup.
+        if self._inference_manager_handle is not None:
+            try:
+                ray.get(self._inference_manager_handle.shutdown_all.remote())
+            except Exception as e:
+                logger.warning(f"Failed to shut down task inference manager roles: {e}")
 
         self._shutdown_agentic_rollout_services()
 

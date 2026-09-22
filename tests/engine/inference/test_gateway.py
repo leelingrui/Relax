@@ -152,7 +152,7 @@ async def test_gateway_genrm_rejects_mixed_protocols(field: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_gateway_genrm_backend_fallback_adapts_only_in_backend() -> None:
+async def test_gateway_genrm_rejects_missing_router_without_backend_fallback() -> None:
     snapshot = _snapshot(role=Role.GENRM)
     snapshot = replace(snapshot, models=(replace(snapshot.models[0], router_url=None),))
     adapt = AsyncMock()
@@ -165,50 +165,26 @@ async def test_gateway_genrm_backend_fallback_adapts_only_in_backend() -> None:
     messages = [{"role": "user", "content": "judge"}]
 
     def upstream(request):
-        assert request.url == "http://backend/generate"
-        assert json.loads(request.content) == {"messages": messages, "route_key": "model-a"}
-        return httpx.Response(200, json={"response": "score"})
+        raise AssertionError("Gateway must not bypass the Router")
 
     await gateway._client.aclose()
     gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
     try:
         response = await gateway.proxy(_request({"messages": messages, "model": "model-a"}), "generate")
-        assert json.loads(response.body) == {"response": "score"}
+        assert response.status_code == 503
         adapt.assert_not_awaited()
     finally:
         await gateway.close()
 
 
 @pytest.mark.asyncio
-async def test_gateway_manager_epochs_track_every_model_and_ignore_order(monkeypatch) -> None:
-    import relax.components.inference_gateway as gateway_module
-
-    snapshots = {
-        key: snapshot_from_engine_urls(
-            ["http://engine/generate"],
-            role=Role.TEACHER,
-            model_id=key,
-            manager_epoch=epoch,
-            router_url="http://router",
-        )
-        for key, epoch in [("a", "a"), ("b", "z")]
-    }
-    handles = {
-        key: SimpleNamespace(get_discovery_snapshot=SimpleNamespace(remote=lambda **kwargs: kwargs["model_id"]))
-        for key in snapshots
-    }
-    monkeypatch.setattr(gateway_module.ray, "get", lambda refs: [snapshots[key] for key in refs])
-    gateway = InferenceGateway(Role.TEACHER, manager_handles=handles)
+async def test_gateway_reads_one_task_manager_snapshot() -> None:
+    snapshot = _snapshot(role=Role.TEACHER)
+    manager = SimpleNamespace(snapshot=SimpleNamespace(remote=lambda **kwargs: snapshot))
+    gateway = InferenceGateway(Role.TEACHER, manager_handle=manager)
     try:
         first = await gateway._snapshot()
-        gateway.manager_handles = dict(reversed(list(handles.items())))
-        assert (await gateway._snapshot()).manager_epoch == first.manager_epoch
-        snapshots["a"] = replace(snapshots["a"], topology_revision=42)
-        revised = await gateway._snapshot()
-        assert revised.manager_epoch == first.manager_epoch
-        assert revised.topology_revision == 42
-        snapshots["a"] = replace(snapshots["a"], manager_epoch="b")
-        assert (await gateway._snapshot()).manager_epoch != first.manager_epoch
+        assert first is snapshot
     finally:
         await gateway.close()
 
@@ -243,5 +219,16 @@ async def test_gateway_preserves_legacy_engines_and_genrm_response_shape() -> No
         assert legacy["models"]["model-a"]["total_engines"] == 1
         assert v2["role"] == "genrm"
         assert json.loads((await gateway.health()).body)["status"] == "healthy"
+    finally:
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_health_reports_manager_unavailable() -> None:
+    gateway = InferenceGateway(Role.TEACHER, snapshot_provider=lambda: (_ for _ in ()).throw(RuntimeError("down")))
+    try:
+        response = await gateway.health()
+        assert response.status_code == 503
+        assert json.loads(response.body)["status"] == "unavailable"
     finally:
         await gateway.close()

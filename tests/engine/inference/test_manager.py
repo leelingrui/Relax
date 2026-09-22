@@ -135,6 +135,16 @@ def test_manager_topology_revision_changes_when_replica_endpoint_changes():
     assert manager.snapshot().topology_revision == revision + 1
 
 
+def test_static_model_rejects_policy_weight_preparation():
+    manager = InferenceManager(Role.TEACHER)
+    manager.register_model(
+        ModelSpec("teacher", "checkpoint", weight_source=WeightSource.CHECKPOINT), operation_id="register"
+    )
+
+    with pytest.raises(ValueError, match="Static or external weights"):
+        manager.begin_preparation("teacher", required_weight_version="step-1")
+
+
 def test_specs_map_stable_logical_replicas_to_all_node_actors():
     replicas = replicas_from_slots("model/group-0", 4, 2)
     assert replicas[0].node_ranks == (0, 1)
@@ -432,3 +442,77 @@ def test_model_observation_cannot_overwrite_concurrent_offload():
     manager.invalidate_model("model", state=LifecycleState.SLEEPING)
     assert not manager.commit_observation(before_rpc, model, evidence=PreparationEvidence(True, True, True))
     assert manager.snapshot().models[0].state == LifecycleState.SLEEPING
+
+
+def test_task_manager_shares_epoch_and_placement_owner_across_roles() -> None:
+    manager = InferenceManager()
+    rollout = manager.for_role(Role.ROLLOUT)
+    teacher = manager.for_role(Role.TEACHER)
+    genrm = manager.for_role(Role.GENRM)
+
+    assert rollout.manager_epoch == teacher.manager_epoch == genrm.manager_epoch
+    assert set(manager.snapshots()) == {Role.ROLLOUT, Role.TEACHER, Role.GENRM}
+
+
+def test_task_manager_request_permit_is_shared_across_role_views() -> None:
+    manager = InferenceManager()
+    teacher = manager.for_role(Role.TEACHER)
+    teacher.register_model(
+        ModelSpec("teacher", "checkpoint", weight_source=WeightSource.CHECKPOINT), operation_id="register"
+    )
+    model = ModelSnapshot(
+        "teacher",
+        (ReplicaSnapshot("teacher/replica-0", LifecycleState.READY, "http://engine"),),
+        router_url="http://router",
+        state=LifecycleState.READY,
+        admission=True,
+    )
+    teacher.publish_model(model)
+
+    permit = manager.admit_request("teacher", request_id="request-1", role=Role.TEACHER, target="http://router")
+    assert permit.manager_epoch == manager.manager_epoch
+    assert manager.get_request("request-1") == permit
+    manager.complete_request(permit)
+    assert manager.get_request("request-1") is None
+
+
+def test_task_manager_operation_snapshot_uses_shared_epoch() -> None:
+    manager = InferenceManager()
+    manager.register_model(
+        ModelSpec("model", "checkpoint", weight_source=WeightSource.CHECKPOINT),
+        operation_id="register",
+        role=Role.ROLLOUT,
+    )
+    operation = manager.get_operation("register", role=Role.ROLLOUT)
+    assert operation.owner_epoch == manager.manager_epoch
+    assert operation.status == "completed"
+    assert operation.kind == "register"
+
+
+def test_request_permit_rejects_foreign_identity() -> None:
+    manager = InferenceManager(Role.TEACHER)
+    manager.register_model(
+        ModelSpec("teacher", "checkpoint", weight_source=WeightSource.CHECKPOINT), operation_id="register"
+    )
+    model = ModelSnapshot(
+        "teacher",
+        (ReplicaSnapshot("teacher/replica-0", LifecycleState.READY, "http://engine"),),
+        router_url="http://router",
+        state=LifecycleState.READY,
+        admission=True,
+    )
+    manager.publish_model(model)
+    permit = manager.admit_request("teacher", request_id="request-1", target="http://router")
+    with pytest.raises(ValueError, match="does not belong"):
+        manager.complete_request(replace(permit, target="http://other"))
+    assert manager.get_request("request-1") == permit
+
+
+def test_discovery_capabilities_are_immutable_after_registration() -> None:
+    manager = InferenceManager(Role.TEACHER)
+    manager.register_model(
+        ModelSpec("teacher", "checkpoint", weight_source=WeightSource.CHECKPOINT, allow_defer=True),
+        operation_id="register",
+    )
+    with pytest.raises(ValueError, match="allow_defer"):
+        manager.get_discovery_snapshot(model_id="teacher", allow_defer=False)

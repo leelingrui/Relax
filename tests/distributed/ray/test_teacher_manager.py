@@ -10,8 +10,29 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _cleanup_teacher_manager_module():
+    """Drop the stub-backed import so it cannot leak into other tests.
+
+    Clearing ``sys.modules`` alone is not enough: ``importlib.import_module``
+    also binds the submodule on its parent package, and ``from package import
+    submodule`` prefers that attribute over a fresh import. A later test would
+    then patch the stub-backed module while the code under test re-imports the
+    real one.
+    """
+    import relax.distributed.ray as ray_pkg
+
+    name = "relax.distributed.ray.teacher_manager"
+    original = sys.modules.get(name)
+    original_attr = getattr(ray_pkg, "teacher_manager", None)
     yield
-    sys.modules.pop("relax.distributed.ray.teacher_manager", None)
+    if original is None:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = original
+    if original_attr is None:
+        if hasattr(ray_pkg, "teacher_manager"):
+            delattr(ray_pkg, "teacher_manager")
+    else:
+        ray_pkg.teacher_manager = original_attr
 
 
 def _install_teacher_manager_stubs(monkeypatch):
@@ -174,6 +195,27 @@ def test_teacher_placement_preserves_owner_and_bundle_mapping(monkeypatch, share
         module.create_placement_group.assert_not_called()
     else:
         module.create_placement_group.assert_called_once_with(num_gpus=2, node_group_affinity=False)
+
+
+def test_teacher_placement_uses_planner_slice_for_shared_pg(monkeypatch):
+    module = _import_teacher_manager(monkeypatch)
+    manager = object.__new__(module.TeacherEngineAdapter)
+    manager.args = SimpleNamespace(rollout_num_gpus=4, num_gpus_per_node=4, enable_affinity=False)
+    manager.gpus_per_replica = 2
+    manager.num_replicas = 2
+    manager.nodes_per_engine = 1
+    manager._shared_pg = True
+    manager._bundle_offset = 2
+    manager._shared_pg_tuple = ("shared", list(range(12)), list(range(12)))
+    manager._placement_planner = module.PlacementPlanner()
+
+    placement, owns_pg, gpu_index, planned = manager._resolve_planned_placement(rank=1)
+
+    assert placement is manager._shared_pg_tuple
+    assert owns_pg is False
+    assert gpu_index == 8
+    assert planned.reserved_offset == 8
+    assert planned.owner is module.PlacementOwner.CONTROLLER
 
 
 def test_teacher_init_uses_own_router_without_dcs(monkeypatch):

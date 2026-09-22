@@ -26,6 +26,13 @@ from relax.distributed.ray.rollout_validation import validate_server_group_gpu_i
 from relax.engine.inference.config import EngineGroupConfig, ModelConfig, SglangConfig
 from relax.engine.inference.discovery import new_manager_epoch
 from relax.engine.inference.manager import InferenceManager, PreparationEvidence
+from relax.engine.inference.placement import (
+    PlacementGroupView,
+    PlacementOwner,
+    PlacementPlanner,
+    PlacementRequest,
+    PlacementSlice,
+)
 from relax.engine.inference.specs import EngineGroupSpec, replicas_from_slots
 from relax.engine.inference.types import (
     LifecycleState,
@@ -312,6 +319,8 @@ class EngineGroup:
     lifecycle_status: EngineGroupLifecycle = EngineGroupLifecycle.ACTIVE
     eviction_requested: bool = False
     spec: EngineGroupSpec | None = None
+    placement: PlacementSlice | None = None
+    pg_owner: PlacementOwner = PlacementOwner.MANAGER
     on_topology_change: Callable[[], None] | None = dataclasses.field(default=None, repr=False)
 
     def notify_topology_change(self) -> None:
@@ -381,7 +390,11 @@ class EngineGroup:
             num_cpus = num_gpus
 
             # Get the base GPU ID from placement group using gpu_offset.
-            gpu_index = self.gpu_offset + i * num_gpu_per_engine
+            gpu_index = (
+                self.placement.referenced_offsets[i]
+                if self.placement is not None
+                else self.gpu_offset + i * num_gpu_per_engine
+            )
             base_gpu_id = int(reordered_gpu_ids[gpu_index])
 
             scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -805,9 +818,10 @@ class RolloutManager(ReloadableMixin):
     _SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS
     _WEIGHT_SYNC_MAX_INIT_ATTEMPTS = Envs.RELAX_WEIGHT_SYNC_MAX_INIT_ATTEMPTS
 
-    def __init__(self, args, pg, data_source=None):
+    def __init__(self, args, pg, data_source=None, inference_manager_handle=None):
         self.pg = pg
         self.args = args
+        self.task_inference_manager = inference_manager_handle
         self.manager_epoch = new_manager_epoch()
         self.topology_revision = 0
         self._topology_signature: tuple[tuple[str, tuple[tuple[int, str, tuple[bool, ...]], ...]], ...] | None = None
@@ -847,7 +861,12 @@ class RolloutManager(ReloadableMixin):
             self.servers: dict[str, RolloutServer] = {}
         else:
             init_http_client(args)
-            self.servers = start_rollout_servers(args, pg, inference_manager=self.inference_manager)
+            self.servers = start_rollout_servers(
+                args,
+                pg,
+                inference_manager=self.inference_manager,
+                placement_manager_handle=self.task_inference_manager,
+            )
         if self.servers:
             for server in self.servers.values():
                 spec = server.model_spec
@@ -870,6 +889,18 @@ class RolloutManager(ReloadableMixin):
                 ),
                 operation_id="routes:startup",
             )
+            if self.task_inference_manager is not None:
+                ray.get(
+                    self.task_inference_manager.register_external_role.remote(
+                        Role.ROLLOUT,
+                        None,
+                        tuple(server.model_spec for server in self.servers.values()),
+                        RoutingSpec(
+                            default_model=model_names[0] if len(model_names) == 1 else None,
+                            route_key_to_model=tuple((name, name) for name in model_names),
+                        ),
+                    )
+                )
         self.service_manager = UnifiedServiceManager(
             Role.ROLLOUT, inference_manager=self.inference_manager, pools=pools
         )
@@ -934,6 +965,19 @@ class RolloutManager(ReloadableMixin):
         self._eviction_check_interval = getattr(args, "eviction_check_interval", 10.0)
         if not self.args.debug_train_only:
             self._start_eviction_monitor()
+
+    def _plan_placement(self, requests, placement_group):
+        manager_handle = getattr(self, "task_inference_manager", None)
+        if manager_handle is None:
+            return PlacementPlanner().plan(requests, placement_group)
+        return ray.get(manager_handle.plan_placement.remote(requests, placement_group))
+
+    def _cancel_placement(self, placement):
+        manager_handle = getattr(self, "task_inference_manager", None)
+        if manager_handle is None:
+            PlacementPlanner.cancel(placement)
+            return
+        ray.get(manager_handle.cancel_placement.remote(placement))
 
     def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
         """Allocate ranks monotonically so a removed elastic rank is not
@@ -1708,6 +1752,8 @@ class RolloutManager(ReloadableMixin):
             logger.error(f"[ScaleOut] Model '{request.model_name}' not found")
             return
 
+        per_replica_pgs: list[Any] = []
+        committed_pg_indices: set[int] = set()
         try:
             # Step 1: Update status
             request.update_status(ScaleOutStatus.CREATING)
@@ -1726,7 +1772,6 @@ class RolloutManager(ReloadableMixin):
 
             # Step 2: Create one PG per replica so that replicas with available
             # resources can proceed immediately without waiting for the others.
-            per_replica_pgs = []
             for i in range(request.num_replicas):
                 num_gpus = gpus_per_engine
                 accel_resource = device_utils.get_ray_accelerator_name()
@@ -1857,6 +1902,7 @@ class RolloutManager(ReloadableMixin):
                         if success:
                             engine_id = f"engine_{engine_offset}"
                             succeeded_engine_ids.append(engine_id)
+                            committed_pg_indices.add(idx)
                             logger.info(f"[ScaleOut] ✅ Replica {idx} successfully brought up as {engine_id}")
                         else:
                             failed_replica_ids.append(f"replica_{idx}")
@@ -1893,6 +1939,12 @@ class RolloutManager(ReloadableMixin):
             )
 
         except Exception as e:
+            for idx, pg in enumerate(per_replica_pgs):
+                if idx not in committed_pg_indices:
+                    try:
+                        ray.util.remove_placement_group(pg)
+                    except Exception:
+                        pass
             # Surface only the exception type, never its args (may leak); full exc logged below.
             failure = ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN, type(e).__name__)
             request.failure_categories = scale_utils._scale_out_failure_categories([failure])
@@ -1961,6 +2013,24 @@ class RolloutManager(ReloadableMixin):
             pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
             pg_tuple = (pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids)
 
+            placement = self._plan_placement(
+                (
+                    PlacementRequest(
+                        group_id=f"scale-out/{request.request_id}/replica-{replica_idx}",
+                        worker_type="regular",
+                        num_gpus=num_gpus,
+                        num_gpus_per_engine=gpus_per_engine,
+                        num_gpus_per_node=self.args.num_gpus_per_node,
+                    ),
+                ),
+                PlacementGroupView(
+                    tuple(pg_reordered_bundle_indices),
+                    tuple(pg_reordered_gpu_ids),
+                    PlacementOwner.MANAGER,
+                    identity=pg,
+                ),
+            )[0]
+
             logger.info(
                 f"[ScaleOut] Replica {replica_idx}: GPU topology probed, "
                 f"bundle_indices={pg_reordered_bundle_indices}, gpu_ids={pg_reordered_gpu_ids}"
@@ -1975,12 +2045,14 @@ class RolloutManager(ReloadableMixin):
                 num_new_engines=0,
                 worker_type="regular",
                 rank_offset=engine_offset,
-                gpu_offset=0,
+                gpu_offset=placement.reserved_offset,
                 router_ip=srv.router_ip,
                 router_port=srv.router_port,
                 is_scaled_out=True,
                 skip_dcs_registration=True,  # Will be done in _finalize_engine_group_registration
                 skip_router_registration=True,  # Will be done in _finalize_engine_group_registration
+                placement=placement,
+                pg_owner=PlacementOwner.MANAGER,
             )
 
             # Step 3: Start engines
@@ -2312,6 +2384,7 @@ class RolloutManager(ReloadableMixin):
                 router_port=router_port,
                 is_scaled_out=True,
                 skip_dcs_registration=False,  # Already registered above
+                pg_owner=PlacementOwner.EXTERNAL,
             )
         else:
             # Mark DCS registration as done (for ray_native mode)
@@ -3319,6 +3392,31 @@ class RolloutManager(ReloadableMixin):
             )
         return dataclasses.replace(snapshot, phase=self.status)
 
+    @ray.method(concurrency_group="control")
+    def ready(self) -> bool:
+        """Expose manager readiness through the task inference owner."""
+        return self.inference_manager.ready()
+
+    @ray.method(concurrency_group="control")
+    def call(self, model_id: str, method: str, /, *args: Any, **kwargs: Any) -> Any:
+        """Forward compatibility lifecycle calls through the shared owner."""
+        if method not in {
+            "health_check",
+            "recover",
+            "onload",
+            "offload",
+            "is_onloaded",
+            "shutdown",
+            "get_urls",
+            "get_engine_hosts_ports",
+            "get_discovery_snapshot",
+            "fanout",
+            "retire",
+            "set_onloaded",
+        }:
+            raise ValueError(f"Unsupported inference pool method: {method}")
+        return self.inference_manager.dispatch(model_id, method, *args, wait=True, **kwargs)
+
     def invalidate_inference_state(self) -> None:
         """Close admission before backend-owned policy weight transactions."""
         self._inference_sync_pending = True
@@ -4229,11 +4327,14 @@ class RolloutManager(ReloadableMixin):
             monitor.stop()
 
         for group in groups_to_remove:
+            if group.placement is not None:
+                self._cancel_placement(group.placement)
             if group.pg is not None:
-                try:
-                    ray.util.remove_placement_group(group.pg[0])
-                except Exception as e:
-                    logger.warning(f"[ScaleIn] Failed to remove placement group: {e}")
+                if group.pg_owner is PlacementOwner.MANAGER:
+                    try:
+                        ray.util.remove_placement_group(group.pg[0])
+                    except Exception as e:
+                        logger.warning(f"[ScaleIn] Failed to remove placement group: {e}")
             with self._engine_lifecycle_lock:
                 group.lifecycle_status = EngineGroupLifecycle.REMOVED
 
@@ -4778,7 +4879,13 @@ def _wait_engine_init_with_progress(
     logger.info(f"[engine-init-barrier:{model_name}] all {total} engines ready")
 
 
-def start_rollout_servers(args, pg, *, inference_manager: InferenceManager | None = None) -> dict[str, RolloutServer]:
+def start_rollout_servers(
+    args,
+    pg,
+    *,
+    inference_manager: InferenceManager | None = None,
+    placement_manager_handle: Any | None = None,
+) -> dict[str, RolloutServer]:
     """Start rollout servers: one per model, each with its own router.
 
     Each model defined in the sglang config gets its own router and set
@@ -4806,8 +4913,26 @@ def start_rollout_servers(args, pg, *, inference_manager: InferenceManager | Non
     )
 
     servers: dict[str, RolloutServer] = {}
-    gpu_offset = 0
     engine_offset = 0
+
+    pg_view = PlacementGroupView(tuple(pg[1]), tuple(pg[2]), PlacementOwner.CONTROLLER, identity=pg[0])
+    placement_requests = tuple(
+        PlacementRequest(
+            group_id=f"{model.name}/group-{group_index}",
+            worker_type=group.worker_type,
+            num_gpus=group.num_gpus,
+            num_gpus_per_engine=group.num_gpus_per_engine,
+            num_gpus_per_node=args.num_gpus_per_node,
+            active=group.worker_type != "placeholder",
+        )
+        for model in models
+        for group_index, group in enumerate(model.engine_groups)
+    )
+    if placement_manager_handle is None:
+        planned_groups = PlacementPlanner().plan(placement_requests, pg_view)
+    else:
+        planned_groups = ray.get(placement_manager_handle.plan_placement.remote(placement_requests, pg_view))
+    planned_by_id = {planned.group_id: planned for planned in planned_groups}
 
     for model_idx, model_cfg in enumerate(models):
         has_pd = model_cfg.has_pd_disaggregation
@@ -4822,10 +4947,11 @@ def start_rollout_servers(args, pg, *, inference_manager: InferenceManager | Non
         all_init_handles: list = []
         port_cursors: dict[int, int] = {}
 
-        for group_cfg in model_cfg.engine_groups:
+        for group_index, group_cfg in enumerate(model_cfg.engine_groups):
             gpus_per_engine = group_cfg.num_gpus_per_engine
             num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
             num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
+            planned = planned_by_id[f"{model_cfg.name}/group-{group_index}"]
 
             group = EngineGroup(
                 args=args,
@@ -4835,11 +4961,13 @@ def start_rollout_servers(args, pg, *, inference_manager: InferenceManager | Non
                 num_new_engines=0,
                 worker_type=group_cfg.worker_type,
                 rank_offset=engine_offset,
-                gpu_offset=gpu_offset,
+                gpu_offset=planned.reserved_offset,
                 sglang_overrides=dict(group_cfg.overrides),
                 router_ip=router_ip,
                 router_port=router_port,
                 spec=group_cfg.topology,
+                placement=planned,
+                pg_owner=PlacementOwner.CONTROLLER,
                 skip_router_registration=True,
             )
             handles, port_cursors = group.start_engines(port_cursors)
@@ -4847,7 +4975,6 @@ def start_rollout_servers(args, pg, *, inference_manager: InferenceManager | Non
             engine_groups.append(group)
 
             engine_offset += num_engines
-            gpu_offset += group_cfg.num_gpus
 
         if all_init_handles:
             _wait_engine_init_with_progress(

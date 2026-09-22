@@ -34,6 +34,29 @@ class PreparationEvidence:
     weights_synced: bool = False
 
 
+@dataclass(frozen=True)
+class RequestPermit:
+    """A request admission bound to one manager epoch and model target."""
+
+    request_id: str
+    manager_epoch: str
+    role: Role
+    model_id: str
+    target: str | None = None
+
+
+@dataclass(frozen=True)
+class OperationSnapshot:
+    """Stable observation of a control-plane operation."""
+
+    operation_id: str
+    owner_epoch: str
+    status: str
+    kind: str | None = None
+    result: Any = None
+    error: str | None = None
+
+
 class EnginePoolRuntime(Protocol):
     """Execution adapter; implementations retain backend-specific RPC
     handling."""
@@ -51,7 +74,7 @@ class ModelBusyError(RuntimeError):
     """Lock admission failed before execution; safe to retry the whole call."""
 
 
-class InferenceManager:
+class _RoleInferenceState:
     """Registration never creates actors or grants admission.
 
     Engine owners submit complete observations after completing health, weight
@@ -406,6 +429,8 @@ class InferenceManager:
             spec = self._models[model_id]
             if spec.weight_source == WeightSource.POLICY and required_weight_version is None:
                 raise ValueError("Policy preparation requires a target weight version")
+            if spec.weight_source != WeightSource.POLICY and required_weight_version is not None:
+                raise ValueError("Static or external weights cannot request a policy weight version")
             current = next(model for model in self._snapshot.models if model.model_id == model_id)
             self.publish_model(
                 replace(
@@ -436,6 +461,10 @@ class InferenceManager:
             if not (evidence.initialized and evidence.health_checked and evidence.router_updated):
                 raise ValueError("Preparation lacks initialization, health or Router evidence")
             spec = self._models[model.model_id]
+            if spec.weight_source != WeightSource.POLICY and (
+                evidence.weights_synced or model.required_weight_version is not None
+            ):
+                raise ValueError("Static or external weights cannot publish dynamic weight synchronization")
             current = next(item for item in self._snapshot.models if item.model_id == model.model_id)
             if spec.weight_source == WeightSource.POLICY and (
                 not evidence.weights_synced or model.required_weight_version != current.required_weight_version
@@ -475,3 +504,250 @@ class InferenceManager:
             if unknown:
                 raise KeyError(f"Unknown models: {sorted(unknown)}")
             return replace(self._snapshot, models=tuple(m for m in self._snapshot.models if m.model_id in model_names))
+
+
+class InferenceManager:
+    """Task-scoped inference control plane shared by all inference roles.
+
+    The role state object is an implementation detail.  Callers keep one
+    manager handle and identify a model by ``(role, model_id)``; compatibility
+    callers may still construct the manager with a default role and use the old
+    role-local method signatures.
+    """
+
+    def __init__(self, role: Role | str | None = None) -> None:
+        self._lock = RLock()
+        self.manager_epoch = new_manager_epoch()
+        self._default_role = Role(role) if role is not None else None
+        self._roles: dict[Role, _RoleInferenceState] = {}
+        self._permits: dict[str, RequestPermit] = {}
+        if self._default_role is not None:
+            self._state(self._default_role)
+
+    def _state(self, role: Role | str | None = None) -> _RoleInferenceState:
+        selected = Role(role) if role is not None else self._default_role
+        if selected is None:
+            raise ValueError("An inference role is required")
+        with self._lock:
+            state = self._roles.get(selected)
+            if state is None:
+                state = _RoleInferenceState(selected)
+                state._snapshot = replace(state._snapshot, manager_epoch=self.manager_epoch)
+                self._roles[selected] = state
+            return state
+
+    def for_role(self, role: Role | str) -> "InferenceManager":
+        """Return a role-scoped compatibility view over this same owner."""
+        view = object.__new__(InferenceManager)
+        view._lock = self._lock
+        view.manager_epoch = self.manager_epoch
+        view._default_role = Role(role)
+        view._roles = self._roles
+        view._permits = self._permits
+        view._state(view._default_role)
+        return view
+
+    @property
+    def role(self) -> Role | None:
+        return self._default_role
+
+    def register_model(self, spec: ModelConfig, *, operation_id: str, role: Role | str | None = None) -> ModelConfig:
+        return self._state(role).register_model(spec, operation_id=operation_id)
+
+    def configure_routes(
+        self, routing: RoutingSpec, *, operation_id: str, role: Role | str | None = None
+    ) -> RoutingSpec:
+        return self._state(role).configure_routes(routing, operation_id=operation_id)
+
+    def bind_pool(self, model_id: str, runtime: EnginePoolRuntime, *, role: Role | str | None = None) -> None:
+        self._state(role).bind_pool(model_id, runtime)
+
+    def attach_host(
+        self,
+        pools: Mapping[str, Any],
+        *,
+        stop_routers: Callable[[], None] | None = None,
+        role: Role | str | None = None,
+    ) -> None:
+        self._state(role).attach_host(pools, stop_routers=stop_routers)
+
+    def ready(self, role: Role | str | None = None) -> bool:
+        return self._state(role).ready()
+
+    def dispatch(
+        self,
+        model_id: str,
+        method: str,
+        /,
+        *args: Any,
+        wait: bool = False,
+        role: Role | str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        return self._state(role).dispatch(model_id, method, *args, wait=wait, **kwargs)
+
+    def health_check(self, model_id: str, *, role: Role | str | None = None) -> bool:
+        return self._state(role).health_check(model_id)
+
+    def recover(self, model_id: str, *, role: Role | str | None = None) -> set[int]:
+        return self._state(role).recover(model_id)
+
+    def onload(self, model_id: str, tags: list[str] | None = None, *, role: Role | str | None = None) -> None:
+        self._state(role).onload(model_id, tags)
+
+    def offload(self, model_id: str, *, role: Role | str | None = None) -> None:
+        self._state(role).offload(model_id)
+
+    def _close_pool(
+        self, model_id: str, /, *args: Any, wait: bool = False, role: Role | str | None = None, **kwargs: Any
+    ) -> Any:
+        """Close one pool through the selected role state.
+
+        Keep this manager-level hook for compatibility callers that wrap the
+        old role-local shutdown boundary to observe drain ordering.
+        """
+        return self._state(role)._close_pool(model_id, *args, wait=wait, **kwargs)
+
+    def shutdown(self, model_id: str | None = None, *, role: Role | str | None = None) -> None:
+        if model_id is not None:
+            self._state(role).shutdown(model_id)
+            return
+        selected = Role(role) if role is not None else self._default_role
+        if selected is not None:
+            state = self._state(selected)
+            with state._shutdown_lock:
+                with state._lock:
+                    state._closing = True
+                    state._ready = False
+                errors = []
+                for pool_model_id in reversed(tuple(state._dispatch_pools)):
+                    try:
+                        self._close_pool(pool_model_id, wait=True, role=selected)
+                    except Exception as exc:
+                        errors.append(exc)
+                try:
+                    state._close_routers()
+                except Exception as exc:
+                    errors.append(exc)
+                if errors:
+                    raise RuntimeError("Failed to shut down one or more inference pools") from errors[0]
+            return
+        for selected in tuple(self._roles):
+            self._roles[selected].close()
+
+    def close(self) -> None:
+        self.shutdown()
+
+    def publish_model(self, model: ModelSnapshot, *, role: Role | str | None = None) -> None:
+        self._state(role).publish_model(model)
+
+    def begin_preparation(
+        self, model_id: str, *, required_weight_version: str | None = None, role: Role | str | None = None
+    ) -> PreparationToken:
+        return self._state(role).begin_preparation(model_id, required_weight_version=required_weight_version)
+
+    def complete_preparation(
+        self,
+        token: PreparationToken,
+        model: ModelSnapshot,
+        *,
+        evidence: PreparationEvidence,
+        role: Role | str | None = None,
+    ) -> None:
+        self._state(role).complete_preparation(token, model, evidence=evidence)
+
+    def invalidate_model(self, model_id: str, *, state: LifecycleState, role: Role | str | None = None) -> None:
+        self._state(role).invalidate_model(model_id, state=state)
+
+    def snapshot(self, model_names: tuple[str, ...] | None = None, *, role: Role | str | None = None) -> RoleSnapshot:
+        return self._state(role).snapshot(model_names)
+
+    def snapshots(self) -> dict[Role, RoleSnapshot]:
+        return {role: state.snapshot() for role, state in self._roles.items()}
+
+    def __getattr__(self, name: str) -> Any:
+        """Keep the pre-unification role-local API available to old callers."""
+        default_role = self.__dict__.get("_default_role")
+        if default_role is None:
+            raise AttributeError(name)
+        return getattr(self._state(default_role), name)
+
+    def get_discovery_snapshot(
+        self,
+        *,
+        role: Role | str | None = None,
+        model_id: str | None = None,
+        allow_defer: bool | None = None,
+        direct_eligible: bool | None = None,
+    ) -> RoleSnapshot:
+        snapshot = self.snapshot(role=role)
+        if model_id is None:
+            return snapshot
+        model = next(item for item in snapshot.models if item.model_id == model_id)
+        if allow_defer is not None and model.allow_defer != allow_defer:
+            raise ValueError("Discovery capability allow_defer differs from registered model")
+        if direct_eligible is not None and model.direct_eligible != direct_eligible:
+            raise ValueError("Discovery capability direct_eligible differs from registered model")
+        return replace(snapshot, models=(model,))
+
+    def get_operation(self, operation_id: str, *, role: Role | str | None = None) -> OperationSnapshot:
+        if not operation_id:
+            raise ValueError("An operation ID is required")
+        state = self._state(role)
+        with state._lock:
+            record = state._operations.get(operation_id)
+            if record is None:
+                raise KeyError(f"Unknown operation: {operation_id}")
+            kind, result = record
+            return OperationSnapshot(
+                operation_id=operation_id,
+                owner_epoch=self.manager_epoch,
+                status="completed",
+                kind=kind,
+                result=deepcopy(result),
+            )
+
+    def admit_request(
+        self,
+        model_id: str,
+        request_id: str | None = None,
+        *,
+        role: Role | str | None = None,
+        phase_handle: str | None = None,
+        target: str | None = None,
+    ) -> RequestPermit:
+        del phase_handle
+        selected = Role(role) if role is not None else self._default_role
+        if selected is None:
+            raise ValueError("An inference role is required")
+        with self._lock:
+            snapshot = self._state(selected).snapshot()
+            model = next((item for item in snapshot.models if item.model_id == model_id), None)
+            if model is None:
+                raise KeyError(f"Unknown model: {model_id}")
+            if not model.admission or model.state != LifecycleState.READY:
+                raise RuntimeError(f"Model {model_id} is not ready for inference")
+            rid = request_id or uuid4().hex
+            existing = self._permits.get(rid)
+            permit = RequestPermit(rid, self.manager_epoch, selected, model_id, target)
+            if existing is not None and existing != permit:
+                raise ValueError(f"Request already exists: {rid}")
+            self._permits[rid] = permit
+            return permit
+
+    def complete_request(self, permit: RequestPermit | str) -> None:
+        request_id = permit if isinstance(permit, str) else permit.request_id
+        with self._lock:
+            current = self._permits.get(request_id)
+            if current is None:
+                return
+            if not isinstance(permit, str) and current != permit:
+                raise ValueError("Request permit does not belong to this manager epoch and target")
+            self._permits.pop(request_id, None)
+
+    def cancel_request(self, permit: RequestPermit | str) -> None:
+        self.complete_request(permit)
+
+    def get_request(self, request_id: str) -> RequestPermit | None:
+        with self._lock:
+            return self._permits.get(request_id)

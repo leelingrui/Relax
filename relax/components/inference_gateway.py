@@ -3,11 +3,11 @@
 """CPU HTTP gateway shared by rollout, GenRM, and Teacher services."""
 
 import asyncio
-import hashlib
 import inspect
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import ray
@@ -17,7 +17,7 @@ from ray import serve
 
 from relax.engine.inference.discovery import role_snapshot_from_dict
 from relax.engine.inference.routing import RoutingError, resolve_model, select_target
-from relax.engine.inference.types import Role, RoleSnapshot, RoutingSpec
+from relax.engine.inference.types import Role, RoleSnapshot
 from relax.utils.logging_utils import get_logger
 
 
@@ -48,9 +48,7 @@ class InferenceGateway:
     """Role-neutral HTTP ingress which routes through a Manager snapshot.
 
     The gateway owns no GPU resources and keeps no availability state of its
-    own. ``snapshot_provider`` is the Manager's source of truth; the optional
-    ``discovery_url`` is only a compatibility fallback for deployments that
-    have not yet exposed a direct Manager handle.
+    own. ``manager_handle`` or ``snapshot_provider`` is the only state source.
     """
 
     app = FastAPI()
@@ -59,52 +57,41 @@ class InferenceGateway:
         self,
         role: str | Role,
         *,
+        manager_handle: Any | None = None,
         snapshot_provider: GatewaySnapshotProvider | None = None,
-        manager_handles: Mapping[str, Any] | None = None,
         role_manager_handle: Any | None = None,
-        discovery_url: str | None = None,
         upstream_url: str | None = None,
+        # Kept only so old deployment construction fails at request time with
+        # a clear manager error instead of failing while binding Serve.
+        discovery_url: str | None = None,
+        manager_handles: Mapping[str, Any] | None = None,
         genrm_backend_handle: Any | None = None,
         timeout: float = 1800.0,
     ) -> None:
         self.role = Role(role)
+        self.manager_handle = manager_handle
         self.snapshot_provider = snapshot_provider
-        self.manager_handles = dict(manager_handles or {})
+        if manager_handle is not None and role_manager_handle is not None:
+            raise ValueError("Use manager_handle or role_manager_handle, not both")
         self.role_manager_handle = role_manager_handle
-        self.discovery_url = discovery_url.rstrip("/") if discovery_url else None
         self.upstream_url = upstream_url.rstrip("/") if upstream_url else None
         self.genrm_backend_handle = genrm_backend_handle
+        if discovery_url is not None or manager_handles:
+            self._logger = get_logger(__name__)
+            self._logger.warning("Ignoring legacy discovery inputs; configure one task InferenceManager handle")
         self._client = httpx.AsyncClient(timeout=timeout, limits=httpx.Limits(max_connections=2048))
         self._logger = get_logger(__name__)
 
     async def _snapshot(self) -> RoleSnapshot:
+        if self.manager_handle is not None:
+            value = self.manager_handle.snapshot.remote(role=self.role)
+            if inspect.isawaitable(value):
+                value = await value
+            elif not isinstance(value, RoleSnapshot):
+                value = await asyncio.to_thread(ray.get, value)
+            return value
         if self.role_manager_handle is not None:
             return await asyncio.to_thread(ray.get, self.role_manager_handle.get_role_snapshot.remote())
-        if self.manager_handles:
-            refs = [
-                manager.get_discovery_snapshot.remote(
-                    role=self.role,
-                    model_id=model_id,
-                    allow_defer=True,
-                    direct_eligible=False,
-                )
-                for model_id, manager in self.manager_handles.items()
-            ]
-            snapshots = await asyncio.to_thread(ray.get, refs)
-            models = tuple(model for snapshot in snapshots for model in snapshot.models)
-            route_key_to_model = tuple((model_id, model_id) for model_id in self.manager_handles)
-            default_model = next(iter(self.manager_handles)) if len(self.manager_handles) == 1 else None
-            epochs = sorted(
-                (model_id, snapshot.manager_epoch)
-                for model_id, snapshot in zip(self.manager_handles, snapshots, strict=True)
-            )
-            return RoleSnapshot(
-                role=self.role,
-                manager_epoch=hashlib.sha256(json.dumps(epochs).encode()).hexdigest(),
-                topology_revision=max((snapshot.topology_revision for snapshot in snapshots), default=0),
-                models=models,
-                routing=RoutingSpec(default_model=default_model, route_key_to_model=route_key_to_model),
-            )
         if self.snapshot_provider is not None:
             value = self.snapshot_provider()
             if inspect.isawaitable(value):
@@ -112,11 +99,7 @@ class InferenceGateway:
             if isinstance(value, RoleSnapshot):
                 return value
             return role_snapshot_from_dict(value)
-        if self.discovery_url is None:
-            raise HTTPException(status_code=503, detail="Inference discovery is not configured")
-        response = await self._client.get(f"{self.discovery_url}/engines", params={"schema_version": 2})
-        response.raise_for_status()
-        return role_snapshot_from_dict(response.json())
+        raise HTTPException(status_code=503, detail="Inference manager is not configured")
 
     async def _target(self, payload: Mapping[str, Any] | None = None) -> str:
         target, _ = await self._resolve_target(payload)
@@ -134,9 +117,6 @@ class InferenceGateway:
             try:
                 return select_target(model).base_url.rstrip("/"), model.model_id
             except RoutingError:
-                if self.role == Role.GENRM and model.admission and model.state and model.state.value == "ready":
-                    if self.upstream_url:
-                        return self.upstream_url, model.model_id
                 raise
         except RoutingError as exc:
             raise HTTPException(
@@ -157,7 +137,9 @@ class InferenceGateway:
             snapshot = await self._snapshot()
         except Exception as exc:
             self._logger.warning("Inference discovery unavailable: %s", exc)
-            return JSONResponse({"status": "healthy", "service": self.role.value, "model_status": "unknown"})
+            return JSONResponse(
+                {"status": "unavailable", "service": self.role.value, "model_status": "unknown"}, status_code=503
+            )
         ready = any(model.admission and model.state and model.state.value == "ready" for model in snapshot.models)
         return JSONResponse(
             {
@@ -203,22 +185,63 @@ class InferenceGateway:
                 exc.status_code, str(exc.detail), code="unavailable" if exc.status_code == 503 else "routing_error"
             )
 
-        payload.pop("route_key", None)
-        if path == "generate":
-            payload.pop("model", None)
-        wrap_response = False
-        if messages_request:
-            if target == self.upstream_url:
-                # The legacy backend owns both adaptation and response formatting.
-                payload["route_key"] = model_id
-            else:
+        permit = await self._admit(request, model_id, target)
+
+        try:
+            payload.pop("route_key", None)
+            if path == "generate":
+                payload.pop("model", None)
+            wrap_response = False
+            if messages_request:
                 if self.genrm_backend_handle is None:
-                    return _json_error(503, "GenRM adapter is not configured", code="unavailable")
+                    raise HTTPException(status_code=503, detail="GenRM adapter is not configured")
                 payload = await self.genrm_backend_handle.prepare_generate_payload.remote(
                     model_id, payload["messages"], payload.get("sampling_params")
                 )
                 wrap_response = True
-        return await self._forward(request, path, target, json.dumps(payload).encode(), wrap_response=wrap_response)
+            response = await self._forward(
+                request, path, target, json.dumps(payload).encode(), wrap_response=wrap_response, permit=permit
+            )
+            if permit is not None and not isinstance(response, StreamingResponse):
+                await self._complete(permit)
+            return response
+        except Exception:
+            if permit is not None:
+                await self._cancel(permit)
+            raise
+
+    async def _manager_call(self, method: str, **kwargs: Any) -> Any:
+        if self.manager_handle is None:
+            return None
+        remote_method = getattr(self.manager_handle, method, None)
+        if remote_method is None:
+            return None
+        value = remote_method.remote(**kwargs)
+        if inspect.isawaitable(value):
+            return await value
+        return await asyncio.to_thread(ray.get, value)
+
+    async def _admit(self, request: Request, model_id: str, target: str) -> Any:
+        if self.manager_handle is None:
+            return None
+        request_id = request.headers.get("x-relax-request-id") or uuid4().hex
+        try:
+            return await self._manager_call(
+                "admit_request",
+                model_id=model_id,
+                request_id=request_id,
+                role=self.role,
+                target=target,
+            )
+        except Exception as exc:
+            self._logger.warning("Inference request admission failed: %s", exc)
+            raise HTTPException(status_code=503, detail="Inference request is not admitted") from exc
+
+    async def _complete(self, permit: Any) -> None:
+        await self._manager_call("complete_request", permit=permit)
+
+    async def _cancel(self, permit: Any) -> None:
+        await self._manager_call("cancel_request", permit=permit)
 
     async def proxy_backend(self, request: Request, path: str) -> Response:
         """Forward role control-plane endpoints to the internal service."""
@@ -227,7 +250,14 @@ class InferenceGateway:
         return await self._forward(request, path, self.upstream_url, await request.body())
 
     async def _forward(
-        self, request: Request, path: str, target: str, body: bytes, *, wrap_response: bool = False
+        self,
+        request: Request,
+        path: str,
+        target: str,
+        body: bytes,
+        *,
+        wrap_response: bool = False,
+        permit: Any = None,
     ) -> Response:
         headers = {
             key: value
@@ -243,7 +273,8 @@ class InferenceGateway:
         try:
             response = await self._client.send(upstream, stream=True)
             if response.headers.get("content-type", "").startswith("text/event-stream"):
-                stream_response = self._stream_response(response)
+                stream_response = self._stream_response(response, permit)
+                permit = None
                 response = None
                 return stream_response
             content = await response.aread()
@@ -265,11 +296,18 @@ class InferenceGateway:
             if response is not None and not response.is_closed:
                 await response.aclose()
 
-    def _stream_response(self, response: httpx.Response) -> StreamingResponse:
+    def _stream_response(self, response: httpx.Response, permit: Any = None) -> StreamingResponse:
         async def body():
             try:
                 async for chunk in response.aiter_raw():
                     yield chunk
+            except BaseException:
+                if permit is not None:
+                    await self._cancel(permit)
+                raise
+            else:
+                if permit is not None:
+                    await self._complete(permit)
             finally:
                 await response.aclose()
 

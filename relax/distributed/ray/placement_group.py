@@ -9,6 +9,12 @@ from relax.core.node_group_affinity import (
     require_control_plane_resource_on_node,
     with_control_plane_affinity,
 )
+from relax.engine.inference.placement import (
+    PlacementGroupView,
+    PlacementOwner,
+    PlacementPlanner,
+    PlacementRequest,
+)
 from relax.utils.device import ray_get_device_ids
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
@@ -152,7 +158,7 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     return rollout_manager, num_rollout_per_epoch
 
 
-def create_genrm_manager(args, pg, runtime_env=None):
+def create_genrm_manager(args, pg, runtime_env=None, inference_manager_handle=None):
     """Create and initialize a single GenRM manager (legacy single-instance
     path).
 
@@ -171,12 +177,14 @@ def create_genrm_manager(args, pg, runtime_env=None):
     # Used by custom_reward_post_process_path when GenRM lifecycle is managed
     # from userland. Only safe as a fixed, well-known name because this path
     # is exclusively for the single-instance case (see create_genrm_managers).
+    role_kwargs = {"runtime_env": runtime_env, "actor_names": {"__default__": "relax_genrm_manager"}}
+    if inference_manager_handle is not None:
+        role_kwargs["task_manager_handle"] = inference_manager_handle
     genrm_manager = create_role_managers(
         args,
         "genrm",
         {"__default__": {"args": (args,), "kwargs": {"pg": pg}}},
-        runtime_env=runtime_env,
-        actor_names={"__default__": "relax_genrm_manager"},
+        **role_kwargs,
     )["__default__"]
 
     logger.info("GenRMManager initialized successfully")
@@ -189,7 +197,7 @@ def create_genrm_manager(args, pg, runtime_env=None):
     return genrm_manager
 
 
-def create_genrm_managers(args, pg, runtime_env=None):
+def create_genrm_managers(args, pg, runtime_env=None, inference_manager_handle=None):
     """Create and initialize the GenRM manager(s) declared by
     ``args._genrm_instances_resolved``.
 
@@ -208,9 +216,14 @@ def create_genrm_managers(args, pg, runtime_env=None):
 
     instance_specs = args._genrm_instances_resolved
     if list(instance_specs.keys()) == ["__default__"]:
-        return {"__default__": create_genrm_manager(args, pg, runtime_env=runtime_env)}
+        return {
+            "__default__": create_genrm_manager(
+                args, pg, runtime_env=runtime_env, inference_manager_handle=inference_manager_handle
+            )
+        }
     pool_configs = {}
     bundle_offset = 0
+    requests = []
     for index, (key, spec) in enumerate(instance_specs.items()):
         instance_args = copy.copy(args)
         instance_args.genrm_model_path = spec["model_path"]
@@ -222,13 +235,32 @@ def create_genrm_managers(args, pg, runtime_env=None):
             "args": (instance_args,),
             "kwargs": {"pg": pg, "bundle_offset": bundle_offset, "port_window_index": index},
         }
+        requests.append(
+            PlacementRequest(
+                group_id=f"genrm/{key}",
+                worker_type="regular",
+                num_gpus=spec["num_gpus"],
+                num_gpus_per_engine=spec["num_gpus_per_engine"],
+                num_gpus_per_node=args.num_gpus_per_node,
+                bundle_offset=bundle_offset,
+            )
+        )
         bundle_offset += spec["num_gpus"]
+    PlacementPlanner().plan(
+        tuple(requests),
+        PlacementGroupView(tuple(pg[1]), tuple(pg[2]), PlacementOwner.CONTROLLER, identity=pg[0]),
+    )
+    role_kwargs = {
+        "runtime_env": runtime_env,
+        "actor_names": {key: f"relax_genrm_manager_{key}" for key in instance_specs},
+    }
+    if inference_manager_handle is not None:
+        role_kwargs["task_manager_handle"] = inference_manager_handle
     managers = create_role_managers(
         args,
         "genrm",
         pool_configs,
-        runtime_env=runtime_env,
-        actor_names={key: f"relax_genrm_manager_{key}" for key in instance_specs},
+        **role_kwargs,
     )
     if getattr(args, "offload_rollout", False):
         ray.get([manager.offload.remote() for manager in managers.values()])

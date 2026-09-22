@@ -82,6 +82,17 @@ class _FakeManager(MultiEngineManager):
         return {}
 
 
+def test_legacy_placement_hook_remains_compatible():
+    manager = _FakeManager(num_slots=1)
+
+    placement, owns_pg, gpu_index, planned = manager._resolve_planned_placement(0)
+
+    assert placement == ("pg-0", [0], [0])
+    assert owns_pg is False
+    assert gpu_index == 0
+    assert planned is None
+
+
 class _FakeEngineActorCls:
     """Stand-in engine "actor class"; ``ray.remote(cls)`` in the base class
     just needs something ``.options(...).remote(...)`` works on."""

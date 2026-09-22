@@ -10,7 +10,12 @@ import pytest
 
 
 try:
-    from relax.distributed.ray.rollout import EngineFinalizeResult, ScaleOutRequest, ScaleOutStatus
+    from relax.distributed.ray.rollout import (
+        EngineFinalizeResult,
+        PlacementOwner,
+        ScaleOutRequest,
+        ScaleOutStatus,
+    )
     from relax.utils.scale_utils import ScaleOutFailure, ScaleOutFailureCategory
 
     HAS_DEPS = True
@@ -82,6 +87,50 @@ async def test_ray_native_finalizer_failure_rolls_back_precreated_group():
     assert result.success is False
     assert result.reason is not None and result.reason.category is ScaleOutFailureCategory.WEIGHT_SYNC_FAILED
     manager._rollback_engines.assert_awaited_once_with(group)
+
+
+@pytest.mark.asyncio
+async def test_ray_native_replica_uses_manager_owned_planned_slice():
+    manager = create_test_manager()
+    server = make_rollout_server()
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
+    manager._finalize_engine_group_registration = AsyncMock(
+        return_value=EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED))
+    )
+    manager._rollback_engines = AsyncMock()
+
+    info_actor = MagicMock()
+    info_actor.get_ip_and_gpu_id.remote.return_value = AwaitableValue(("10.0.0.1", 0))
+    info_actor_class = MagicMock()
+    info_actor_class.options.return_value.remote.return_value = info_actor
+    created = {}
+
+    def make_group(**kwargs):
+        created.update(kwargs)
+        group = SimpleNamespace(engines=[make_mock_engine()], all_engines=[make_mock_engine()])
+        group.start_engines = MagicMock(return_value=([AwaitableValue(None)], {}))
+        return group
+
+    with (
+        patch("relax.distributed.ray.rollout.EngineGroup", side_effect=make_group),
+        patch("relax.distributed.ray.rollout.ray.kill"),
+    ):
+        result = await manager._bring_up_single_replica(
+            request=request,
+            srv=server,
+            pg=object(),
+            replica_idx=0,
+            num_gpus=1,
+            gpus_per_engine=1,
+            engine_offset=1,
+            sort_key=lambda item: item,
+            InfoActor=info_actor_class,
+        )
+
+    assert result.success is False
+    assert created["pg_owner"] is PlacementOwner.MANAGER
+    assert created["placement"].reserved_size == 1
+    assert created["placement"].referenced_offsets == (0,)
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ class Service:
         data_source: Optional[Any] = None,
         actor_rollout_pgs: Optional[Any] = None,
         runtime_env=None,
+        inference_manager_handle: Optional[Any] = None,
         *,
         defer_deploy: bool = False,
     ) -> None:
@@ -48,6 +49,7 @@ class Service:
             data_source: Optional data source actor or factory used by rollout.
             actor_rollout_pgs: Optional placement group for colocated actor-rollout.
             runtime_env: Optional Ray runtime environment dict for the service.
+            inference_manager_handle: Task-scoped CPU inference control-plane handle.
             defer_deploy: Allocate resources without deploying until ``deploy`` is called.
         """
         logger.info(
@@ -60,6 +62,7 @@ class Service:
         self.cls = cls
         self.data_source = data_source
         self.runtime_env = runtime_env
+        self.inference_manager_handle = inference_manager_handle
         self._is_shared_pgs = actor_rollout_pgs is not None
         self._deployed = False
         self._task_ref: Optional[Any] = None
@@ -103,25 +106,37 @@ class Service:
             {"runtime_env": self.runtime_env},
         )
         if self.data_source is not None:
+            bind_kwargs = {"data_source": self.data_source, "runtime_env": self.runtime_env}
+            if self.role == "rollout" and getattr(self, "inference_manager_handle", None) is not None:
+                bind_kwargs["inference_manager_handle"] = self.inference_manager_handle
             self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
-                self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env
+                self.healthy, pgs, self.config, **bind_kwargs
             )
         else:
+            bind_kwargs = {"runtime_env": self.runtime_env}
+            if self.role == "genrm" and getattr(self, "inference_manager_handle", None) is not None:
+                bind_kwargs["inference_manager_handle"] = self.inference_manager_handle
             self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
-                self.healthy, pgs, self.num_gpus, self.config, self.role, runtime_env=self.runtime_env
+                self.healthy, pgs, self.num_gpus, self.config, self.role, **bind_kwargs
             )
         logger.info(f"[{self.role}] Deploying service...")
-        backend_prefix = f"/{self.role}/backend" if self._gateway_enabled else f"/{self.role}"
-        self.handle = serve.run(self.service, name=self._backend_name, route_prefix=backend_prefix)
-        if self._gateway_enabled:
+        gateway_enabled = getattr(self, "_gateway_enabled", self.role in {"rollout", "genrm"})
+        backend_name = getattr(self, "_backend_name", f"{self.role}_backend" if gateway_enabled else self.role)
+        gateway_name = getattr(self, "_gateway_name", f"{self.role}_gateway" if gateway_enabled else None)
+        manager_handle = getattr(self, "inference_manager_handle", None)
+        backend_prefix = f"/{self.role}/backend" if gateway_enabled else f"/{self.role}"
+        self.handle = serve.run(self.service, name=backend_name, route_prefix=backend_prefix)
+        if gateway_enabled:
+            if manager_handle is not None:
+                ray.get(manager_handle.register_role.remote(self.role, self.handle))
             backend_url = get_serve_url(backend_prefix)
             gateway = InferenceGatewayDeployment.bind(
                 self.role,
-                discovery_url=backend_url,
+                manager_handle=manager_handle,
                 upstream_url=backend_url,
                 genrm_backend_handle=self.handle if self.role == "genrm" else None,
             )
-            self.gateway_handle = serve.run(gateway, name=self._gateway_name, route_prefix=f"/{self.role}")
+            self.gateway_handle = serve.run(gateway, name=gateway_name, route_prefix=f"/{self.role}")
             logger.info(f"[{self.role}] CPU InferenceGateway deployed at /{self.role}; backend={backend_prefix}")
 
     def _start_heartbeat(self) -> None:

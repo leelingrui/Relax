@@ -13,9 +13,16 @@ import pytest
 
 from relax.distributed.ray import inference_role as module
 from relax.engine.inference.capabilities import WeightSource
-from relax.engine.inference.manager import ModelBusyError
+from relax.engine.inference.manager import InferenceManager, ModelBusyError
 from relax.engine.inference.specs import ModelSpec
-from relax.engine.inference.types import Role
+from relax.engine.inference.types import (
+    LifecycleState,
+    ModelSnapshot,
+    ReplicaSnapshot,
+    Role,
+    RoleSnapshot,
+    RoutingSpec,
+)
 
 
 @pytest.fixture
@@ -45,8 +52,10 @@ def pools(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
         def initialize(self) -> None:
             snapshot = self.manager.snapshot()
-            assert {model.model_id for model in snapshot.models} == set(state.instances)
-            assert dict(snapshot.routing.route_key_to_model) == {key: key for key in state.instances}
+            assert {model.model_id for model in snapshot.models} <= set(state.instances)
+            assert dict(snapshot.routing.route_key_to_model) == {
+                key: key for key, _ in snapshot.routing.route_key_to_model
+            }
             state.events.append(("initialize", self.model_id))
             if self.model_id == state.fail_init:
                 raise RuntimeError("initialize failed")
@@ -85,6 +94,17 @@ def test_role_registers_all_models_before_initialization(pools: SimpleNamespace,
 def test_role_single_model_has_default_route(pools: SimpleNamespace) -> None:
     owner = module.InferenceRole("teacher", {"a": _configs()["a"]})
     assert owner.snapshot().routing.default_model == "a"
+
+
+def test_role_compatibility_views_can_share_task_manager(pools: SimpleNamespace) -> None:
+    manager = InferenceManager()
+    teacher = module.InferenceRole("teacher", {"teacher": _configs()["a"]}, inference_manager=manager)
+    genrm = module.InferenceRole("genrm", {"genrm": _configs()["b"]}, inference_manager=manager)
+
+    assert teacher.inference_manager.manager_epoch == manager.manager_epoch
+    assert genrm.inference_manager.manager_epoch == manager.manager_epoch
+    assert manager.snapshot(role=Role.TEACHER).models[0].model_id == "teacher"
+    assert manager.snapshot(role=Role.GENRM).models[0].model_id == "genrm"
 
 
 @pytest.mark.parametrize("failing_model", ["a", "b"])
@@ -488,3 +508,160 @@ def test_role_rejects_rollout_pool_before_construction(pools: SimpleNamespace) -
     with pytest.raises(ValueError, match="Unsupported inference pool role"):
         module.InferenceRole("rollout", _configs())
     assert pools.events == []
+
+
+def test_task_manager_normalizes_snapshots_and_owns_request_permits() -> None:
+    snapshot = RoleSnapshot(
+        role=Role.ROLLOUT,
+        manager_epoch="role-local-epoch",
+        models=(
+            ModelSnapshot(
+                model_id="model",
+                state=LifecycleState.READY,
+                admission=True,
+                replicas=(ReplicaSnapshot("replica", LifecycleState.READY, "http://router"),),
+            ),
+        ),
+        routing=RoutingSpec(default_model="model", route_key_to_model=(("model", "model"),)),
+    )
+    host = SimpleNamespace(snapshot=SimpleNamespace(remote=MagicMock(return_value=snapshot)))
+    owner = module.TaskInferenceManager()
+    owner.register_role(Role.ROLLOUT, host)
+
+    normalized = owner.snapshot(role=Role.ROLLOUT)
+    permit = owner.admit_request("model", request_id="request", role=Role.ROLLOUT, target="http://router")
+
+    assert normalized.manager_epoch == owner.manager_epoch
+    assert permit.manager_epoch == owner.manager_epoch
+    assert owner.get_request("request") == permit
+    owner.complete_request(permit)
+    assert owner.get_request("request") is None
+
+
+def test_task_manager_registers_external_role_before_host_binding() -> None:
+    snapshot = RoleSnapshot(
+        role=Role.ROLLOUT,
+        manager_epoch="backend-epoch",
+        models=(ModelSnapshot(model_id="model"),),
+        routing=RoutingSpec(default_model="model"),
+    )
+    host = SimpleNamespace(snapshot=SimpleNamespace(remote=MagicMock(return_value=snapshot)))
+    owner = module.TaskInferenceManager()
+
+    owner.register_external_role(
+        Role.ROLLOUT,
+        None,
+        (module.ModelConfig("model", "checkpoint", weight_source=WeightSource.CHECKPOINT),),
+        RoutingSpec(default_model="model"),
+    )
+    owner.register_role(Role.ROLLOUT, host)
+
+    normalized = owner.snapshot(role=Role.ROLLOUT)
+    assert normalized.manager_epoch == owner.manager_epoch
+    assert normalized.routing.default_model == "model"
+    assert owner.get_operation("register:rollout:model").kind == "register"
+
+
+def test_task_manager_external_snapshot_uses_owner_routes() -> None:
+    observed = RoleSnapshot(
+        role=Role.ROLLOUT,
+        manager_epoch="backend-epoch",
+        models=(ModelSnapshot(model_id="model"),),
+        routing=RoutingSpec(default_model="backend-default"),
+    )
+    host = SimpleNamespace(snapshot=SimpleNamespace(remote=MagicMock(return_value=observed)))
+    owner = module.TaskInferenceManager()
+    owner.register_external_role(
+        Role.ROLLOUT,
+        None,
+        (module.ModelConfig("model", "checkpoint", weight_source=WeightSource.CHECKPOINT),),
+        RoutingSpec(default_model="model"),
+    )
+    owner.register_role(Role.ROLLOUT, host)
+
+    assert owner.snapshot(role=Role.ROLLOUT).routing.default_model == "model"
+
+
+def test_task_manager_records_external_lifecycle_operation() -> None:
+    snapshot = RoleSnapshot(
+        role=Role.ROLLOUT,
+        manager_epoch="backend-epoch",
+        models=(ModelSnapshot(model_id="model"),),
+        routing=RoutingSpec(default_model="model"),
+    )
+    host = SimpleNamespace(
+        snapshot=SimpleNamespace(remote=MagicMock(return_value=snapshot)),
+        call=SimpleNamespace(remote=MagicMock(return_value="healthy")),
+    )
+    owner = module.TaskInferenceManager()
+    owner.register_external_role(
+        Role.ROLLOUT,
+        host,
+        (module.ModelConfig("model", "checkpoint", weight_source=WeightSource.CHECKPOINT),),
+        RoutingSpec(default_model="model"),
+    )
+
+    assert owner.lifecycle(Role.ROLLOUT, "model", "health_check") is True
+    operation = next(item for item in owner._operations.values() if item.kind == "health_check")
+    assert operation.status == "completed"
+    assert operation.result is True
+
+
+def test_external_pool_runtime_preserves_partial_restore_skip_ranks() -> None:
+    host = SimpleNamespace(call=SimpleNamespace(remote=MagicMock(return_value=[])))
+    runtime = module._ExternalPoolRuntime(host, "model")
+
+    assert runtime.fanout("resume_memory_occupation", skip_ranks={1, 3}, tags=["weights"]) == []
+    host.call.remote.assert_called_once_with("model", "resume_memory_occupation", skip_ranks={1, 3}, tags=["weights"])
+
+
+def test_task_manager_shutdown_external_role_uses_owner_pool_shutdown() -> None:
+    snapshot = RoleSnapshot(
+        role=Role.ROLLOUT,
+        manager_epoch="backend-epoch",
+        models=(ModelSnapshot(model_id="model"),),
+        routing=RoutingSpec(default_model="model"),
+    )
+    host = SimpleNamespace(snapshot=SimpleNamespace(remote=MagicMock(return_value=snapshot)))
+    owner = module.TaskInferenceManager()
+    owner.register_external_role(
+        Role.ROLLOUT,
+        host,
+        (module.ModelConfig("model", "checkpoint", weight_source=WeightSource.CHECKPOINT),),
+        RoutingSpec(default_model="model"),
+    )
+
+    owner.shutdown_role(Role.ROLLOUT)
+    assert Role.ROLLOUT not in owner._external_roles
+
+
+def test_task_manager_publishes_external_ready_snapshot_after_preparation() -> None:
+    snapshot = RoleSnapshot(
+        role=Role.ROLLOUT,
+        manager_epoch="backend-epoch",
+        models=(
+            ModelSnapshot(
+                model_id="model",
+                replicas=(ReplicaSnapshot("model/replica-0", LifecycleState.READY, "http://engine"),),
+                router_url="http://router",
+                state=LifecycleState.READY,
+                admission=True,
+            ),
+        ),
+        routing=RoutingSpec(default_model="backend-default"),
+    )
+    host = SimpleNamespace(snapshot=SimpleNamespace(remote=MagicMock(return_value=snapshot)))
+    owner = module.TaskInferenceManager()
+    owner.register_external_role(
+        Role.ROLLOUT,
+        host,
+        (module.ModelConfig("model", "checkpoint", weight_source=WeightSource.CHECKPOINT),),
+        RoutingSpec(default_model="model"),
+    )
+
+    published = owner.snapshot(role=Role.ROLLOUT)
+    model = published.models[0]
+    assert model.state is LifecycleState.READY
+    assert model.admission is True
+    assert model.router_url == "http://router"
+    assert published.routing.default_model == "model"

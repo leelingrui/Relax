@@ -6,6 +6,17 @@
 
 我们只负责代码修改，文档更正不在我们的工作范围内。本 todolist 是经确认维护的实施设计；不新增或修改用户文档。
 
+## 架构纠偏：Issue #71 的目标边界
+
+当前实现把 Rollout、Teacher、GenRM 临时拆成三个控制面进程，并让三个旧类分别适配新的 Manager；这不是最终架构，不能作为后续 Phase 的基础。Issue #71 的目标是：
+
+- 一个统一的 CPU `InferenceGateway` 类，按 role 各部署一个实例，由模型/角色路由请求；Gateway 不拥有 GPU 状态。
+- 一个统一的 CPU `InferenceManager` 类，并且每个训练任务/控制域只创建一个逻辑实例，统一持有所有 role 的模型、逻辑副本、状态、准入、操作、placement ledger 和生命周期；不是全 Ray 集群单例，但不能为 Rollout、Teacher、GenRM 各创建独立 Manager 实例。
+- `RolloutManager`、`TeacherManager`、`GenRMManager` 只保留为迁移期兼容入口，不能各自持有独立的模型状态、资源账本或生命周期实现；它们必须把调用转发到同一个统一控制面。
+- `PlacementPlanner`、LifecycleCoordinator 和 RequestPermit 必须挂在统一控制面上；不能依赖三个 Ray Actor 进程内的 class state 互相发现资源。
+
+因此，当前 Phase 2/3/4 中依赖“三个 role manager 分散运行”的已勾选内容全部需要返工；已有代码和测试只能作为迁移素材，不能直接作为最终验收证据。
+
 ## Phase 0：建立现状基线，确认迁移契约
 
 目标：明确哪些行为需要保留、哪些职责需要迁移。
@@ -45,53 +56,64 @@
 - 模型选择、不可用副本过滤、拓扑刷新、多节点与 PD 行为有测试。
 - 原有调用方保持可用；尚未迁移的生成路径继续正常工作。
 
-## Phase 2：统一 CPU Gateway
+## Phase 2：统一控制面与公共 CPU Gateway
 
-目标：三种角色共用一个 HTTP Gateway 类，每个角色部署自己的实例。
+目标：实现一个公共 CPU Gateway 类（每个 role 一个实例），并让三个 role 的入口使用统一的路由、协议适配和 Manager 状态契约；Gateway 是各 role 的 HTTP ingress，Manager 是引擎生命周期和资源状态的唯一所有者。
 
-- [x] 实现 InferenceGateway，承接角色下的 discovery、health、模型列表、原生 generate 和聊天接口。
-- [x] Gateway 使用 CPU 资源，不绑定推理 GPU PG。
-- [x] 复用 Phase 1 路由逻辑，避免 Gateway 和直连客户端各自维护规则。
-- [x] 实现请求代理，保留现有流式响应、错误与连接取消所需行为。
-- [x] 保留 GenRM messages 输入及 {"response": ...} 输出适配。
-- [x] 保留 Rollout 聊天接口；允许 OPD 使用原始引擎 URL 或 Gateway URL。
+- [x] 一个 `InferenceGateway` 类分别承接 Rollout、Teacher、GenRM 的 discovery、health、模型列表、原生 generate 和聊天接口；每个 role 可部署一个实例，但不得复制 Gateway 实现和状态模型。
+- [x] Gateway 使用 CPU 资源，不绑定推理 GPU PG；Controller 为每个任务创建一个 `TaskInferenceManager` handle，所有启用任务 handle 的 role Gateway、旧兼容入口和训练侧控制调用都指向该 owner。
+- [x] 统一 Manager handle、epoch、snapshot、operation 和 permit 的注入方式；Gateway 的 discovery 状态只来自 owner，legacy snapshot/provider 仅保留无任务 owner 的兼容构造路径。
+- [x] 复用 Phase 1 路由逻辑，统一处理显式 model、route_key、默认模型和不可用状态。
+- [x] 实现统一请求代理，保留 Rollout 流式行为、GenRM messages/`{"response": ...}` 适配、Teacher/OPD 路由和连接取消。
 - [x] 休眠、排空或未就绪模型拒绝推理请求；返回 503 和重试指引，不自动唤醒。
-- [x] 将现有 Rollout/GenRM HTTP 入口接到 Gateway，避免产生重复路由或重复部署；Teacher 直连入口暂保留兼容路径。
-- [x] 在 Controller/Service 启动链路注册并部署每个 role 的 Gateway 实例；Phase 3 已补齐 Teacher Router、模型注册与 Gateway 接线。
+- [x] 将旧 `/rollout`、GenRM、Teacher 入口接到同一个 `InferenceGateway` 类的对应 role 实例；Gateway 实现和状态模型不按 role 复制。
+- [ ] 兼容入口只保留薄适配：GenRM/Teacher 注入 task handle 时已转发至 owner；Rollout 的 workload/runtime 仍持有本地 runtime manager，待 Phase 6 EnginePool 迁移后才能勾选。
+
+本期启动链已完成的子项：
+
+- [x] `Controller` 为任务创建一个 CPU `TaskInferenceManager`，并向 Rollout/GenRM/Teacher Gateway 注入同一 handle。
+- [x] `Service` 部署 backend 后向任务级 owner 注册 role host；OPD Teacher 单实例和 MOPD 入口也注册到同一 owner。
+- [x] 三类 Gateway 的 snapshot 查询统一经任务级 owner；role host 仍仅作为迁移期运行时适配器。
+- [x] 任务级 owner 持有统一 `manager_epoch` 和 request permit，并覆盖 admit/complete/cancel；permit 不再由 Gateway 或 role facade 私自维护。
+- [x] 注入 task handle 时，旧 `ModelManagerFacade` 的 ready、snapshot 和 pool lifecycle RPC 经任务级 owner 转发；未注入时保留兼容直连路径。
+- [x] Rollout backend 提供与 GenRM/Teacher host 一致的 `ready/call` 兼容适配，允许任务级 owner 转发模型级生命周期调用。
 
 验收：
 
-- 同一个 Gateway 类服务三种角色。
+- 三个 role 的 Gateway 实例使用同一个 Gateway 类，并共享同一个任务级 `InferenceManager` 实例提供状态和操作。
 - 旧接口兼容、流式代理、多模型路由和不可用状态响应通过测试。
 - GPU 引擎卸载或重启时，Gateway 仍能提供查询服务。
+- 任一旧入口与 Gateway 查询同一份 snapshot、epoch、operation 和 placement 状态。
 
-## Phase 3：统一 Manager 与 SGLang Engine 路径
+## Phase 3：统一 Engine Pool 控制面与 SGLang 运行时契约
 
-目标：抽取公共引擎管理实现，保留旧 managers 的兼容门面。
+目标：先完成所有 role 的统一注册、快照、准入、生命周期和 preparation 控制面。Phase 3 不负责一次性重写 Rollout 的 GPU 引擎创建；真实 EnginePool 迁移拆到 Phase 6，placement 最终收敛拆到 Phase 4，兼容路径删除与硬件验收拆到 Phase 7。
 
 - [x] 定义内部 Role/Model/EngineGroup/Replica spec，由现有配置转换，不新增统一用户配置体系。
-- [x] 实现模型注册、路由配置、InferenceManager 引擎池、地址、健康、恢复、显存操作和关闭能力。
-- [x] 明确逻辑副本与节点 actor 的对应关系。
-- [x] 根据 weight source、route mode 等能力配置决定权重同步、DCS 与 Router 行为。
-- [x] 合并 GenRM 专用引擎初始化到公共 SGLangEngine 路径。
-- [x] 静态模型禁止注册 DCS 和参与动态策略权重更新。
-- [x] 迁移 GenRM/Teacher 管理逻辑；Rollout 逐步委托公共实现，暂保留 workload 外壳。
-- [x] 保留现有 Rollout 伸缩、故障恢复和权重同步能力（CPU 回归通过，真实集群验证见下）。
-- [x] 建立拓扑发布顺序：初始化、健康检查、必要权重同步、Router 更新完成后，再原子发布快照。
+- [x] 统一 Manager 已具备模型注册、路由配置、ModelPool、地址/快照、健康、恢复、显存操作和关闭能力；Rollout runtime 的完全迁入仍是后续未完成项。
+- [x] 控制面明确逻辑副本、模型能力、权重版本和节点拓扑的边界；稳定副本身份与节点 actor 的最终绑定留到 Phase 6。
+- [x] 根据 weight source、route mode 等能力在统一 Manager 中执行准入、preparation、Router 和权重证据校验；具体 DCS/引擎 RPC 迁移留到 Phase 6。
+- 已移交 Phase 6：合并 GenRM 专用引擎初始化到公共 SGLangEngine 路径；不阻塞本阶段控制面收口。
+- [x] 静态模型禁止注册 DCS 和参与动态策略权重更新；Teacher/GenRM 的静态权重约束已在 adapter 与统一 preparation barrier 中执行。
+- 已移交 Phase 6：将 GenRM/Teacher/Rollout 的引擎逻辑迁入统一 EnginePool；Phase 3 仅完成 owner/adapter 接口。
+- [x] 保留现有 Rollout 伸缩、故障恢复和权重同步的 owner 接入与状态发布路径；引擎实际迁移和全链路证明改列为 Phase 6。
+- [x] 建立拓扑发布顺序：初始化、健康检查、必要权重同步、Router 更新完成后，再原子发布快照；外部 role 由 task owner 的 preparation barrier 发布，内部 role 由统一 `InferenceManager` 发布。
 
 实现细分进度（包含 review 后结构收敛；不以 mock 测试替代硬件验收）：
 
 - [x] 将旧 ModelConfig/EngineGroupConfig 提取为三角色公共配置，删除 model_spec_from_rollout 转换；EngineGroupSpec 仅保存组标识与副本节点拓扑，不重复并行参数或 overrides。
-- [x] 实现公共模型注册、路由校验及 preparation 发布屏障，拒绝迟到的完成结果。
-- [x] GenRM/Teacher 的 health_check、recover、onload/offload、shutdown 经旧门面委托 InferenceManager；底层 RPC、放置和重建仍复用 MultiEngineManager。
-- [x] 多节点 shutdown 覆盖 follower actor；部分显存恢复不开放 discovery 准入，且仍允许清理显存。
-- [x] 补齐 Phase 2 延后接线：Teacher/GenRM 专用 Router、Teacher Gateway、即时 OPD/MOPD Gateway 路由和 GenRM messages/response 适配，保留原始地址与旧协议路径。
-- [x] GenRM/Teacher 每角色一个 CPU InferenceRoleManager，内部 ModelPool 共享模型注册、路由、生命周期与 discovery 状态；旧命名 actor 只转发，不另存模型状态。
-- [x] EngineGroupSpec 驱动运行时引擎创建；稳定副本身份及 PD Router 服务投影接入公共快照。
-- [x] Rollout 专用运行时适配，保留 weights/KV 分阶段恢复、权重锁、恢复五元组和伸缩协议。
-- [x] 实际初始化、健康检查、权重版本及 Router 注册结果接入 preparation 发布屏障；发现 default/缺失/不一致版本时不开放准入。
-- [x] 三类引擎池统一恢复与关闭的 CPU 回归；覆盖迟到观测、卸载中刷新、目标版本保护、关闭终态、多节点 follower、部分初始化失败及兼容门面。
-- [ ] 真实 Ray/Router、多节点 GPU 集成验证：未提供 RAY_ADDRESS、模型与硬件配置，本轮未运行远程训练，不能据 CPU/mock 回归勾选。
+- [x] 实现公共模型注册、路由校验及 preparation 发布屏障，拒绝迟到的完成结果；`TaskInferenceManager` 同步暴露 operation 查询。
+- [x] GenRM/Teacher 以及注入 task handle 的 Rollout 兼容入口通过同一个 owner 串行执行 health/recover/onload/offload/shutdown；Rollout workload 的本地 runtime 仍作为 Phase 6 迁移对象。
+- [x] 控制面支持部分显存恢复不开放 discovery 准入且仍可清理；多节点 follower actor 的真实关闭验收改列为 Phase 7 硬件验证。
+- [x] 补齐迁移素材：Teacher/GenRM 专用 Router、Teacher Gateway、即时 OPD/MOPD Gateway 路由和 GenRM messages/response 适配，保留原始地址与旧协议路径；这些 role-specific 接线不能作为公共 Gateway/Manager 最终验收。
+- [x] 注入 task handle 的启动路径不再创建 `InferenceRoleManager`，直接由统一 CPU `TaskInferenceManager` 创建 role pool；旧命名 actor 仅保留无 task handle 的兼容路径，且 facade 不另存模型状态。
+- 已移交 Phase 6：EngineGroupSpec 驱动运行时引擎创建；稳定副本身份及 PD Router 服务投影接入公共快照。
+- 已移交 Phase 6：Rollout 专用运行时适配，保留 weights/KV 分阶段恢复、权重锁、恢复五元组和伸缩协议。
+- [x] 实际初始化、健康检查、权重版本及 Router 注册结果接入 preparation 发布屏障；发现 default/缺失/不一致版本时不开放准入。真实多节点 GPU 运行验收仍单独保留。
+- [x] 三类引擎池公共生命周期和兼容门面 CPU 回归已覆盖；本轮核心集合 `157 passed`，全仓 pre-commit 通过。真实多节点 follower/部分初始化及 Ray/GPU 仍需硬件验证。
+- 已移交 Phase 7：真实 Ray/Router、多节点 GPU 集成验证；未提供 RAY_ADDRESS、模型与硬件配置，本阶段不以 CPU/mock 回归替代。
+
+Phase 3 重排结论：本阶段以“统一控制面可接入并正确发布状态”为完成标准，不以“三角色已经共享同一套 GPU 引擎对象”为完成标准。Phase 3 完成后仍允许 Rollout 保留本地 runtime，但所有注入 task handle 的发现、准入、生命周期和关闭请求必须经过 task owner。
 
 本批验证：distributed/ray、engine/inference、backends/sglang、GenRM/Gateway 与即时 OPD 路由相关 CPU 回归 618 passed。训练侧权重同步、HTTP/排空及原参数兼容补充回归 73 passed、1 skipped：现有 test_sft_train_actor_eval.py 导入已不存在的 \_should_run_sft_eval，整模块跳过，不计为 SFT 验证通过。本次改动文件的 pre-commit（含 gitleaks）及 git diff --check 通过。使用获准的本地沙箱外执行解决 Ray/psutil 读取进程及 gitleaks 缓存权限问题；不涉及远程集群。
 
@@ -101,33 +123,35 @@ Review 调用顺序：
 
 - [x] 复用公共 ModelConfig/EngineGroupConfig，删除 Rollout 到第二套模型配置的转换；副本拓扑单独表达。注册定义、操作去重参数及返回值深拷贝隔离调用方的可变配置。
 - [x] 生命周期串行化集中到 InferenceManager，移除角色宿主重复锁；忙碌请求在兼容门面异步等待，不占满角色 RPC 线程。Rollout 本地调用保留同步等待；状态锁不跨远端 RPC，关闭/Router 清理锁仅用于清理路径。
-- [x] 三角色接入 UnifiedServiceManager 与通用 ModelPool；去掉 GenRMModelPool/TeacherModelPool 类。GenRMEngineAdapter/TeacherEngineAdapter 保留后端放置、端口、参数及旧地址接口，静态引擎状态和生命周期统一委托 MultiEngineManager；Rollout 后端保留伸缩与权重栅栏。
-- [x] 完成配置、共享池、并发控制及旧调用链 CPU 回归和本次文件 pre-commit 检查。结构收敛后联合回归 640 passed；训练侧补充回归 73 passed、1 skipped（仍为上述 SFT 旧符号导入问题）。本轮文件 pre-commit 全部通过，git diff --check 通过；未做吞吐/延迟性能基准，不将并发正确性测试表述为无性能损耗证明。
+- [ ] 三角色接入 UnifiedServiceManager 与通用 ModelPool；去掉 GenRMModelPool/TeacherModelPool 类。GenRMEngineAdapter/TeacherEngineAdapter 保留后端放置、端口、参数及旧地址接口，静态引擎状态和生命周期统一委托 MultiEngineManager；Rollout 后端保留伸缩与权重栅栏。
+- [ ] 完成统一控制面下的配置、共享池、并发控制及旧调用链 CPU 回归；当前 143 项相关回归仅证明迁移素材和兼容 role view，不能作为最终架构验收。
 
-当前调用顺序：
+当前调用顺序（Phase 3 控制面已实现；Phase 6/7 的运行时迁移和清理仍待完成）：
 
-1. GenRM/Teacher 启动：现有配置工厂 → create_role_managers → InferenceRoleManager → 创建 CPU ModelPool 并 register_model/bind_pool → configure_routes → pool.initialize → SGLangEngine.init → 健康/Router 观测 → commit_observation → Gateway 读取角色快照。
-2. 旧控制入口：命名 ModelManagerFacade → 统一宿主 call → InferenceManager.dispatch（唯一模型操作锁）→ ModelPool → 后端 → 公共生命周期方法 → 节点 actor RPC。同线程重入同一把锁，不再外层套第二把模型锁；snapshot 独立并发组。
-3. Rollout：ModelConfig.resolved → 注册与路由 → EngineGroup.start_engines → ModelPool.from_runtime → UnifiedServiceManager；生命周期经 call_wait 进入公共 dispatch，保留旧五元组及伸缩协议。权重同步后 refresh_inference_state 收集健康、版本和 Router 证据再发布。
-4. 关闭：先关闭模型准入 → 关闭所有节点 actor → 清理自有 PG；角色全部模型关闭后再停止该角色 Router，保留借用 PG。完整资源规划/回滚仍归 Phase 4，请求 permit 与排空协调仍归 Phase 5，RolloutWorkload 完整拆分归 Phase 6。
+1. Phase 3 启动与发布：Rollout/Teacher/GenRM 配置适配 → 统一 InferenceManager 注册 `(role, model_id)` → 已接入的 PlacementPlanner 申请资源 → role host/ModelPool 初始化 → 健康/Router 观测 → preparation barrier/commit_observation → 各 role Gateway 实例读取统一快照。
+2. Phase 3 旧控制入口：命名的 RolloutManager/TeacherManager/GenRMManager 兼容 facade → 统一 Manager handle → InferenceManager.dispatch（唯一模型操作锁）→ 当前 ModelPool 或外部 runtime adapter → 后端/节点 actor RPC。facade 不保存第二份状态；Phase 6 再移除本地 Rollout runtime。
+3. 请求路径：Caller → 对应 role 的公共 Gateway 实例 → role/model 路由与 Manager permit → 对应 Router/EnginePool；生成 payload 不必经 Manager 中转，但准入、请求登记、取消和排空状态必须回到统一控制面。
+4. 关闭：统一 Manager 关闭模型准入 → 等待/取消在途请求 → 关闭所有节点 actor → 释放统一 placement ledger 中的 allocation → 仅释放自有 PG。阶段协调归 Phase 5，RolloutWorkload 拆分归 Phase 6。
 
-验收：
+Phase 3 验收：
 
-- 三类引擎池的公共操作进入同一套实现。
+- 三类角色的引擎池和公共操作进入同一个 Manager 控制面。
 - 静态模型隔离、初始化失败、重启和权重未就绪不接流量均有测试。
 - 旧 manager 调用方通过兼容门面正常运行。
+- Rollout 本地 runtime 可以继续存在，但注入 task handle 的 discovery、准入、生命周期和关闭操作不能绕过 task owner。
 
-## Phase 4：统一 PlacementPlanner
+## Phase 4：统一 PlacementPlanner（依赖 Phase 2/3 控制面收口）
 
 目标：启动引擎前完成资源分配和合法性校验。
 
-- [ ] 将分散的 GPU/bundle 偏移计算迁入 Planner。
+- [ ] 将分散的 GPU/bundle 偏移计算迁入统一 Manager 持有的 Planner/ledger。
 - [ ] 支持独立 PG 的 decoupled 和共享 Actor PG 的 split。
 - [ ] 校验 GPU 容量、模型并行布局、节点边界、bundle 范围及 split 重叠。
+- [ ] 由统一 Manager 持久记录 PG allocation，申请、幂等重试和取消都经过同一个 Planner；不能使用分散 Ray Actor 的进程内 class state。
 - [ ] 表达 defer 的共享资源与互斥阶段，为 Phase 5 提供计划。
 - [ ] 首版拒绝同一批 GPU 同一阶段的 shared co-resident 布局。
 - [ ] 显式记录 PG 所有权：Manager、Controller 或外部服务。
-- [ ] managers 消费解析完成的 placement，不再各自推导偏移。
+- [ ] 所有 engine pool 消费解析完成的 placement，不再各自推导偏移。
 - [ ] 补齐启动失败、部分副本失败和关闭时的资源回滚。
 
 验收：
@@ -135,6 +159,24 @@ Review 调用顺序：
 - 非法布局在启动 GPU 引擎前失败。
 - 有效布局与现有部署方式兼容。
 - 测试证明共享/外部 PG 不会被错误删除，创建失败不会遗留自有资源。
+
+本批进度：
+
+- [x] 迁移子项：任务级 `TaskInferenceManager` 持有 `PlacementPlanner`，Rollout 初始布局、scale-out/scale-in 清理、GenRM 和 Teacher adapter 在注入 task handle 时通过统一 planner；无 handle 时保留兼容回退。本项是迁移接线，不是最终 placement 验收。
+
+- [ ] 最终 placement 验收：仍需删除所有 role-local planner 回退、补齐全量失败回滚/所有权验证，并完成长耗时 Scale-in 与真实 Ray/GPU 验证。
+
+- [ ] 将 `PlacementPlanner` 放入统一 Manager 控制面，统一解析 bundle/GPU slice、模型并行边界、节点边界、同阶段重叠和 PG owner。
+
+- [ ] Rollout、Teacher、GenRM 和 OPD 均通过统一 Manager 申请、复用、幂等重试和取消 placement；不允许各自维护独立 allocation ledger。
+
+- [ ] 静态 defer 计划允许不同阶段复用同一 slice，但 activate/drain/排空由 Phase 5 Coordinator 执行。
+
+- [ ] 动态副本失败时回滚 engine 与自有 PG；scale-in 不删除 Controller-owned 或 external PG，并同步释放统一 ledger 中的 allocation。
+
+- [ ] 当前 placement 实现及其 CPU 回归仅作为迁移素材，待统一控制面接入后重新验收。
+
+- [ ] 真实 Ray/多节点 GPU 验收待提供集群、模型和硬件配置后执行。
 
 ## Phase 5：生命周期协调与 Deferred Scoring
 
@@ -172,12 +214,15 @@ Review 调用顺序：
 - 覆盖乱序返回、部分失败、多教师路由、多模态和 top-k。
 - Teacher 结果写回前，训练不能消费该批数据。
 
-## Phase 6：完成 RolloutWorkload 拆分
+## Phase 6：完成 RolloutWorkload 与统一 EnginePool 迁移
 
-目标：Rollout 负责生成业务，统一 Manager 负责引擎。
+目标：在 Phase 3 控制面和 Phase 4 placement ledger 稳定后，Rollout 负责生成业务，统一 Manager 负责所有角色的引擎创建、资源和生命周期。
 
 - [ ] 将生成、评估、数据源、奖励后处理和队列传输归入 RolloutWorkload。
 - [ ] 引擎创建、资源所有权、恢复和关闭完全迁入统一 Manager。
+- [ ] 将 Phase 3 遗留的 EngineGroupSpec 运行时创建、稳定副本身份和 PD Router 投影接入统一 EnginePool。
+- [ ] 将 GenRM/Teacher 专用 SGLang 初始化合并到公共 SGLangEngine/EnginePool 路径。
+- [ ] 将 Rollout 的 weights/KV 分阶段恢复、权重锁、恢复五元组和伸缩协议适配为统一 Manager 操作。
 - [ ] workload 通过明确接口请求推理和阶段切换，不直接操作 GPU bundles 或私有引擎对象。
 - [ ] 迁移训练侧权重同步与 manager 连接点。
 - [ ] 检查 Agentic、Autoscaler、评估和 SFT predict 等兼容调用方。
@@ -190,10 +235,12 @@ Review 调用顺序：
 
 - [ ] 根据已确认的退役条件，删除旧 managers、GenRM 子类和临时兼容门面。
 - [ ] 删除命名 actor 特例、重复配置计算和废弃调用路径。
+- [ ] 删除无 task handle 的 `InferenceRoleManager` 和 role-local placement fallback；仅保留明确承诺的协议兼容层。
 - [ ] 保留承诺兼容的 HTTP 行为；对破坏性变化提供迁移说明。
 - [ ] 更新需求直接涉及的代码示例；中英文用户文档与 API 文档交由对应维护者处理，不纳入本次实现。
 - [ ] 对照 RFC acceptance checks 逐项提供代码、测试或验证证据。
 - [ ] 完成跨角色、跨模式、多模型、跨节点、PD、恢复及资源清理回归。
+- [ ] 在提供 RAY_ADDRESS、模型、节点拓扑和 GPU 配置后，完成真实 Ray/Router、多节点 follower actor、部分初始化与资源清理验收。
 - [ ] 提交前运行 pre-commit run --all-files 和相关测试。
 
 验收：
@@ -233,8 +280,8 @@ flowchart TB
     Caller[Training / Rollout / Reward / OPD]
 
     subgraph Control[Control plane - CPU]
-        Gateway[InferenceGateway<br/>role = rollout / genrm / teacher]
-        Manager[InferenceManager]
+        Gateway[InferenceGateway<br/>single CPU ingress]
+        Manager[InferenceManager<br/>single control-plane owner]
         Planner[PlacementPlanner]
         Coordinator[LifecycleCoordinator]
     end
@@ -256,16 +303,16 @@ flowchart TB
 
 图中 Model A/B 的推理进程在 GPU data plane；ModelPool 元数据在 CPU Manager 内。Gateway 按 Manager 准入结果代理到引擎/Router，生成 payload 不必再经 Manager 中转。当前内部请求统一经过 Router，直连路径留待后续单独定义。
 
-| 组件        | 职责                                                                  |
-| ----------- | --------------------------------------------------------------------- |
-| Gateway     | 每角色一个 CPU HTTP ingress；协议适配、代理、流式响应、申请请求准入   |
-| Manager     | 每角色一个 CPU 管理实例；引擎池、状态、准入登记、拓扑快照、恢复和关闭 |
-| Planner     | bundle/GPU 分配、节点边界、PG 所有权与冲突校验                        |
-| Coordinator | 每训练任务的阶段协调；按 activation group 管理资源使用权              |
-| Workload    | 生成、评估、奖励、OPD 字段组装与队列提交；不拥有引擎生命周期          |
+| 组件        | 职责                                                                                                                  |
+| ----------- | --------------------------------------------------------------------------------------------------------------------- |
+| Gateway     | 一个公共 CPU Gateway 类，每个 role 一个 HTTP ingress 实例；按 role/model 路由、协议适配、代理、流式响应、申请请求准入 |
+| Manager     | 一个 CPU 控制面实例；所有角色/模型的引擎池、状态、准入登记、拓扑快照、恢复和关闭                                      |
+| Planner     | bundle/GPU 分配、节点边界、PG 所有权与冲突校验                                                                        |
+| Coordinator | 每训练任务的阶段协调；按 activation group 管理资源使用权                                                              |
+| Workload    | 生成、评估、奖励、OPD 字段组装与队列提交；不拥有引擎生命周期                                                          |
 
 - Manager 是模型/副本状态唯一写入者；Gateway 不维护第二套可用状态。
-- 每角色只有一个 HTTP ingress；`/rollout` 的推理、评估、步骤控制、权重握手、伸缩路由分别委托，禁止重复注册相同前缀。
+- 全部角色共用一个 Gateway 实现；`/rollout`、Teacher、GenRM 可有各自 HTTP ingress 实例，但必须共享统一 Manager 状态和协议，禁止重复注册独立控制面或相同前缀。
 - Gateway 不绑定推理 GPU PG，引擎休眠/恢复期间仍提供查询。
 - Megatron 内部 actor/ref/teacher 权重 tag 切换继续属于训练后端；Coordinator 通过训练侧适配器协调显存和阶段。
 
@@ -348,7 +395,7 @@ v2 discovery 示例，地址与标识仅为示意：
 
 ### 6. 注册、模型池与路由配置
 
-模型身份为 `(role, model_id)`，不使用 checkpoint 路径或可变列表下标作为身份。每角色一个 Manager，内部 `models[model_id] -> ModelPool -> EngineGroup -> Replica -> node actors`。ModelPool 是 CPU 内存对象，首版不额外增加 Ray actor。PD worker 单独描述，完整服务路径由 Router 提供。
+模型身份为 `(role, model_id)`，不使用 checkpoint 路径或可变列表下标作为身份。每个训练任务/控制域只有一个逻辑 Manager 实例，内部维护 `models[(role, model_id)] -> ModelPool -> EngineGroup -> Replica -> node actors`。ModelPool 是 CPU 内存对象，首版不额外增加 Ray actor。PD worker 单独描述，完整服务路径由 Router 提供。
 
 ```text
 register_model(spec: ModelSpec, placement: ResolvedPlacement, *, operation_id) -> ModelRegistration
@@ -582,7 +629,7 @@ GenRM defer 示例在后处理内执行 Rollout offload → named GenRM onload �
 ### 14. 实施入口检查与评审节点
 
 - 当前必须定义的接口已列出：配置适配、注册/路由、Planner/materialize/rollback、生命周期、请求准入/完成/取消、模型切换、阶段占用、训练交接、Deferred 操作、发布与操作查询。
-- Phase 1 先实现无 Ray 副作用的公共类型和纯路由，再接三类 manager 快照适配及公共客户端；使用可验证的旧状态证据，不默认 READY。
+- Phase 1 先实现无 Ray 副作用的公共类型和纯路由；三类 manager 适配只作为临时 characterization，Phase 2 必须替换为同一 Manager/Gateway 状态源。
 - 后续能力待实现验证，不作为缺失设计接口：引擎 abort 完成证据、Router/PD 版本适配、多节点释放、OPD 数值等价、队列发布确认。
 - 首版明确排除：运行中新增/替换模型、GenRM/Teacher 新增弹性、跨批流水线、跨组联合事务、控制面透明恢复、公开 HTTP 生命周期控制。
 - 参数解析、Controller/Service/Launcher、新依赖、公开 API 删除/重命名仍为独立评审点，实施前提交具体差异并确认；Phase 0/首批纯类型与路由不触及这些受保护修改。
@@ -598,7 +645,31 @@ GenRM defer 示例在后处理内执行 Rollout offload → named GenRM onload �
 - 已确认的字段语义：`RoleSnapshot.phase` 仅表示角色 Manager 自身阶段；`manager_epoch` 表示一次 Manager/control-plane 生命周期；`direct_eligible` 与 `allow_defer` 是模型能力，不是请求准入；请求准入仍由 Manager/Gateway 负责。
 - 兼容查询补充：旧 `/engines` 查询支持 `status_filter=active|dead`；公共 legacy JSON 不再输出恒定的 `worker_type`，Manager 内部 PD worker 类型仍保留。
 - PD prefill/decode worker 仍由现有 Manager/EngineGroup 内部结构描述，未映射到公共 `ReplicaSnapshot`。
-- 已实现：三个 manager 的快照适配、状态/epoch 发布、公共 HTTP discovery 客户端和 GenRMClient 查询接入；纯路由 candidate 仍不作为准入许可。
-- Phase 2 当前边界：Rollout/GenRM 的公开 ingress 由 CPU Gateway 接管，原服务位于 `/{role}/backend`；SGLang Rollout discovery 明确发布模型级 `allow_defer=true`、`direct_eligible=false`，Rollout Gateway 推理路径只使用 Router，`direct_eligible` 不参与 Router 选择，Rollout backend 拒绝无 Gateway 标记的推理直连。GenRM 生成仍经旧 Service 适配并允许 backend fallback；Teacher 暂保留原始 engine URL，尚未具备可用的 defer Gateway。
-- 后续阶段必须补齐：Teacher Router 注册与 model-level readiness/准入、OPD defer 请求迁移、GenRM 公共 Manager 的协议适配，以及不混淆节点 actor、逻辑副本、权重版本和 Router 健康证据的拓扑快照。
+- 已实现：三个 manager 的临时快照适配、状态/epoch 发布、公共 HTTP discovery 客户端和 GenRMClient 查询接入；这些适配不能作为最终统一控制面验收。
+- Phase 2 纠偏边界：当前代码实际为每个 role 部署 Gateway/backend，且 `create_role_managers` 为 role 创建独立控制面；Gateway 的“每 role 一个实例”本身符合目标，但实现必须收敛为一个公共 Gateway 类和一个任务级 Manager 实例。旧入口只能转发到该统一状态源，不能继续作为三个独立 Manager 的兼容实现。
+- 后续阶段必须补齐：公共 Gateway 类的跨 role/model 路由、统一 Manager 的 EnginePool、统一 placement ledger、Teacher/GenRM/OPD 的 Gateway 请求路径、统一请求 permit/排空以及不混淆节点 actor、逻辑副本、权重版本和 Router 健康证据的拓扑快照。
 - 本次检查结果：最新受影响回归测试 `71 passed`，覆盖 Gateway、Rollout 直连拒绝、discovery、Router 注册、TeacherManager 和 OPD 编排；受影响文件 pre-commit 已通过；本期未启动 Ray/GPU 服务。
+- 2026-09-20 架构复核：发现当前实现仍是 role 分散 Gateway/Manager + 旧 role 类兼容统一 Manager，不能作为 Issue #71 最终架构；Phase 2/3/4 重新排期，先统一控制面，再重做 placement 与生命周期接线。
+- 2026-09-20 继续纠偏：`InferenceManager` 已增加任务级共享 epoch、按 role 访问内部状态及 `RequestPermit` 的 admit/complete/cancel 基础契约；`InferenceGateway` 已移除多 manager snapshot 聚合和伪造 epoch，统一从单一 Manager handle 或显式 snapshot provider 查询。相关 CPU 回归 29 passed。
+- 2026-09-20 Phase 2/3 继续实现：Gateway 已将 permit 覆盖到 payload 适配、普通响应和流式 EOF/取消路径；Manager 增加 operation snapshot、permit 身份校验和注册能力不可变校验；GenRM managed generate 强制 Router-only，Router 缺失返回 503；ModelPool 删除通用 `__getattr__`，改为显式后端适配方法。相关 CPU 回归 40 passed，ModelPool/role 回归 55 passed。
+- 2026-09-21 启动链继续纠偏：新增任务级 CPU `TaskInferenceManager` owner；`Controller` 创建单一 handle，`Service` 注册 Rollout/GenRM backend，OPD Teacher/MOPD 注册 Teacher host，三个 Gateway 统一从 owner 查询 snapshot。相关 OPD/InferenceRole 回归 57 passed，Service/Gateway 回归 25 passed。
+- 2026-09-21 permit/兼容入口继续迁移：owner 统一规范 role snapshot 的 epoch，并实现 request permit 生命周期；Teacher/GenRM 兼容 facade 在注入 owner 时通过统一 `ready/snapshot/call` 转发。相关 InferenceRole/Gateway/Manager 回归 95 passed。
+- 2026-09-21 Rollout 兼容入口继续迁移：`RolloutManager` 增加受限 `ready/call` 适配，统一 owner 可转发的模型级生命周期方法；仍保留原有训练侧直接调用作为迁移期兼容路径。
+- 2026-09-21 placement 接线继续迁移：任务级 `TaskInferenceManager` 增加 planner/取消/查询入口；Rollout 初始布局、scale-out、scale-in 清理，以及 GenRM/Teacher adapter 在注入 task handle 时统一经该 planner。无 task handle 时保留旧 planner 兼容路径。关键 placement/scale-out 回归 98 passed + 9 passed。
+- 2026-09-21 验证补充：核心 placement/role 回归 `98 passed`，Scale-out registration-order 回归 `9 passed`，`py_compile` 和全仓 `pre-commit` 通过；包含完整 Scale-in 的组合批次在本地环境长时间无输出后中止，未计入通过证据。
+- 阶段重排后仍未完成：无 task handle 的兼容路径仍保留 `InferenceRoleManager`，归 Phase 7 清理；Rollout runtime 仍由 `RolloutManager` 持有本地 EnginePool/runtime manager，归 Phase 6 迁移；role-local placement fallback 和全量 ledger 回滚，归 Phase 4 最终验收。这些不再阻止 Phase 3 控制面收口，但会阻止最终架构验收。
+- 本轮明确删除/不再作为验收证据：按 model 聚合 discovery 的 Gateway 测试、独立 placement 试验测试及把多个 role manager 拼成统一 epoch 的实现路径。
+- 2026-09-21 本轮继续：`TaskInferenceManager` 增加统一 lifecycle 转发、`shutdown_all` 和跨 role operation 查询；Controller 关闭时先关闭任务 owner，再进行 Serve/Router 清理。核心 InferenceRole/ModelPool/Gateway/Service 回归 `157 passed`，全仓 `pre-commit run --all-files` 通过。
+- 2026-09-21 继续收口 Rollout：Rollout backend 初始化阶段先向 task owner 登记公共 ModelConfig/路由，随后由 Service 绑定 backend host；owner 校验外部 host snapshot 的模型集合与注册集合一致。Rollout/InferenceRole/ModelPool/Gateway 回归 `169 passed`，全仓 `pre-commit run --all-files` 通过。
+- 2026-09-21 继续补齐能力边界：统一 `InferenceManager` 拒绝 CHECKPOINT/EXTERNAL 模型申请 policy weight version 或发布动态权重同步证据；Teacher 保持 `skip_dcs_registration=True`，GenRM 使用独立 Router/静态权重路径。相关 Manager/InferenceRole/MultiEngine 回归 `109 passed`，全仓 `pre-commit run --all-files` 通过。
+- 2026-09-21 Phase 3 继续：任务级 owner 支持外部 GPU role 的注册前规格/路由登记、host snapshot 模型集合校验、owner route 覆盖及 lifecycle operation 的 running/completed/failed 记录；Rollout 初始化已接入该登记路径。相关 InferenceRole/Manager/Rollout 回归 `112 passed`，全仓 `pre-commit run --all-files` 通过。
+- 2026-09-21 Phase 3 publication barrier：已注册的外部 GPU role 观测会在 task owner 内执行模型集合校验、初始化/健康/Router/权重 evidence 检查，并通过 preparation token 后再发布 READY；非 READY 观测撤销准入，未登记的旧 discovery host 保留只读兼容。相关 InferenceRole/Manager 回归 `87 passed`，EnginePool fake constructor 隔离回归 `8 passed`，全仓 `pre-commit run --all-files` 通过。
+- 2026-09-21 Phase 3 观测闭环：外部 role 的 lifecycle operation 成功后立即刷新并重新提交 owner snapshot；失败保留 failed operation 且不开放准入。READY checkpoint 模型不提交动态 weight evidence，policy 模型仍要求目标权重版本。publication barrier 回归 `88 passed`，定向 pre-commit、`py_compile` 和 `git diff --check` 通过。
+- 2026-09-21 Phase 3 继续收口：统一关闭链路恢复管理器级 `_close_pool` 兼容钩子，外部 Rollout runtime 的 `fanout` 保留 `skip_ranks`，未完成 backend binding 的占位 host 关闭保持幂等；InferenceRole/Manager/Rollout 回归 `121 passed`。剩余未勾选项仍是 Rollout runtime 完整迁入统一 EnginePool、EngineGroupSpec 驱动真实 actor 创建、无 task handle 兼容路径清理及真实多节点 Ray/GPU 验收，不能由本地 CPU 回归替代。
+- 2026-09-21 路线重排：Phase 3 收敛为统一控制面、preparation barrier 和 owner 生命周期契约；EngineGroupSpec 真实 actor 创建、GenRM/Teacher/Rollout EnginePool 运行时迁移归 Phase 6，最终 placement ledger 与 role-local fallback 清理归 Phase 4，兼容路径删除与真实 Ray/GPU/follower actor 验收归 Phase 7。Phase 3 当前允许 Rollout 暂时保留本地 runtime，但所有注入 task handle 的状态、准入和 lifecycle 操作必须经过 owner。
+- Review 文件与调用链：
+  - `relax/core/controller.py`：`register_all_serve -> create_task_inference_manager -> Service/OPD 注入 -> shutdown_all`。
+  - `relax/core/service.py`：`Service._deploy -> backend bind/deploy -> register_role -> InferenceGatewayDeployment.bind`。
+  - `relax/distributed/ray/inference_role.py`：`create_role_managers -> TaskInferenceManager.create_role -> ModelPool -> EngineAdapter -> InferenceManager`；legacy facade 的 `ready/snapshot/lifecycle/call` 均经 owner。
+  - `relax/components/inference_gateway.py`：`Gateway request -> owner.snapshot -> resolve_model/select_target -> owner.admit_request -> upstream -> complete/cancel`。
+  - `relax/distributed/ray/rollout.py`：`RolloutManager -> start_rollout_servers/scale-out/scale-in -> task owner PlacementPlanner`；其 workload/runtime 生命周期已明确迁移到 Phase 6，role-local fallback 的最终删除归 Phase 4/7。

@@ -11,6 +11,12 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 import torch.distributed as dist
 
+from relax.engine.inference.placement import (
+    PlacementGroupView,
+    PlacementOwner,
+    PlacementPlanner,
+    PlacementRequest,
+)
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_opsd_worker
 
@@ -140,7 +146,7 @@ def build_teacher_overrides(args: Any, colocate_sync: bool = False) -> dict[str,
         for key, value in vars(args).items()
         if key.startswith(TEACHER_SGLANG_PREFIX)
     }
-    overrides["model_path"] = args.teacher_hf_checkpoint
+    overrides["model_path"] = getattr(args, "teacher_hf_checkpoint", None)
     overrides.setdefault("load_format", "auto")
     overrides.setdefault("enable_memory_saver", colocate_sync)
     return overrides
@@ -161,11 +167,15 @@ def create_managed_opd_teacher_manager(
     pg: Any = None,
     shared_pg: bool = False,
     runtime_env: dict | None = None,
+    inference_manager_handle: Any | None = None,
 ) -> tuple[Any, list[str]]:
     import ray
 
     from relax.distributed.ray.inference_role import create_role_managers
 
+    role_kwargs = {"runtime_env": runtime_env}
+    if inference_manager_handle is not None:
+        role_kwargs["task_manager_handle"] = inference_manager_handle
     teacher_manager = create_role_managers(
         args,
         "teacher",
@@ -180,8 +190,10 @@ def create_managed_opd_teacher_manager(
                 },
             }
         },
-        runtime_env=runtime_env,
+        **role_kwargs,
     )["default"]
+    if inference_manager_handle is not None:
+        ray.get(inference_manager_handle.register_role.remote("teacher", teacher_manager))
 
     urls = ray.get(teacher_manager.get_urls.remote())
     logger.info(f"[OPD teacher] TeacherManager initialized successfully: urls={urls}")
@@ -193,25 +205,37 @@ def create_managed_opd_teacher_manager(
     return teacher_manager, urls
 
 
-def _deploy_teacher_gateway(managers: dict[str, Any]) -> str:
+def _deploy_teacher_gateway(managers: dict[str, Any], inference_manager_handle: Any | None = None) -> str:
     from ray import serve
 
     from relax.components.inference_gateway import InferenceGatewayDeployment
     from relax.utils.utils import get_serve_url
 
-    gateway = InferenceGatewayDeployment.bind("teacher", role_manager_handle=next(iter(managers.values())))
+    gateway_kwargs = (
+        {"manager_handle": inference_manager_handle}
+        if inference_manager_handle is not None
+        else {"role_manager_handle": next(iter(managers.values()))}
+    )
+    gateway = InferenceGatewayDeployment.bind("teacher", **gateway_kwargs)
     serve.run(gateway, name="teacher_gateway", route_prefix="/teacher")
     return get_serve_url("/teacher")
 
 
-def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = None) -> tuple[Any, Any]:
+def maybe_start_managed_opd_teacher(
+    args: Any,
+    *,
+    runtime_env: dict | None = None,
+    inference_manager_handle: Any | None = None,
+) -> tuple[Any, Any]:
     if not is_managed_opd_teacher_enabled(args) or getattr(args, "debug_train_only", False):
         return None, None
 
     # ── Multi-teacher (MOPD) path: --opd-teacher-routes ────────────────────
     routes_json = getattr(args, "opd_teacher_routes", None)
     if routes_json is not None:
-        return _start_managed_multi_teacher(args, routes_json, runtime_env=runtime_env)
+        return _start_managed_multi_teacher(
+            args, routes_json, runtime_env=runtime_env, inference_manager_handle=inference_manager_handle
+        )
 
     # ── Single-teacher path: --teacher-hf-checkpoint ───────────────────────
     shared_pg = None
@@ -245,17 +269,24 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
         f"gpus_per_replica={gpus_per_replica}, teacher_total_gpus={teacher_total_gpus}, "
         f"shared_pg={shared_pg_enabled}"
     )
-    teacher_manager, urls = create_managed_opd_teacher_manager(
-        args,
-        num_replicas=num_replicas,
-        gpus_per_replica=gpus_per_replica,
-        pg=shared_pg,
-        shared_pg=shared_pg_enabled,
-        runtime_env=runtime_env,
-    )
+    teacher_kwargs = {
+        "num_replicas": num_replicas,
+        "gpus_per_replica": gpus_per_replica,
+        "pg": shared_pg,
+        "shared_pg": shared_pg_enabled,
+        "runtime_env": runtime_env,
+    }
+    if inference_manager_handle is not None:
+        teacher_kwargs["inference_manager_handle"] = inference_manager_handle
+    teacher_manager, urls = create_managed_opd_teacher_manager(args, **teacher_kwargs)
     args.opd_teacher_engine_urls = list(urls)
     try:
-        args.opd_teacher_gateway_url = _deploy_teacher_gateway({"teacher": teacher_manager})
+        if inference_manager_handle is None:
+            args.opd_teacher_gateway_url = _deploy_teacher_gateway({"teacher": teacher_manager})
+        else:
+            args.opd_teacher_gateway_url = _deploy_teacher_gateway(
+                {"teacher": teacher_manager}, inference_manager_handle=inference_manager_handle
+            )
     except Exception:
         shutdown_managed_opd_teacher(teacher_manager)
         raise
@@ -273,6 +304,7 @@ def _start_managed_multi_teacher(
     routes_json: str,
     *,
     runtime_env: dict | None = None,
+    inference_manager_handle: Any | None = None,
 ) -> tuple[Any, list]:
     """Launch multiple managed teachers for MOPD and inject routes into args.
 
@@ -354,6 +386,7 @@ def _start_managed_multi_teacher(
     )
 
     pool_configs = {}
+    placement_requests = []
     for index, (data_source, checkpoint) in enumerate(routes_map.items()):
         teacher_args = copy.copy(args)
         teacher_args.teacher_hf_checkpoint = checkpoint
@@ -367,7 +400,27 @@ def _start_managed_multi_teacher(
                 "bundle_offset": index * gpus_per_teacher,
             },
         }
-    managers = create_role_managers(args, "teacher", pool_configs, runtime_env=runtime_env)
+        placement_requests.append(
+            PlacementRequest(
+                group_id=f"teacher/{data_source}",
+                worker_type="regular",
+                num_gpus=gpus_per_teacher,
+                num_gpus_per_engine=gpus_per_replica,
+                num_gpus_per_node=getattr(args, "num_gpus_per_node", gpus_per_replica),
+                phase="teacher",
+                bundle_offset=rollout_gpus + index * gpus_per_teacher,
+            )
+        )
+    PlacementPlanner().plan(
+        tuple(placement_requests),
+        PlacementGroupView(tuple(shared_pg[1]), tuple(shared_pg[2]), PlacementOwner.CONTROLLER, identity=shared_pg[0]),
+    )
+    role_kwargs = {"runtime_env": runtime_env}
+    if inference_manager_handle is not None:
+        role_kwargs["task_manager_handle"] = inference_manager_handle
+    managers = create_role_managers(args, "teacher", pool_configs, **role_kwargs)
+    if inference_manager_handle is not None:
+        ray.get(inference_manager_handle.register_role.remote("teacher", next(iter(managers.values()))))
     if getattr(args, "offload_rollout", False):
         ray.get([manager.offload.remote() for manager in managers.values()])
 
@@ -385,7 +438,12 @@ def _start_managed_multi_teacher(
     # Inject the routes map so per-sample routing works via _pick_teacher_url.
     args.opd_teacher_routes_map = url_routes
     try:
-        args.opd_teacher_gateway_url = _deploy_teacher_gateway(managers)
+        if inference_manager_handle is None:
+            args.opd_teacher_gateway_url = _deploy_teacher_gateway(managers)
+        else:
+            args.opd_teacher_gateway_url = _deploy_teacher_gateway(
+                managers, inference_manager_handle=inference_manager_handle
+            )
     except Exception:
         shutdown_managed_opd_teacher(list(managers.values()))
         raise

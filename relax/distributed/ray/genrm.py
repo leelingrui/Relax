@@ -9,6 +9,7 @@ onload/offload) with GenRM-specific placement and engine wiring.
 
 import copy
 import logging
+from typing import Any
 
 import ray
 
@@ -19,6 +20,7 @@ from relax.distributed.ray.multi_engine_manager import MultiEngineManager, _is_e
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.engine.inference.capabilities import WeightSource
 from relax.engine.inference.manager import InferenceManager
+from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementPlanner, PlacementRequest
 from relax.engine.inference.types import Role
 from relax.utils.http_utils import init_http_client
 from relax.utils.logging_utils import get_logger
@@ -50,6 +52,7 @@ class GenRMEngineAdapter:
         inference_manager: InferenceManager | None = None,
         model_id: str = "default",
         defer_init: bool = False,
+        placement_manager_handle: Any | None = None,
     ):
         args = copy.copy(args)
         args.use_slime_router = False
@@ -59,10 +62,16 @@ class GenRMEngineAdapter:
         num_gpu_per_engine = min(args.genrm_num_gpus_per_engine, args.num_gpus_per_node)
         num_slots = 0 if args.debug_train_only else args.genrm_num_gpus // num_gpu_per_engine
         nodes_per_engine = max(1, args.genrm_num_gpus_per_engine // args.num_gpus_per_node)
+        self.nodes_per_engine = nodes_per_engine
 
         self.pg = pg
+        self.num_replicas = num_slots // nodes_per_engine
         self.num_gpu_per_engine = num_gpu_per_engine
         self.bundle_offset = bundle_offset
+        self.placement_owner = PlacementOwner.CONTROLLER
+        self._placement_planner = PlacementPlanner()
+        self._placement_manager_handle = placement_manager_handle
+        self._placement_slices = {}
         self.port_window_index = port_window_index
         self.inference_model_path = args.genrm_model_path
         self.inference_num_gpus_per_engine = args.genrm_num_gpus_per_engine
@@ -162,6 +171,33 @@ class GenRMEngineAdapter:
             gpu_idx += self.args.rollout_num_gpus
 
         return self.pg, False, gpu_idx
+
+    def _resolve_planned_placement(self, rank):
+        replica, node_rank = divmod(rank, self.nodes_per_engine)
+        shared_with_rollout = getattr(self.args, "_genrm_colocate_with_rollout", False)
+        pg_view = PlacementGroupView(tuple(self.pg[1]), tuple(self.pg[2]), self.placement_owner, identity=self.pg[0])
+        rollout_offset = 0 if self.args.fully_async or shared_with_rollout else self.args.rollout_num_gpus
+        requests = tuple(
+            PlacementRequest(
+                group_id=f"genrm-{index}",
+                worker_type="regular",
+                num_gpus=self.args.genrm_num_gpus_per_engine,
+                num_gpus_per_engine=self.num_gpu_per_engine,
+                num_gpus_per_node=self.args.num_gpus_per_node,
+                phase="genrm",
+                bundle_offset=rollout_offset + self.bundle_offset + index * self.args.genrm_num_gpus_per_engine,
+            )
+            for index in range(self.args.genrm_num_gpus // self.args.genrm_num_gpus_per_engine)
+        )
+        placement_manager_handle = getattr(self, "_placement_manager_handle", None)
+        if placement_manager_handle is None:
+            planned = self._placement_planner.plan(requests, pg_view)[replica]
+        elif isinstance(placement_manager_handle, PlacementPlanner):
+            planned = placement_manager_handle.plan(requests, pg_view)[replica]
+        else:
+            planned = ray.get(placement_manager_handle.plan_placement.remote(requests, pg_view))[replica]
+        bundle_index = tuple(self.pg[1]).index(planned.bundle_indices[node_rank])
+        return self.pg, False, bundle_index, planned
 
     def _ray_resource_kwargs(self, rank):
         # Lower default fractional-GPU footprint when sharing bundles with

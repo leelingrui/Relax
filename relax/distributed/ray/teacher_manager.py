@@ -12,6 +12,7 @@ from relax.distributed.ray.multi_engine_manager import MultiEngineManager
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from relax.engine.inference.capabilities import WeightSource
+from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementPlanner, PlacementRequest
 from relax.engine.inference.types import Role
 from relax.utils.env import Envs
 from relax.utils.http_utils import find_available_port
@@ -78,6 +79,7 @@ class TeacherEngineAdapter:
         inference_manager=None,
         model_id: str = "default",
         defer_init: bool = False,
+        placement_manager_handle=None,
     ) -> None:
         self.args = args
         assert num_replicas >= 1, f"num_replicas must be >= 1, got {num_replicas}."
@@ -85,6 +87,7 @@ class TeacherEngineAdapter:
         if gpus_per_replica > args.num_gpus_per_node and gpus_per_replica % args.num_gpus_per_node:
             raise ValueError("Multi-node teacher replicas must occupy complete nodes")
         nodes_per_engine = max(1, gpus_per_replica // args.num_gpus_per_node)
+        self.nodes_per_engine = nodes_per_engine
         if shared_pg:
             assert pg is not None, "shared_pg=True requires the full actor/rollout placement group."
             _pg, bundle_indices, gpu_ids = pg
@@ -96,9 +99,13 @@ class TeacherEngineAdapter:
             )
 
         self.gpus_per_replica = gpus_per_replica
+        self.num_replicas = num_replicas
         self._shared_pg = shared_pg
         self._shared_pg_tuple = pg
         self._bundle_offset = bundle_offset
+        self._placement_planner = PlacementPlanner()
+        self._placement_manager_handle = placement_manager_handle
+        self._placement_slices = {}
 
         overrides = build_teacher_overrides(args, colocate_sync=shared_pg)
         self._overrides = overrides
@@ -221,6 +228,53 @@ class TeacherEngineAdapter:
             shared_pg=False,
         )
         return pg_tuple, True, gpu_index + node_offset
+
+    def _resolve_planned_placement(self, rank: int):
+        nodes_per_engine = getattr(self, "nodes_per_engine", 1)
+        replica, node_rank = divmod(rank, nodes_per_engine)
+        if self._shared_pg:
+            pg_tuple = self._shared_pg_tuple
+            owner = PlacementOwner.CONTROLLER
+            requests = tuple(
+                PlacementRequest(
+                    group_id=f"teacher-{index}",
+                    worker_type="regular",
+                    num_gpus=self.gpus_per_replica,
+                    num_gpus_per_engine=min(self.gpus_per_replica, self.args.num_gpus_per_node),
+                    num_gpus_per_node=self.args.num_gpus_per_node,
+                    phase="teacher",
+                    bundle_offset=int(self.args.rollout_num_gpus)
+                    + self._bundle_offset
+                    + index * self.gpus_per_replica,
+                )
+                for index in range(self.num_replicas)
+            )
+        else:
+            pg_tuple, _, _ = self._resolve_placement(rank)
+            owner = PlacementOwner.MANAGER
+            requests = (
+                PlacementRequest(
+                    group_id=f"teacher-{replica}",
+                    worker_type="regular",
+                    num_gpus=self.gpus_per_replica,
+                    num_gpus_per_engine=min(self.gpus_per_replica, self.args.num_gpus_per_node),
+                    num_gpus_per_node=self.args.num_gpus_per_node,
+                    phase="teacher",
+                    bundle_offset=0,
+                ),
+            )
+        pg_view = PlacementGroupView(tuple(pg_tuple[1]), tuple(pg_tuple[2]), owner, identity=pg_tuple[0])
+        placement_manager_handle = getattr(self, "_placement_manager_handle", None)
+        if placement_manager_handle is None:
+            planned = self._placement_planner.plan(requests, pg_view)[replica if self._shared_pg else 0]
+        elif isinstance(placement_manager_handle, PlacementPlanner):
+            planned = placement_manager_handle.plan(requests, pg_view)[replica if self._shared_pg else 0]
+        else:
+            planned = ray.get(placement_manager_handle.plan_placement.remote(requests, pg_view))[
+                replica if self._shared_pg else 0
+            ]
+        bundle = planned.bundle_indices[node_rank]
+        return pg_tuple, self._shared_pg is False, tuple(pg_tuple[1]).index(bundle), planned
 
     def _ray_resource_kwargs(self, rank: int) -> dict:
         return {"num_cpus": 0.2, "num_gpus": 0.2}

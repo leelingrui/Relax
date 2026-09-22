@@ -12,6 +12,7 @@ import pytest
 try:
     from relax.distributed.ray.rollout import (
         EngineGroupLifecycle,
+        PlacementOwner,
         ScaleInRequest,
         ScaleInStatus,
         ScaleOutRequest,
@@ -814,6 +815,18 @@ class TestCleanupEngineGroups:
         with patch("ray.util.remove_placement_group") as mock_remove:
             manager._cleanup_engine_groups(srv)
             mock_remove.assert_called_once_with(mock_pg)
+
+    def test_does_not_remove_controller_owned_placement_group(self):
+        mock_pg = MagicMock()
+        g_empty = make_engine_group(engines=[None], is_scaled_out=False)
+        g_empty.pg = (mock_pg, [], [])
+        g_empty.pg_owner = PlacementOwner.CONTROLLER
+        srv = make_rollout_server(engine_groups=[g_empty])
+        manager = create_test_manager(servers={"default": srv})
+
+        with patch("ray.util.remove_placement_group") as mock_remove:
+            manager._cleanup_engine_groups(srv)
+            mock_remove.assert_not_called()
 
 
 # ===================== Scale-in status queries =============================

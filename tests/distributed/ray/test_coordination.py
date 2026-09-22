@@ -714,13 +714,25 @@ class TestLegacyDiscoveryContract:
         assert manager.get_engines_info("missing") == {"models": {}, "total_engines": 0}
 
     def test_rollout_discovery_topology_revision_increments_on_slot_change(self, patch_ray_get):
-        group = make_engine_group(engines=[make_mock_engine(), None])
+        # The revision tracks the addressable endpoint set, so the recovered
+        # slot has to report an observation -- a bare handle publishes no
+        # address and is not a topology change.
+        def _observed_engine(url):
+            engine = make_mock_engine(url=url)
+            engine.get_inference_observation.remote.return_value = {
+                "healthy": True,
+                "router_registered": True,
+                "weight_version": "policy-v1",
+                "base_url": url,
+            }
+            return engine
+
+        group = make_engine_group(engines=[_observed_engine("http://node-a:30000"), None])
         manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
-        manager.manager_epoch = "epoch-test"
 
         manager.refresh_inference_state()
         initial = manager.get_discovery_snapshot()
-        group.all_engines[1] = make_mock_engine()
+        group.all_engines[1] = _observed_engine("http://node-b:30000")
         assert manager.get_discovery_snapshot() == initial
         manager.refresh_inference_state()
         updated = manager.get_discovery_snapshot()

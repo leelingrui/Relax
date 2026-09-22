@@ -25,6 +25,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.engine.inference.capabilities import WeightSource
 from relax.engine.inference.manager import InferenceManager, PreparationEvidence
+from relax.engine.inference.placement import PlacementPlanner, PlacementSlice
 from relax.engine.inference.specs import model_spec_from_pool, replicas_from_slots
 from relax.engine.inference.types import (
     LifecycleState,
@@ -140,6 +141,7 @@ class MultiEngineManager:
         # Per-slot (pg_tuple, owns_pg) so shutdown()/_retire_engines() only
         # remove placement groups this manager itself created.
         self._engine_placements: dict[int, tuple] = {}
+        self._placement_slices: dict[int, PlacementSlice] = {}
         self._engine_addr_and_ports: dict[int, dict] = {}
         # Track memory-occupation state so repeated onload/offload calls become
         # safe no-ops. Engines start onloaded; callers may immediately offload.
@@ -266,6 +268,17 @@ class MultiEngineManager:
         """
         raise NotImplementedError
 
+    def _resolve_planned_placement(self, rank: int) -> tuple[tuple, bool, int, PlacementSlice | None]:
+        """Return the legacy placement tuple plus its static planner result.
+
+        The tuple remains the compatibility contract used by existing manager
+        implementations.  Adapters that participate in Phase 4 override this
+        hook and provide a ``PlacementSlice``; PG lifecycle remains owned by
+        the legacy ``owns_pg`` value until Phase 5.
+        """
+        pg_tuple, owns_pg, gpu_index = self.adapter._resolve_placement(rank)
+        return pg_tuple, owns_pg, gpu_index, None
+
     def _ray_resource_kwargs(self, rank: int) -> dict:
         """Return the num_cpus/num_gpus fractional Ray resource request for one
         slot."""
@@ -341,8 +354,10 @@ class MultiEngineManager:
             if self.all_engines[rank] is not None:
                 continue
 
-            pg_tuple, owns_pg, gpu_index = self.adapter._resolve_placement(rank)
+            pg_tuple, owns_pg, gpu_index, placement_slice = self.adapter._resolve_planned_placement(rank)
             self._engine_placements[rank] = (pg_tuple, owns_pg)
+            if placement_slice is not None:
+                self._placement_slices[rank] = placement_slice
             pg, reordered_bundle_indices, reordered_gpu_ids = pg_tuple
             base_gpu_id = int(reordered_gpu_ids[gpu_index])
             scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -383,6 +398,7 @@ class MultiEngineManager:
 
     def _remove_owned_pg(self, rank: int) -> None:
         placement = self._engine_placements.pop(rank, None)
+        placement_slice = self._placement_slices.pop(rank, None)
         if placement is None:
             return
         pg_tuple, owns_pg = placement
@@ -390,6 +406,8 @@ class MultiEngineManager:
             return
         if any(other[0][0] == pg_tuple[0] for other in self._engine_placements.values()):
             return
+        if placement_slice is not None:
+            PlacementPlanner.cancel(placement_slice)
         try:
             from ray.util.placement_group import remove_placement_group
 

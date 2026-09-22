@@ -57,6 +57,9 @@ class _ManagerStub:
     def __init__(self, set_weight_updating_fn=None, health_monitoring_pause_fn=None):
         self.health_monitoring_pause = _RemoteStub(health_monitoring_pause_fn or (lambda *a, **k: _ok()))
         self.set_weight_updating = _RemoteStub(set_weight_updating_fn or (lambda *a, **k: _prepared()))
+        # ``end_update_weight`` re-observes health / Router / weight versions
+        # after releasing the lease, because the lease alone is not evidence.
+        self.refresh_inference_state = _RemoteStub(lambda *a, **k: _ok())
 
 
 def _make_rollout(*, can_update: bool, manager: _ManagerStub) -> "Rollout":

@@ -10,6 +10,7 @@ from relax.engine.inference.discovery import (
     snapshot_from_engine_urls,
     snapshot_from_legacy_engines,
 )
+from relax.engine.inference.manager import OperationSnapshot, RequestPermit
 from relax.engine.inference.routing import resolve_model, select_target
 from relax.engine.inference.types import Role, RoleSnapshot
 
@@ -23,6 +24,8 @@ __all__ = [
     "snapshot_from_legacy_engines",
     "Role",
     "RoleSnapshot",
+    "RequestPermit",
+    "OperationSnapshot",
     "resolve_model",
     "select_target",
 ]
