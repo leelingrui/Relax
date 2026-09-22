@@ -22,7 +22,14 @@ from relax.engine.inference.manager import (
     PreparationEvidence,
     RequestPermit,
 )
-from relax.engine.inference.placement import PlacementGroupView, PlacementPlanner, PlacementRequest, PlacementSlice
+from relax.engine.inference.placement import (
+    PhaseContention,
+    PlacementGroupView,
+    PlacementPlanner,
+    PlacementRelease,
+    PlacementRequest,
+    PlacementSlice,
+)
 from relax.engine.inference.types import LifecycleState, Role, RoleSnapshot, RoutingSpec
 from relax.utils.logging_utils import get_logger
 
@@ -324,15 +331,28 @@ class TaskInferenceManager:
         return self._permits.get(request_id)
 
     def plan_placement(
-        self, requests: Sequence[PlacementRequest], placement_group: PlacementGroupView
+        self,
+        requests: Sequence[PlacementRequest],
+        placement_group: PlacementGroupView,
+        *,
+        dry_run: bool = False,
     ) -> tuple[PlacementSlice, ...]:
-        return self._placement_planner.plan(requests, placement_group)
+        """Resolve a layout against the one ledger this task owns."""
+        return self._placement_planner.plan(requests, placement_group, dry_run=dry_run)
 
-    def cancel_placement(self, placement: PlacementSlice | PlacementGroupView, group_id: str | None = None) -> None:
-        self._placement_planner.cancel(placement, group_id=group_id)
+    def release_placement(
+        self, placement: PlacementSlice | PlacementGroupView, group_id: str | None = None
+    ) -> PlacementRelease:
+        """Release ledger entries and report whether the group may be
+        removed."""
+        return self._placement_planner.release(placement, group_id=group_id)
 
-    def allocations(self, placement_group: PlacementGroupView) -> tuple[PlacementSlice, ...]:
+    def allocations(self, placement_group: PlacementGroupView | None = None) -> tuple[PlacementSlice, ...]:
         return self._placement_planner.allocations(placement_group)
+
+    def contended_phases(self, placement_group: PlacementGroupView | None = None) -> tuple[PhaseContention, ...]:
+        """Report the phase exclusions a lifecycle coordinator must honor."""
+        return self._placement_planner.contended_phases(placement_group)
 
     def ready(self, *, role: Role | str) -> bool:
         role = Role(role)

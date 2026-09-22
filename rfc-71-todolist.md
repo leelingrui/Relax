@@ -144,15 +144,15 @@ Phase 3 验收：
 
 目标：启动引擎前完成资源分配和合法性校验。
 
-- [ ] 将分散的 GPU/bundle 偏移计算迁入统一 Manager 持有的 Planner/ledger。
-- [ ] 支持独立 PG 的 decoupled 和共享 Actor PG 的 split。
-- [ ] 校验 GPU 容量、模型并行布局、节点边界、bundle 范围及 split 重叠。
-- [ ] 由统一 Manager 持久记录 PG allocation，申请、幂等重试和取消都经过同一个 Planner；不能使用分散 Ray Actor 的进程内 class state。
-- [ ] 表达 defer 的共享资源与互斥阶段，为 Phase 5 提供计划。
-- [ ] 首版拒绝同一批 GPU 同一阶段的 shared co-resident 布局。
-- [ ] 显式记录 PG 所有权：Manager、Controller 或外部服务。
-- [ ] 所有 engine pool 消费解析完成的 placement，不再各自推导偏移。
-- [ ] 补齐启动失败、部分副本失败和关闭时的资源回滚。
+- [x] 将分散的 GPU/bundle 偏移计算迁入统一 Manager 持有的 Planner/ledger。
+- [x] 支持独立 PG 的 decoupled 和共享 Actor PG 的 split。
+- [x] 校验 GPU 容量、模型并行布局、节点边界、bundle 范围及 split 重叠。
+- [x] 由统一 Manager 持久记录 PG allocation，申请、幂等重试和取消都经过同一个 Planner；不能使用分散 Ray Actor 的进程内 class state。
+- [x] 表达 defer 的共享资源与互斥阶段，为 Phase 5 提供计划。
+- [x] 首版拒绝同一批 GPU 同一阶段的 shared co-resident 布局。
+- [x] 显式记录 PG 所有权：Manager、Controller 或外部服务。
+- [x] 所有 engine pool 消费解析完成的 placement，不再各自推导偏移。
+- [x] 补齐启动失败、部分副本失败和关闭时的资源回滚。
 
 验收：
 
@@ -164,19 +164,17 @@ Phase 3 验收：
 
 - [x] 迁移子项：任务级 `TaskInferenceManager` 持有 `PlacementPlanner`，Rollout 初始布局、scale-out/scale-in 清理、GenRM 和 Teacher adapter 在注入 task handle 时通过统一 planner；无 handle 时保留兼容回退。本项是迁移接线，不是最终 placement 验收。
 
-- [ ] 最终 placement 验收：仍需删除所有 role-local planner 回退、补齐全量失败回滚/所有权验证，并完成长耗时 Scale-in 与真实 Ray/GPU 验证。
+- [x] 将 `PlacementPlanner` 放入统一 Manager 控制面，统一解析 bundle/GPU slice、模型并行边界、节点边界、同阶段重叠和 PG owner。`PlacementPlanner` 删除全部 `ClassVar` 账本，改为实例状态；账本键改用稳定的 PG 身份（Ray PG 的 hex id），修正了"view 经 RPC 传入 owner 后 `id()` 每次不同、幂等与重叠检测全部失效"的缺陷。
 
-- [ ] 将 `PlacementPlanner` 放入统一 Manager 控制面，统一解析 bundle/GPU slice、模型并行边界、节点边界、同阶段重叠和 PG owner。
+- [x] Rollout、Teacher、GenRM 和 OPD 均通过统一 Manager 申请、复用、幂等重试和取消 placement；不允许各自维护独立 allocation ledger。新增 `relax/distributed/ray/placement_ledger.py` 作为唯一访问入口；`plan`/`release` 不再有 `classmethod` 旁路，`MultiEngineManager._remove_owned_pg` 也改为经 adapter 的账本释放。`create_genrm_managers`、MOPD teacher 与 multi-instance orchestrator 的启动前校验改为 `dry_run=True`，只校验不占账本。
 
-- [ ] Rollout、Teacher、GenRM 和 OPD 均通过统一 Manager 申请、复用、幂等重试和取消 placement；不允许各自维护独立 allocation ledger。
+- [x] 静态 defer 计划允许不同阶段复用同一 slice，但 activate/drain/排空由 Phase 5 Coordinator 执行。同阶段重叠拒绝、跨阶段复用允许；自动偏移只在本阶段内累加，避免 teacher 先注册时把 rollout 区域推偏。`contended_phases()` 输出 Phase 5 需要的互斥集合。
 
-- [ ] 静态 defer 计划允许不同阶段复用同一 slice，但 activate/drain/排空由 Phase 5 Coordinator 执行。
+- [x] 动态副本失败时回滚 engine 与自有 PG；scale-in 不删除 Controller-owned 或 external PG，并同步释放统一 ledger 中的 allocation。`PlacementRelease.remove_placement_group` 是唯一的删除授权来源，仅 owner 为 MANAGER 且该 PG 最后一个 allocation 被释放时为真；重复释放不再二次授权。`start_rollout_servers` 启动失败时归还已预留 slice。
 
-- [ ] 动态副本失败时回滚 engine 与自有 PG；scale-in 不删除 Controller-owned 或 external PG，并同步释放统一 ledger 中的 allocation。
+- [ ] 删除 role-local planner 回退入口：回退已收敛为"无 task handle 时角色自己显式持有一个 planner 实例"，不再有第二套账本实现或隐式类状态；入口本身的删除归 Phase 7。
 
-- [ ] 当前 placement 实现及其 CPU 回归仅作为迁移素材，待统一控制面接入后重新验收。
-
-- [ ] 真实 Ray/多节点 GPU 验收待提供集群、模型和硬件配置后执行。
+- [ ] 真实 Ray/多节点 GPU 验收与长耗时 Scale-in 验证待提供集群、模型和硬件配置后执行；CPU 回归不替代硬件验收。
 
 ## Phase 5：生命周期协调与 Deferred Scoring
 
@@ -667,9 +665,18 @@ GenRM defer 示例在后处理内执行 Rollout offload → named GenRM onload �
 - 2026-09-21 Phase 3 观测闭环：外部 role 的 lifecycle operation 成功后立即刷新并重新提交 owner snapshot；失败保留 failed operation 且不开放准入。READY checkpoint 模型不提交动态 weight evidence，policy 模型仍要求目标权重版本。publication barrier 回归 `88 passed`，定向 pre-commit、`py_compile` 和 `git diff --check` 通过。
 - 2026-09-21 Phase 3 继续收口：统一关闭链路恢复管理器级 `_close_pool` 兼容钩子，外部 Rollout runtime 的 `fanout` 保留 `skip_ranks`，未完成 backend binding 的占位 host 关闭保持幂等；InferenceRole/Manager/Rollout 回归 `121 passed`。剩余未勾选项仍是 Rollout runtime 完整迁入统一 EnginePool、EngineGroupSpec 驱动真实 actor 创建、无 task handle 兼容路径清理及真实多节点 Ray/GPU 验收，不能由本地 CPU 回归替代。
 - 2026-09-21 路线重排：Phase 3 收敛为统一控制面、preparation barrier 和 owner 生命周期契约；EngineGroupSpec 真实 actor 创建、GenRM/Teacher/Rollout EnginePool 运行时迁移归 Phase 6，最终 placement ledger 与 role-local fallback 清理归 Phase 4，兼容路径删除与真实 Ray/GPU/follower actor 验收归 Phase 7。Phase 3 当前允许 Rollout 暂时保留本地 runtime，但所有注入 task handle 的状态、准入和 lifecycle 操作必须经过 owner。
+- 2026-09-22 Phase 4 统一 PlacementPlanner：`PlacementPlanner` 改为实例账本（删除全部 `ClassVar` 状态与 `classmethod` 旁路），账本键改用稳定 PG 身份，修正了 view 经 RPC 传入 owner 后 `id()` 每次不同导致幂等/重叠检测失效的缺陷；新增 `relax/distributed/ray/placement_ledger.py` 作为唯一访问入口；`plan` 支持 `dry_run` 供启动前校验；`release` 返回 `PlacementRelease`，`remove_placement_group` 是删除 PG 的唯一授权；`contended_phases()` 输出 Phase 5 需要的阶段互斥集合。同时修正两个真实缺陷：多实例 GenRM / 多 teacher 共享一个 PG 时 group_id 撞名（原实现会静默返回别的实例的 slice），以及 GenRM 多实例启动前校验用了不含 rollout 偏移的错误区域。placeholder 预留区不参与引擎并行布局与节点边界校验，避免误拒 split 布局。
+- 2026-09-22 Phase 4 回归：新增 `tests/engine/inference/test_placement.py`（30 项）、`tests/distributed/ray/test_rollout_startup_placement.py`（3 项），并在 `test_inference_role.py`、`test_scale_in.py`、`test_multi_engine_manager.py` 补 owner 账本、scale-in 所有权与多实例不撞名回归。`tests/distributed/ray`、`tests/engine/inference`、`tests/components` 合计 `644 passed`；改动文件 pre-commit 通过。真实 Ray/多节点 GPU 与长耗时 Scale-in 验收未执行：未提供集群与硬件配置。
+- 2026-09-22 修正测试隔离缺陷：`test_teacher_manager.py` 的 autouse fixture 原先只 pop `sys.modules`，父包属性仍绑定 stub 模块，后续测试 monkeypatch 的模块与被测代码重新 import 的模块不是同一个对象；同时补齐 `_ManagerStub.refresh_inference_state` 和 topology-revision 测试的引擎观测。`tests/utils/data/test_identity_window_sampler.py::test_identity_window_sampler_backfills_lagging_dp_dummy_round` 在 pre-RFC 基点 `2a8d2ed` 即失败，与本次工作无关，未处理。
+- 2026-09-22 修复两处 RFC 引入但此前未被发现的测试回归（`tests/core/` 不在之前的定向回归子集内，是验证盲区）：
+  - `tests/core/test_control_plane_affinity.py` 的两个 GenRM 测试在 Phase 3 改道 `create_role_managers` 后失效——它们只 fake 了 `GenRMManager`，而该类已不在调用链上，于是测试去创建真实 `InferenceRoleManager` actor 并在 `ray.get(owner.ready.remote())` 上**永久挂住**，`make test` 会无限阻塞。改为 stub `InferenceRoleManager`/`InferenceManagerFacade` 并断言真正承载 affinity 标记与众所周知 actor 名的对象；顺带修正该测试把 `pg` 传成字符串（多实例路径 `tuple(pg[2])` 会 IndexError）。基点 `2a8d2ed` 下该文件 8 项 7 秒通过，`07dd27f` 起挂死。
+  - `tests/core/test_controller_s3_model_cleanup.py::test_controller_prepares_then_deploys_service` 用 `__new__` 手工装配 Controller，未跟上 Phase 3 新增的 `_inference_manager_handle`。生产代码无缺陷（`__init__` 已初始化，`register_all_serve` 在创建 service 前赋值），因此修测试而非给生产代码加 `getattr` 兜底。
+- 2026-09-22 全量基线：`tests/` 共 `2977 passed, 3 failed, 25 skipped`（修复前）。剩余两项与 RFC 无关，均已用 `git diff 2a8d2ed..HEAD` 确认相关源码未被触碰：`tests/backends/megatron/test_chunked_mtp_loss.py::test_is_training_logging_matches`（megatron patch 与上游对齐问题）、`tests/utils/data/test_identity_window_sampler.py::test_identity_window_sampler_backfills_lagging_dp_dummy_round`（`2a8d2ed` 即失败）。
 - Review 文件与调用链：
   - `relax/core/controller.py`：`register_all_serve -> create_task_inference_manager -> Service/OPD 注入 -> shutdown_all`。
   - `relax/core/service.py`：`Service._deploy -> backend bind/deploy -> register_role -> InferenceGatewayDeployment.bind`。
   - `relax/distributed/ray/inference_role.py`：`create_role_managers -> TaskInferenceManager.create_role -> ModelPool -> EngineAdapter -> InferenceManager`；legacy facade 的 `ready/snapshot/lifecycle/call` 均经 owner。
   - `relax/components/inference_gateway.py`：`Gateway request -> owner.snapshot -> resolve_model/select_target -> owner.admit_request -> upstream -> complete/cancel`。
-  - `relax/distributed/ray/rollout.py`：`RolloutManager -> start_rollout_servers/scale-out/scale-in -> task owner PlacementPlanner`；其 workload/runtime 生命周期已明确迁移到 Phase 6，role-local fallback 的最终删除归 Phase 4/7。
+  - `relax/distributed/ray/rollout.py`：`RolloutManager -> start_rollout_servers/scale-out/scale-in -> task owner PlacementPlanner`；其 workload/runtime 生命周期已明确迁移到 Phase 6，role-local fallback 的最终删除归 Phase 7。
+  - `relax/engine/inference/placement.py`：`plan -> _validate_parallel_layout/_validate_node_boundaries -> 同阶段重叠检查 -> PlacementSlice`；`release -> PlacementRelease.remove_placement_group`；`contended_phases -> PhaseContention`。
+  - `relax/distributed/ray/placement_ledger.py`：`plan_placement/release_placement -> task owner actor 或角色自持 PlacementPlanner`，全部角色的唯一账本入口。

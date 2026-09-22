@@ -828,6 +828,63 @@ class TestCleanupEngineGroups:
             manager._cleanup_engine_groups(srv)
             mock_remove.assert_not_called()
 
+    def test_releases_the_ledger_slice_and_removes_its_own_group(self):
+        from relax.engine.inference.placement import PlacementGroupView, PlacementRequest
+
+        mock_pg = MagicMock()
+        g_empty = make_engine_group(engines=[None], is_scaled_out=True)
+        g_empty.pg = (mock_pg, [0], [0])
+        srv = make_rollout_server(engine_groups=[g_empty])
+        manager = create_test_manager(servers={"default": srv})
+        view = PlacementGroupView((0,), (0,), PlacementOwner.MANAGER, identity=mock_pg)
+        (g_empty.placement,) = manager._plan_placement(
+            (
+                PlacementRequest(
+                    group_id="scale-out/replica-0",
+                    worker_type="regular",
+                    num_gpus=1,
+                    num_gpus_per_engine=1,
+                    num_gpus_per_node=8,
+                ),
+            ),
+            view,
+        )
+
+        with patch("ray.util.remove_placement_group") as mock_remove:
+            manager._cleanup_engine_groups(srv)
+            mock_remove.assert_called_once_with(mock_pg)
+        assert manager._placement_ledger.allocations(view) == ()
+
+    def test_ledger_ownership_overrides_a_stale_group_owner(self):
+        from relax.engine.inference.placement import PlacementGroupView, PlacementRequest
+
+        mock_pg = MagicMock()
+        g_empty = make_engine_group(engines=[None], is_scaled_out=True)
+        g_empty.pg = (mock_pg, [0], [0])
+        # The group claims ownership, but the ledger recorded a borrowed
+        # placement group, which is what decides.
+        g_empty.pg_owner = PlacementOwner.MANAGER
+        srv = make_rollout_server(engine_groups=[g_empty])
+        manager = create_test_manager(servers={"default": srv})
+        view = PlacementGroupView((0,), (0,), PlacementOwner.CONTROLLER, identity=mock_pg)
+        (g_empty.placement,) = manager._plan_placement(
+            (
+                PlacementRequest(
+                    group_id="default/group-0",
+                    worker_type="regular",
+                    num_gpus=1,
+                    num_gpus_per_engine=1,
+                    num_gpus_per_node=8,
+                ),
+            ),
+            view,
+        )
+
+        with patch("ray.util.remove_placement_group") as mock_remove:
+            manager._cleanup_engine_groups(srv)
+            mock_remove.assert_not_called()
+        assert manager._placement_ledger.allocations(view) == ()
+
 
 # ===================== Scale-in status queries =============================
 

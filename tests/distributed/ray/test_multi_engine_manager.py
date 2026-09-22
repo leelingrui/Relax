@@ -282,6 +282,48 @@ def test_shutdown_removes_owned_placement_group_but_not_borrowed_one(_patch_ray,
     assert removed_pgs == []
 
 
+def test_shutdown_releases_the_planned_slice_before_removing_its_group(_patch_ray, monkeypatch):
+    from relax.engine.inference.placement import (
+        PlacementGroupView,
+        PlacementOwner,
+        PlacementPlanner,
+        PlacementRequest,
+    )
+
+    placement_group_submodule = sys.modules["ray.util.placement_group"]
+    removed_pgs = []
+    monkeypatch.setattr(placement_group_submodule, "remove_placement_group", lambda pg: removed_pgs.append(pg))
+
+    ledger = PlacementPlanner()
+    view = PlacementGroupView((0,), (0,), PlacementOwner.MANAGER, identity="own-pg")
+    request = PlacementRequest(
+        group_id="teacher/math/replica-0",
+        worker_type="regular",
+        num_gpus=1,
+        num_gpus_per_engine=1,
+        num_gpus_per_node=8,
+    )
+
+    class _PlannedManager(_FakeManager):
+        """A manager whose slot comes from the shared ledger, as the migrated
+        adapters' slots do."""
+
+        def _resolve_planned_placement(self, rank):
+            (planned,) = ledger.plan((request,), view)
+            return ("own-pg", [0], [0]), True, 0, planned
+
+        def _release_placement(self, placement):
+            return ledger.release(placement)
+
+    manager = _PlannedManager(num_slots=1, owns_pg=True)
+    assert len(ledger.allocations(view)) == 1
+
+    manager.shutdown()
+
+    assert removed_pgs == ["own-pg"]
+    assert ledger.allocations(view) == ()
+
+
 def test_manager_onload_skips_resume_for_newly_rebuilt_engine(_patch_ray):
     manager = _FakeManager(num_slots=2)
     manager.offload()
@@ -463,3 +505,38 @@ def test_model_pool_runtime_is_onloaded_uses_runtime():
     for method in ("onload", "offload", "recover", "health_check", "shutdown"):
         getattr(pool, method)()
         getattr(manager, method).assert_called_once_with("model")
+
+
+def test_multi_instance_genrm_slices_do_not_collide_in_one_ledger():
+    """Instances of a multi-instance role share one placement group, so their
+    slices must stay distinct in the single task-level ledger."""
+    from relax.distributed.ray.genrm import GenRMEngineAdapter
+    from relax.engine.inference.placement import PlacementOwner, PlacementPlanner
+
+    ledger = PlacementPlanner()
+    pg = ("shared", list(range(8)), list(range(8)))
+    planned = []
+    for index, model_id in enumerate(("judge-a", "judge-b")):
+        adapter = object.__new__(GenRMEngineAdapter)
+        adapter.args = SimpleNamespace(
+            num_gpus_per_node=4,
+            rollout_num_gpus=4,
+            fully_async=False,
+            genrm_num_gpus=2,
+            genrm_num_gpus_per_engine=2,
+        )
+        adapter.pg = pg
+        adapter.nodes_per_engine = 1
+        adapter.num_gpu_per_engine = 2
+        adapter.bundle_offset = index * 2
+        adapter.placement_owner = PlacementOwner.CONTROLLER
+        adapter._placement_ledger = ledger
+        adapter._placement_model_id = model_id
+        planned.append(adapter._resolve_planned_placement(0)[3])
+
+    # Both sit behind the rollout region, at their own instance offset.
+    assert [item.reserved_offset for item in planned] == [4, 6]
+    assert {item.group_id for item in ledger.allocations()} == {
+        "genrm/judge-a/replica-0",
+        "genrm/judge-b/replica-0",
+    }

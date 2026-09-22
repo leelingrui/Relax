@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 import torch.distributed as dist
 
+from relax.distributed.ray.placement_ledger import plan_placement
 from relax.engine.inference.placement import (
     PlacementGroupView,
     PlacementOwner,
@@ -411,9 +412,13 @@ def _start_managed_multi_teacher(
                 bundle_offset=rollout_gpus + index * gpus_per_teacher,
             )
         )
-    PlacementPlanner().plan(
+    # Validate every teacher slice before any manager is spawned. The teacher
+    # adapters record the authoritative slices, so this check reserves nothing.
+    plan_placement(
+        inference_manager_handle or PlacementPlanner(),
         tuple(placement_requests),
         PlacementGroupView(tuple(shared_pg[1]), tuple(shared_pg[2]), PlacementOwner.CONTROLLER, identity=shared_pg[0]),
+        dry_run=True,
     )
     role_kwargs = {"runtime_env": runtime_env}
     if inference_manager_handle is not None:

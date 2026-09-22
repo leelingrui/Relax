@@ -9,10 +9,18 @@ from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.service import create_placement_group
 from relax.distributed.ray.model_pool import ModelPool
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager
+from relax.distributed.ray.placement_ledger import plan_placement, release_placement
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from relax.engine.inference.capabilities import WeightSource
-from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementPlanner, PlacementRequest
+from relax.engine.inference.placement import (
+    PlacementGroupView,
+    PlacementOwner,
+    PlacementPlanner,
+    PlacementRelease,
+    PlacementRequest,
+    PlacementSlice,
+)
 from relax.engine.inference.types import Role
 from relax.utils.env import Envs
 from relax.utils.http_utils import find_available_port
@@ -103,9 +111,12 @@ class TeacherEngineAdapter:
         self._shared_pg = shared_pg
         self._shared_pg_tuple = pg
         self._bundle_offset = bundle_offset
-        self._placement_planner = PlacementPlanner()
-        self._placement_manager_handle = placement_manager_handle
-        self._placement_slices = {}
+        # Without an owner handle this role keeps its own ledger; the task
+        # owner's planner is the single ledger whenever one is injected.
+        self._placement_ledger = placement_manager_handle or PlacementPlanner()
+        # Multiple teachers share one placement group, so the allocation
+        # identity has to carry the model, not just the replica.
+        self._placement_model_id = model_id
 
         overrides = build_teacher_overrides(args, colocate_sync=shared_pg)
         self._overrides = overrides
@@ -211,16 +222,7 @@ class TeacherEngineAdapter:
             )
             return self._shared_pg_tuple, False, gpu_index + node_offset
 
-        # Dedicated: this replica creates and owns its own placement group.
-        existing = getattr(self, "_engine_placements", {}).get(replica * nodes_per_engine)
-        pg_tuple = (
-            existing[0]
-            if existing
-            else create_placement_group(
-                num_gpus=self.gpus_per_replica,
-                node_group_affinity=getattr(self.args, "enable_affinity", True),
-            )
-        )
+        pg_tuple = self._dedicated_placement_group(replica)
         gpu_index = _resolve_teacher_gpu_index(
             args=self.args,
             replica=replica,
@@ -228,6 +230,21 @@ class TeacherEngineAdapter:
             shared_pg=False,
         )
         return pg_tuple, True, gpu_index + node_offset
+
+    def _dedicated_placement_group(self, replica: int) -> tuple:
+        """Provision -- or reuse -- the placement group this replica owns.
+
+        Offsets inside the group come from the planner, so this hook resolves
+        the resource only and never derives a bundle offset.
+        """
+        nodes_per_engine = getattr(self, "nodes_per_engine", 1)
+        existing = getattr(self, "_engine_placements", {}).get(replica * nodes_per_engine)
+        if existing:
+            return existing[0]
+        return create_placement_group(
+            num_gpus=self.gpus_per_replica,
+            node_group_affinity=getattr(self.args, "enable_affinity", True),
+        )
 
     def _resolve_planned_placement(self, rank: int):
         nodes_per_engine = getattr(self, "nodes_per_engine", 1)
@@ -237,10 +254,10 @@ class TeacherEngineAdapter:
             owner = PlacementOwner.CONTROLLER
             requests = tuple(
                 PlacementRequest(
-                    group_id=f"teacher-{index}",
+                    group_id=f"teacher/{self._placement_model_id}/replica-{index}",
                     worker_type="regular",
                     num_gpus=self.gpus_per_replica,
-                    num_gpus_per_engine=min(self.gpus_per_replica, self.args.num_gpus_per_node),
+                    num_gpus_per_engine=self.gpus_per_replica,
                     num_gpus_per_node=self.args.num_gpus_per_node,
                     phase="teacher",
                     bundle_offset=int(self.args.rollout_num_gpus)
@@ -250,31 +267,26 @@ class TeacherEngineAdapter:
                 for index in range(self.num_replicas)
             )
         else:
-            pg_tuple, _, _ = self._resolve_placement(rank)
+            pg_tuple = self._dedicated_placement_group(replica)
             owner = PlacementOwner.MANAGER
             requests = (
                 PlacementRequest(
-                    group_id=f"teacher-{replica}",
+                    group_id=f"teacher/{self._placement_model_id}/replica-{replica}",
                     worker_type="regular",
                     num_gpus=self.gpus_per_replica,
-                    num_gpus_per_engine=min(self.gpus_per_replica, self.args.num_gpus_per_node),
+                    num_gpus_per_engine=self.gpus_per_replica,
                     num_gpus_per_node=self.args.num_gpus_per_node,
                     phase="teacher",
                     bundle_offset=0,
                 ),
             )
         pg_view = PlacementGroupView(tuple(pg_tuple[1]), tuple(pg_tuple[2]), owner, identity=pg_tuple[0])
-        placement_manager_handle = getattr(self, "_placement_manager_handle", None)
-        if placement_manager_handle is None:
-            planned = self._placement_planner.plan(requests, pg_view)[replica if self._shared_pg else 0]
-        elif isinstance(placement_manager_handle, PlacementPlanner):
-            planned = placement_manager_handle.plan(requests, pg_view)[replica if self._shared_pg else 0]
-        else:
-            planned = ray.get(placement_manager_handle.plan_placement.remote(requests, pg_view))[
-                replica if self._shared_pg else 0
-            ]
+        planned = plan_placement(self._placement_ledger, requests, pg_view)[replica if self._shared_pg else 0]
         bundle = planned.bundle_indices[node_rank]
         return pg_tuple, self._shared_pg is False, tuple(pg_tuple[1]).index(bundle), planned
+
+    def _release_placement(self, placement: PlacementSlice) -> PlacementRelease:
+        return release_placement(self._placement_ledger, placement)
 
     def _ray_resource_kwargs(self, rank: int) -> dict:
         return {"num_cpus": 0.2, "num_gpus": 0.2}

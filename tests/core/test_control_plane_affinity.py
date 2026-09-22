@@ -4,7 +4,7 @@ import ast
 import sys
 from argparse import Namespace
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -122,49 +122,75 @@ def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkey
     assert captured["options"]["scheduling_strategy"].node_id == node_id
 
 
-def test_genrm_manager_requests_stable_cpu(monkeypatch, tmp_path):
-    captured = {}
-    genrm_module = ModuleType("relax.distributed.ray.genrm")
+def _stub_inference_role_actors(monkeypatch):
+    """Capture the control-plane actor options ``create_role_managers`` uses.
 
-    class FakeGenRMManager(_FakeActorClass):
+    GenRM bring-up now goes through the unified role owner, so the actors that
+    carry the affinity markers are ``InferenceRoleManager`` and the legacy
+    facades -- not ``GenRMManager``. Both are real Ray actors, so they have to
+    be stubbed or the call blocks on a cluster that no unit test has.
+    """
+    from relax.distributed.ray import inference_role
+
+    captured = SimpleNamespace(owner=None, facades=[], pool_configs=None)
+
+    class FakeRoleOwner(_FakeActorClass):
         @classmethod
         def options(cls, **options):
-            captured["options"] = options
+            captured.owner = options
             return cls
 
-    genrm_module.GenRMManager = FakeGenRMManager
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.genrm", genrm_module)
+        @classmethod
+        def remote(cls, role, pool_configs):
+            captured.pool_configs = pool_configs
+            return SimpleNamespace(ready=SimpleNamespace(remote=lambda: True))
+
+    class FakeFacade(_FakeActorClass):
+        @classmethod
+        def options(cls, **options):
+            captured.facades.append(options)
+            return cls
+
+        @classmethod
+        def remote(cls, *args, **kwargs):
+            return SimpleNamespace(ready=SimpleNamespace(remote=lambda: True))
+
+    monkeypatch.setattr(inference_role, "InferenceRoleManager", FakeRoleOwner)
+    monkeypatch.setattr(inference_role, "InferenceManagerFacade", FakeFacade)
+    monkeypatch.setattr(
+        inference_role.ray,
+        "get",
+        lambda refs, **kwargs: list(refs) if isinstance(refs, (list, tuple)) else refs,
+    )
+    return captured
+
+
+def test_genrm_manager_requests_stable_cpu(monkeypatch, tmp_path):
+    captured = _stub_inference_role_actors(monkeypatch)
     args = _elastic_args(tmp_path, offload_rollout=False)
 
     placement_group_module.create_genrm_manager(args, "pg", runtime_env={"env_vars": {"A": "B"}})
 
-    assert captured["options"] == {
-        "name": "relax_genrm_manager",
+    assert captured.owner == {
         "num_cpus": 1,
         "num_gpus": 0,
         "runtime_env": {"env_vars": {"A": "B"}},
         "resources": {"stable_cpu": 1},
     }
+    # The well-known single-instance name still lands on the legacy facade.
+    assert captured.facades == [
+        {
+            "name": "relax_genrm_manager",
+            "num_cpus": 0,
+            "num_gpus": 0,
+            "runtime_env": {"env_vars": {"A": "B"}},
+            "resources": {"stable_cpu": 1},
+        }
+    ]
 
 
 def test_multi_genrm_managers_have_route_specific_names(monkeypatch, tmp_path):
-    captured_options = []
-    captured_ctor_kwargs = []
-    genrm_module = ModuleType("relax.distributed.ray.genrm")
-
-    class FakeGenRMManager(_FakeActorClass):
-        @classmethod
-        def options(cls, **options):
-            captured_options.append(options)
-            return cls
-
-        @classmethod
-        def remote(cls, *args, **kwargs):
-            captured_ctor_kwargs.append(kwargs)
-            return MagicMock()
-
-    genrm_module.GenRMManager = FakeGenRMManager
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.genrm", genrm_module)
+    captured = _stub_inference_role_actors(monkeypatch)
     spec = {
         "model_path": "/model",
         "num_gpus": 1,
@@ -175,16 +201,20 @@ def test_multi_genrm_managers_have_route_specific_names(monkeypatch, tmp_path):
     args = _elastic_args(
         tmp_path,
         offload_rollout=False,
+        fully_async=True,
+        rollout_num_gpus=0,
+        num_gpus_per_node=8,
         _genrm_instances_resolved={"quality": dict(spec), "safety": dict(spec)},
     )
 
-    placement_group_module.create_genrm_managers(args, "pg")
+    placement_group_module.create_genrm_managers(args, ("pg", [0, 1], [0, 1]))
 
-    assert [options["name"] for options in captured_options] == [
+    assert [options["name"] for options in captured.facades] == [
         "relax_genrm_manager_quality",
         "relax_genrm_manager_safety",
     ]
-    assert [kwargs["port_window_index"] for kwargs in captured_ctor_kwargs] == [0, 1]
+    assert [config["kwargs"]["port_window_index"] for config in captured.pool_configs.values()] == [0, 1]
+    assert [config["kwargs"]["bundle_offset"] for config in captured.pool_configs.values()] == [0, 1]
 
 
 def test_dcs_proxy_requests_stable_cpu(monkeypatch, tmp_path):

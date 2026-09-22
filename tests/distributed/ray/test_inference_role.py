@@ -14,6 +14,7 @@ import pytest
 from relax.distributed.ray import inference_role as module
 from relax.engine.inference.capabilities import WeightSource
 from relax.engine.inference.manager import InferenceManager, ModelBusyError
+from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementRequest
 from relax.engine.inference.specs import ModelSpec
 from relax.engine.inference.types import (
     LifecycleState,
@@ -665,3 +666,89 @@ def test_task_manager_publishes_external_ready_snapshot_after_preparation() -> N
     assert model.admission is True
     assert model.router_url == "http://router"
     assert published.routing.default_model == "model"
+
+
+# ---------------------------------------------------------------------------
+# The task owner holds the one placement ledger for every role.
+# ---------------------------------------------------------------------------
+class _FakePlacementGroup:
+    def __init__(self, value: str) -> None:
+        self.id = SimpleNamespace(hex=lambda value=value: value)
+
+
+def _placement_view(owner: PlacementOwner = PlacementOwner.CONTROLLER, size: int = 8, identity: str = "shared"):
+    return PlacementGroupView(tuple(range(size)), tuple(range(size)), owner, identity=_FakePlacementGroup(identity))
+
+
+def _placement_request(group_id: str, *, num_gpus: int, phase: str, bundle_offset: int | None = None):
+    return PlacementRequest(
+        group_id=group_id,
+        worker_type="regular",
+        num_gpus=num_gpus,
+        num_gpus_per_engine=2,
+        num_gpus_per_node=4,
+        phase=phase,
+        bundle_offset=bundle_offset,
+    )
+
+
+def test_task_manager_shares_one_placement_ledger_across_roles() -> None:
+    owner = module.TaskInferenceManager()
+    view = _placement_view()
+
+    owner.plan_placement((_placement_request("rollout/group-0", num_gpus=4, phase="inference"),), view)
+    (genrm,) = owner.plan_placement((_placement_request("genrm-0", num_gpus=4, phase="genrm"),), view)
+
+    # Every role's slice lives in the same ledger, keyed by the group identity
+    # rather than by a per-process object.
+    assert {item.group_id for item in owner.allocations(view)} == {"rollout/group-0", "genrm-0"}
+    assert genrm.reserved_offset == 0
+
+
+def test_task_manager_rejects_co_resident_roles_in_one_phase() -> None:
+    owner = module.TaskInferenceManager()
+    view = _placement_view()
+    owner.plan_placement(
+        (_placement_request("rollout/group-0", num_gpus=4, phase="inference", bundle_offset=0),), view
+    )
+
+    with pytest.raises(ValueError, match="overlap"):
+        owner.plan_placement((_placement_request("teacher-0", num_gpus=4, phase="inference", bundle_offset=2),), view)
+
+
+def test_task_manager_reports_phase_exclusions_for_a_deferred_plan() -> None:
+    owner = module.TaskInferenceManager()
+    view = _placement_view()
+    owner.plan_placement(
+        (_placement_request("rollout/group-0", num_gpus=4, phase="inference", bundle_offset=0),), view
+    )
+    owner.plan_placement((_placement_request("teacher-0", num_gpus=4, phase="teacher_score", bundle_offset=0),), view)
+
+    (contention,) = owner.contended_phases(view)
+
+    assert contention.phases == ("inference", "teacher_score")
+
+
+def test_task_manager_release_reports_ownership_of_the_group() -> None:
+    owner = module.TaskInferenceManager()
+    borrowed = _placement_view(PlacementOwner.CONTROLLER, identity="borrowed")
+    created = _placement_view(PlacementOwner.MANAGER, identity="created")
+    (from_borrowed,) = owner.plan_placement((_placement_request("genrm-0", num_gpus=4, phase="genrm"),), borrowed)
+    (from_created,) = owner.plan_placement(
+        (_placement_request("scale-out/replica-0", num_gpus=4, phase="inference"),), created
+    )
+
+    assert owner.release_placement(from_borrowed).remove_placement_group is False
+    assert owner.release_placement(from_created).remove_placement_group is True
+    assert owner.allocations() == ()
+
+
+def test_task_manager_dry_run_validates_without_reserving() -> None:
+    owner = module.TaskInferenceManager()
+    view = _placement_view()
+
+    owner.plan_placement(
+        (_placement_request("genrm/a", num_gpus=4, phase="genrm", bundle_offset=0),), view, dry_run=True
+    )
+
+    assert owner.allocations(view) == ()

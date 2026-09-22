@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 import ray
 
+from relax.distributed.ray.placement_ledger import plan_placement
 from relax.engine.inference.placement import (
     PlacementGroupView,
     PlacementOwner,
@@ -44,6 +45,8 @@ def start_multi_instance_managers(
     placement_owner: PlacementOwner = PlacementOwner.CONTROLLER,
     worker_type: str = "regular",
     num_gpus_per_node: int | None = None,
+    phase: str = "inference",
+    placement_ledger: Any | None = None,
 ) -> dict[str, Any]:
     """Launch one manager per entry in ``instance_specs``, each at a non-
     overlapping GPU offset within whatever shared placement group
@@ -92,7 +95,9 @@ def start_multi_instance_managers(
         pg_view = PlacementGroupView(
             tuple(placement_group[1]), tuple(placement_group[2]), placement_owner, identity=placement_group[0]
         )
-        PlacementPlanner().plan(
+        # Pre-flight only: the role adapters record the authoritative slices.
+        plan_placement(
+            placement_ledger or PlacementPlanner(),
             tuple(
                 PlacementRequest(
                     group_id=f"{worker_type}/{key}",
@@ -100,12 +105,14 @@ def start_multi_instance_managers(
                     num_gpus=spec["num_gpus"],
                     num_gpus_per_engine=spec.get("num_gpus_per_engine", spec["num_gpus"]),
                     num_gpus_per_node=num_gpus_per_node,
+                    phase=phase,
                     bundle_offset=offset,
                 )
                 for key, spec in instance_specs.items()
                 for offset in (offsets[key],)
             ),
             pg_view,
+            dry_run=True,
         )
 
     for key, spec in instance_specs.items():

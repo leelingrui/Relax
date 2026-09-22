@@ -207,7 +207,8 @@ def test_teacher_placement_uses_planner_slice_for_shared_pg(monkeypatch):
     manager._shared_pg = True
     manager._bundle_offset = 2
     manager._shared_pg_tuple = ("shared", list(range(12)), list(range(12)))
-    manager._placement_planner = module.PlacementPlanner()
+    manager._placement_ledger = module.PlacementPlanner()
+    manager._placement_model_id = "math-teacher"
 
     placement, owns_pg, gpu_index, planned = manager._resolve_planned_placement(rank=1)
 
@@ -216,6 +217,9 @@ def test_teacher_placement_uses_planner_slice_for_shared_pg(monkeypatch):
     assert gpu_index == 8
     assert planned.reserved_offset == 8
     assert planned.owner is module.PlacementOwner.CONTROLLER
+    # Teachers share one placement group, so the slice identity carries the
+    # model and not just the replica index.
+    assert planned.group_id == "teacher/math-teacher/replica-1"
 
 
 def test_teacher_init_uses_own_router_without_dcs(monkeypatch):

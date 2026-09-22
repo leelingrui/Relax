@@ -25,7 +25,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.engine.inference.capabilities import WeightSource
 from relax.engine.inference.manager import InferenceManager, PreparationEvidence
-from relax.engine.inference.placement import PlacementPlanner, PlacementSlice
+from relax.engine.inference.placement import PlacementSlice
 from relax.engine.inference.specs import model_spec_from_pool, replicas_from_slots
 from relax.engine.inference.types import (
     LifecycleState,
@@ -402,12 +402,20 @@ class MultiEngineManager:
         if placement is None:
             return
         pg_tuple, owns_pg = placement
-        if not owns_pg:
-            return
+        release = None
+        if placement_slice is not None and not any(
+            other.group_id == placement_slice.group_id for other in self._placement_slices.values()
+        ):
+            # The last node actor of this logical replica gives the slice back.
+            release = self.adapter._release_placement(placement_slice)
         if any(other[0][0] == pg_tuple[0] for other in self._engine_placements.values()):
+            # Other slots still run in this group; its last slot removes it.
             return
-        if placement_slice is not None:
-            PlacementPlanner.cancel(placement_slice)
+        # The ledger is authoritative once the slice is recorded there, so a
+        # borrowed group is never removed on this path.
+        remove_pg = release.remove_placement_group if release is not None and release.slices else owns_pg
+        if not remove_pg:
+            return
         try:
             from ray.util.placement_group import remove_placement_group
 

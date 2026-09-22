@@ -22,6 +22,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.distributed.ray.placement_ledger import plan_placement, release_placement
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.inference.config import EngineGroupConfig, ModelConfig, SglangConfig
 from relax.engine.inference.discovery import new_manager_epoch
@@ -865,7 +866,9 @@ class RolloutManager(ReloadableMixin):
                 args,
                 pg,
                 inference_manager=self.inference_manager,
-                placement_manager_handle=self.task_inference_manager,
+                # One ledger on both paths: the task owner's when injected,
+                # this manager's own otherwise.
+                placement_manager_handle=self._placement_ledger,
             )
         if self.servers:
             for server in self.servers.values():
@@ -966,18 +969,24 @@ class RolloutManager(ReloadableMixin):
         if not self.args.debug_train_only:
             self._start_eviction_monitor()
 
-    def _plan_placement(self, requests, placement_group):
-        manager_handle = getattr(self, "task_inference_manager", None)
-        if manager_handle is None:
-            return PlacementPlanner().plan(requests, placement_group)
-        return ray.get(manager_handle.plan_placement.remote(requests, placement_group))
+    @property
+    def _placement_ledger(self):
+        """The task owner's ledger, or this manager's own on the compat
+        path."""
+        handle = getattr(self, "task_inference_manager", None)
+        if handle is not None:
+            return handle
+        ledger = getattr(self, "_local_placement_planner", None)
+        if ledger is None:
+            ledger = PlacementPlanner()
+            self._local_placement_planner = ledger
+        return ledger
 
-    def _cancel_placement(self, placement):
-        manager_handle = getattr(self, "task_inference_manager", None)
-        if manager_handle is None:
-            PlacementPlanner.cancel(placement)
-            return
-        ray.get(manager_handle.cancel_placement.remote(placement))
+    def _plan_placement(self, requests, placement_group):
+        return plan_placement(self._placement_ledger, requests, placement_group)
+
+    def _release_placement(self, placement):
+        return release_placement(self._placement_ledger, placement)
 
     def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
         """Allocate ranks monotonically so a removed elastic rank is not
@@ -4327,14 +4336,18 @@ class RolloutManager(ReloadableMixin):
             monitor.stop()
 
         for group in groups_to_remove:
+            # Ownership decides removal: a Controller-owned or external group is
+            # only given back in the ledger, never destroyed here.
+            remove_pg = group.pg_owner is PlacementOwner.MANAGER
             if group.placement is not None:
-                self._cancel_placement(group.placement)
-            if group.pg is not None:
-                if group.pg_owner is PlacementOwner.MANAGER:
-                    try:
-                        ray.util.remove_placement_group(group.pg[0])
-                    except Exception as e:
-                        logger.warning(f"[ScaleIn] Failed to remove placement group: {e}")
+                release = self._release_placement(group.placement)
+                if release.slices:
+                    remove_pg = release.remove_placement_group
+            if group.pg is not None and remove_pg:
+                try:
+                    ray.util.remove_placement_group(group.pg[0])
+                except Exception as e:
+                    logger.warning(f"[ScaleIn] Failed to remove placement group: {e}")
             with self._engine_lifecycle_lock:
                 group.lifecycle_status = EngineGroupLifecycle.REMOVED
 
@@ -4928,69 +4941,78 @@ def start_rollout_servers(
         for model in models
         for group_index, group in enumerate(model.engine_groups)
     )
-    if placement_manager_handle is None:
-        planned_groups = PlacementPlanner().plan(placement_requests, pg_view)
-    else:
-        planned_groups = ray.get(placement_manager_handle.plan_placement.remote(placement_requests, pg_view))
+    ledger = placement_manager_handle or PlacementPlanner()
+    planned_groups = plan_placement(ledger, placement_requests, pg_view)
     planned_by_id = {planned.group_id: planned for planned in planned_groups}
 
-    for model_idx, model_cfg in enumerate(models):
-        has_pd = model_cfg.has_pd_disaggregation
-        router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
+    try:
+        for model_idx, model_cfg in enumerate(models):
+            has_pd = model_cfg.has_pd_disaggregation
+            router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
 
-        # Write back for backward compat (first model only).
-        if model_idx == 0:
-            args.sglang_router_ip = router_ip
-            args.sglang_router_port = router_port
+            # Write back for backward compat (first model only).
+            if model_idx == 0:
+                args.sglang_router_ip = router_ip
+                args.sglang_router_port = router_port
 
-        engine_groups: list[EngineGroup] = []
-        all_init_handles: list = []
-        port_cursors: dict[int, int] = {}
+            engine_groups: list[EngineGroup] = []
+            all_init_handles: list = []
+            port_cursors: dict[int, int] = {}
 
-        for group_index, group_cfg in enumerate(model_cfg.engine_groups):
-            gpus_per_engine = group_cfg.num_gpus_per_engine
-            num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
-            num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
-            planned = planned_by_id[f"{model_cfg.name}/group-{group_index}"]
+            for group_index, group_cfg in enumerate(model_cfg.engine_groups):
+                gpus_per_engine = group_cfg.num_gpus_per_engine
+                num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
+                num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
+                planned = planned_by_id[f"{model_cfg.name}/group-{group_index}"]
 
-            group = EngineGroup(
-                args=args,
-                pg=pg,
-                all_engines=[None] * num_engines if group_cfg.worker_type != "placeholder" else [],
-                num_gpus_per_engine=gpus_per_engine,
-                num_new_engines=0,
-                worker_type=group_cfg.worker_type,
-                rank_offset=engine_offset,
-                gpu_offset=planned.reserved_offset,
-                sglang_overrides=dict(group_cfg.overrides),
+                group = EngineGroup(
+                    args=args,
+                    pg=pg,
+                    all_engines=[None] * num_engines if group_cfg.worker_type != "placeholder" else [],
+                    num_gpus_per_engine=gpus_per_engine,
+                    num_new_engines=0,
+                    worker_type=group_cfg.worker_type,
+                    rank_offset=engine_offset,
+                    gpu_offset=planned.reserved_offset,
+                    sglang_overrides=dict(group_cfg.overrides),
+                    router_ip=router_ip,
+                    router_port=router_port,
+                    spec=group_cfg.topology,
+                    placement=planned,
+                    pg_owner=PlacementOwner.CONTROLLER,
+                    skip_router_registration=True,
+                )
+                handles, port_cursors = group.start_engines(port_cursors)
+                all_init_handles.extend(handles)
+                engine_groups.append(group)
+
+                engine_offset += num_engines
+
+            if all_init_handles:
+                _wait_engine_init_with_progress(
+                    all_init_handles,
+                    model_name=model_cfg.name,
+                    timeout=getattr(args, "rollout_engine_init_timeout", 3600.0),
+                    log_interval=60.0,
+                )
+
+            servers[model_cfg.name] = RolloutServer(
+                engine_groups=engine_groups,
                 router_ip=router_ip,
                 router_port=router_port,
-                spec=group_cfg.topology,
-                placement=planned,
-                pg_owner=PlacementOwner.CONTROLLER,
-                skip_router_registration=True,
-            )
-            handles, port_cursors = group.start_engines(port_cursors)
-            all_init_handles.extend(handles)
-            engine_groups.append(group)
-
-            engine_offset += num_engines
-
-        if all_init_handles:
-            _wait_engine_init_with_progress(
-                all_init_handles,
                 model_name=model_cfg.name,
-                timeout=getattr(args, "rollout_engine_init_timeout", 3600.0),
-                log_interval=60.0,
+                model_spec=model_cfg,
             )
 
-        servers[model_cfg.name] = RolloutServer(
-            engine_groups=engine_groups,
-            router_ip=router_ip,
-            router_port=router_port,
-            model_name=model_cfg.name,
-            model_spec=model_cfg,
-        )
+    except Exception:
+        # A startup that does not finish must give its reserved slices back.
+        # The group itself belongs to the Controller and is left alone.
+        for group_id in planned_by_id:
+            try:
+                release_placement(ledger, pg_view, group_id)
+            except Exception as exc:
+                logger.warning(f"Failed to release the planned placement for {group_id}: {exc}")
+        raise
 
     return servers
 

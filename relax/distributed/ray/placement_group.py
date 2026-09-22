@@ -9,6 +9,7 @@ from relax.core.node_group_affinity import (
     require_control_plane_resource_on_node,
     with_control_plane_affinity,
 )
+from relax.distributed.ray.placement_ledger import plan_placement
 from relax.engine.inference.placement import (
     PlacementGroupView,
     PlacementOwner,
@@ -224,6 +225,11 @@ def create_genrm_managers(args, pg, runtime_env=None, inference_manager_handle=N
     pool_configs = {}
     bundle_offset = 0
     requests = []
+    # The adapters place their engines behind the rollout region under sync
+    # colocate, so the pre-flight check has to validate that same region.
+    region_offset = (
+        0 if args.fully_async or getattr(args, "_genrm_colocate_with_rollout", False) else args.rollout_num_gpus
+    )
     for index, (key, spec) in enumerate(instance_specs.items()):
         instance_args = copy.copy(args)
         instance_args.genrm_model_path = spec["model_path"]
@@ -242,13 +248,19 @@ def create_genrm_managers(args, pg, runtime_env=None, inference_manager_handle=N
                 num_gpus=spec["num_gpus"],
                 num_gpus_per_engine=spec["num_gpus_per_engine"],
                 num_gpus_per_node=args.num_gpus_per_node,
-                bundle_offset=bundle_offset,
+                phase="genrm",
+                bundle_offset=region_offset + bundle_offset,
             )
         )
         bundle_offset += spec["num_gpus"]
-    PlacementPlanner().plan(
+    # Validate the whole layout before anything is spawned. The adapters record
+    # the authoritative slices per replica, so this pre-flight check must not
+    # reserve anything itself.
+    plan_placement(
+        inference_manager_handle or PlacementPlanner(),
         tuple(requests),
         PlacementGroupView(tuple(pg[1]), tuple(pg[2]), PlacementOwner.CONTROLLER, identity=pg[0]),
+        dry_run=True,
     )
     role_kwargs = {
         "runtime_env": runtime_env,

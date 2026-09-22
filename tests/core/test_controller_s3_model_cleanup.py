@@ -308,6 +308,9 @@ def test_controller_prepares_then_deploys_service(monkeypatch):
     instance.config = SimpleNamespace()
     instance.runtime_env = None
     instance._health_manager = SimpleNamespace(status=object())
+    # Services are handed the task-level inference owner; register_all_serve
+    # creates it before any service, and __init__ seeds it as None.
+    instance._inference_manager_handle = None
     monkeypatch.setattr(controller, "Service", FakeService)
 
     role, service, error = instance._create_service_task(
