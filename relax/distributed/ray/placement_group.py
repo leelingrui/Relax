@@ -92,7 +92,7 @@ def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
     )
 
 
-def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
+def create_rollout_manager(args, pg, data_source=None, runtime_env=None, inference_manager_handle=None):
     from .rollout import RolloutManager
 
     # Get the head node ID to ensure RolloutManager runs on the head node
@@ -115,7 +115,7 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
                 ),
             },
         )
-    ).remote(args, pg, data_source=data_source)
+    ).remote(args, pg, data_source=data_source, inference_manager_handle=inference_manager_handle)
 
     # Add timeout protection to prevent indefinite blocking during initialization
     # The timeout is set to 120 seconds to allow sufficient time for:

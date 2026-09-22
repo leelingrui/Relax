@@ -46,8 +46,8 @@ def genrm_model_ids(args: Any) -> tuple[str, ...]:
     """The resolved GenRM instance keys, including the single-instance
     sentinel.
 
-    The keys are the model IDs: ``create_genrm_manager(s)`` passes them straight
-    through as the pool identities.
+    The keys are the model IDs: ``create_genrm_manager(s)`` passes them
+    straight through as the pool identities.
     """
     return tuple(getattr(args, "_genrm_instances_resolved", None) or ())
 
@@ -73,6 +73,7 @@ def deferred_opd_enabled(args: Any) -> bool:
     Colocate defaults to the deferred stage, which is where moving the teacher
     prefill out of the generation loop pays off; a dedicated-GPU teacher keeps
     scoring inline because nothing is waiting for its memory.
+
     ``--opd-deferred-scoring`` overrides the default in either direction.
     """
     from relax.utils.opd.opd_utils import is_managed_opd_teacher_colocate
@@ -113,8 +114,8 @@ def activation_group_name(contention: Any) -> str:
     """Name a group after the shared slice it protects.
 
     The placement-group key plus the lowest shared offset is stable across
-    processes, unlike a Python object identity, and it stays meaningful when one
-    placement group holds several independently contended regions.
+    processes, unlike a Python object identity, and it stays meaningful when
+    one placement group holds several independently contended regions.
     """
     offsets = tuple(getattr(contention, "reserved_offsets", ()) or (0,))
     return f"{getattr(contention, 'placement_group_key', 'pg')}@{min(offsets)}"
@@ -136,7 +137,8 @@ def phase_plans_from_contentions(
     *,
     deferred: Sequence[str] = (),
 ) -> tuple[PhasePlan, ...]:
-    """Build one plan per contended slice, plus one per unshared deferred phase.
+    """Build one plan per contended slice, plus one per unshared deferred
+    phase.
 
     A phase that shares GPUs with nothing normally needs no plan: it can stay
     active alongside every other phase, and giving it one would only add a

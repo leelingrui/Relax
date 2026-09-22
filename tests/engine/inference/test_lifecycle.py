@@ -39,7 +39,8 @@ from relax.engine.inference.types import LifecycleState, ModelRef, ReplicaSnapsh
 
 
 class FakeRuntime:
-    """The engine-side runtime: it owns occupation, mirroring ``_PoolRuntime``."""
+    """The engine-side runtime: it owns occupation, mirroring
+    ``_PoolRuntime``."""
 
     def __init__(self, *, fail_onload: bool = False, fail_offload: bool = False, leak: bool = False) -> None:
         self.onloaded = True
@@ -201,10 +202,10 @@ def test_manager_drain_waits_for_a_request_that_finishes_concurrently():
 def test_a_cancelled_request_is_recorded_but_left_to_the_engine_release_drain():
     """A cancel is not a completion, and not a reason to hold the slice.
 
-    Matching the behaviour that predates this control plane: the engine's release
-    path pauses admission, aborts what is in flight and only releases once
-    ``flush_cache`` confirms the scheduler is empty. Blocking here instead would
-    turn a client disconnect into a stuck activation group.
+    Matching the behaviour that predates this control plane: the engine's
+    release path pauses admission, aborts what is in flight and only releases
+    once ``flush_cache`` confirms the scheduler is empty. Blocking here instead
+    would turn a client disconnect into a stuck activation group.
     """
     manager, _ = build_manager()
     target = ModelRef(Role.GENRM, "judge")
@@ -666,7 +667,8 @@ def test_coordinator_release_evidence_blocks_the_next_activation_until_all_ranks
 def test_coordinator_rejects_a_stale_phase_handle():
     coordinator, _ = build_coordinator()
     handle = coordinator.enter_phase("colocate", "genrm", operation_id="op-genrm")
-    stale = replace(handle, token=replace(handle.token, coordinator_epoch="other-epoch"))
+    later_epoch = "epoch-of-a-rebuilt-coordinator"
+    stale = replace(handle, token=replace(handle.token, coordinator_epoch=later_epoch))
     with pytest.raises(LifecycleError, match="earlier coordinator"):
         coordinator.finish_phase(stale, operation_id="op-finish")
 

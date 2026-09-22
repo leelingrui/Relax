@@ -3,8 +3,8 @@
 """Owner-level phase coordination over externally hosted roles.
 
 The interesting property is the handover: entering a scoring phase must close
-generation admission, offload it, *confirm* the release from the host rather than
-from the fact that the call returned, and only then wake the scorer.
+generation admission, offload it, *confirm* the release from the host rather
+than from the fact that the call returned, and only then wake the scorer.
 """
 
 from dataclasses import replace
@@ -32,8 +32,8 @@ from relax.engine.inference.types import (
 class FakeHost:
     """A role host that only releases memory when actually asked to.
 
-    ``leak`` models a backend that answers the RPC while keeping the memory; the
-    owner must then refuse to hand the slice on.
+    ``leak`` models a backend that answers the RPC while keeping the memory;
+    the owner must then refuse to hand the slice on.
     """
 
     def __init__(self, role: Role, model_id: str, events: list, *, leak: bool = False, onloaded: bool = True) -> None:

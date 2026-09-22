@@ -69,9 +69,9 @@ DEFERRED_ORDER = (
 class SampleRef:
     """The sealed description of one sample's scoring contract.
 
-    Sealed at submit time and kept until a terminal state: it is what results are
-    correlated against, so a late or duplicated response cannot be mistaken for
-    the sample it claims to be.
+    Sealed at submit time and kept until a terminal state: it is what results
+    are correlated against, so a late or duplicated response cannot be mistaken
+    for the sample it claims to be.
     """
 
     sample_index: Any
@@ -248,7 +248,8 @@ def seal_batch(
 
 
 class DeferredExecutor:
-    """Run one deferred batch at a time, and never publish an incomplete one."""
+    """Run one deferred batch at a time, and never publish an incomplete
+    one."""
 
     def __init__(self, args: Any) -> None:
         self.args = args
@@ -270,7 +271,10 @@ class DeferredExecutor:
         payload: Any = None,
         is_last: bool = False,
     ) -> DeferredHandle:
-        """Register a staged batch. This does not make it trainable."""
+        """Register a staged batch.
+
+        This does not make it trainable.
+        """
         if not operation_id:
             raise ValueError("A deferred operation ID is required")
         existing = self._records.get(operation_id)
@@ -313,7 +317,8 @@ class DeferredExecutor:
         return record.snapshot
 
     async def wait_deferred(self, handle: DeferredHandle, *, timeout_s: float | None = None) -> DeferredResult:
-        """Wait for a terminal state; a timeout ends the wait, not the batch."""
+        """Wait for a terminal state; a timeout ends the wait, not the
+        batch."""
         record = self._records[handle.operation_id]
         if record.task is None:
             return record.snapshot

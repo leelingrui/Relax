@@ -43,10 +43,11 @@ def scoring_phase(args: Any, phase_id: str, *, batch_id: str | None = None) -> I
 
     Yields the ``PhaseHandle``, or ``None`` when this deployment does not
     sequence the phase. Entering drains and deactivates whatever occupied the
-    slice and confirms the release before the scorer is activated; leaving drains
-    and deactivates the scorer again. It never restores the previous occupant:
-    the training path onloads generation when it synchronizes weights, and an
-    extra restore here would cost a full weights and KV round trip.
+    slice and confirms the release before the scorer is activated; leaving
+    drains and deactivates the scorer again. It never restores the previous
+    occupant: the training path onloads generation when it synchronizes
+    weights, and an extra restore here would cost a full weights and KV round
+    trip.
     """
     del args
     from relax.distributed.ray.lifecycle_client import phase_client
@@ -106,11 +107,12 @@ async def async_scoring_phase(args: Any, phase_id: str, *, batch_id: str | None 
 
 
 async def async_activate_phase(phase_id: str, *, operation_id: str, timeout_s: float | None = None) -> Any:
-    """Activate ``phase_id`` from async code, or return ``None`` if unsequenced.
+    """Activate ``phase_id`` from async code, or return ``None`` if
+    unsequenced.
 
-    Used for the follow-up stage of a token selection that needs a second pass on
-    the student after the teacher scored: the student was deliberately offloaded
-    for the teacher, so it has to be brought back explicitly.
+    Used for the follow-up stage of a token selection that needs a second pass
+    on the student after the teacher scored: the student was deliberately
+    offloaded for the teacher, so it has to be brought back explicitly.
     """
     from relax.distributed.ray.lifecycle_client import phase_client
 

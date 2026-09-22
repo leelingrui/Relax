@@ -164,6 +164,10 @@ class TaskInferenceManager:
         self._operations: dict[str, OperationSnapshot] = {}
         self._role_pools: dict[Role, dict[str, Any]] = {}
         self._external_roles: set[Role] = set()
+        # The rollout engine pool, once this owner created it. It is one pool
+        # object covering every rollout model, unlike the static roles where
+        # each model has its own adapter.
+        self._rollout_pool: Any = None
         self._coordinator: LifecycleCoordinator | None = None
         # Compatibility-only request ledger for a legacy discovery host that
         # never registered its models here. Such a model has no pool bound, so
@@ -758,6 +762,60 @@ class TaskInferenceManager:
             return self._run_external_operation(role, model_id, method, *args, **kwargs)
         return self.call(role, model_id, method, *args, **kwargs)
 
+    @ray.method(concurrency_group="rollout")
+    def create_rollout_role(self, args: Any, placement_group: Any) -> dict[str, Any]:
+        """Create the rollout engines here, in the owner's own process.
+
+        The pool is built against this owner's role-scoped ``InferenceManager``
+        and placement ledger, so the rollout engines are registered, routed and
+        accounted for exactly like the static roles. Repeat calls reuse the
+        pool instead of starting a second one.
+
+        Returns the primary router endpoint: the pool starts the router in
+        this process, so the rollout process cannot observe that endpoint by
+        itself and has to write it back into its own ``args``.
+        """
+        from relax.distributed.ray.rollout import RolloutEnginePool
+
+        if self._rollout_pool is None:
+            manager = self._control_manager.for_role(Role.ROLLOUT)
+            pool = RolloutEnginePool(
+                args,
+                placement_group,
+                inference_manager=manager,
+                placement_ledger=self._placement_planner,
+            )
+            self._rollout_pool = pool
+            self._role_pools[Role.ROLLOUT] = pool.model_pools
+            self._operations["routes:rollout:startup"] = OperationSnapshot(
+                "routes:rollout:startup",
+                self.manager_epoch,
+                "completed",
+                "routes",
+                manager.snapshot().routing,
+            )
+        return self._rollout_pool.get_primary_router_address()
+
+    @ray.method(concurrency_group="rollout")
+    def rollout_operation(self, method: str, /, *args: Any, **kwargs: Any) -> Any:
+        """Run one engine-pool operation on the rollout pool this owner holds.
+
+        Only the rollout role's own Ray entry point calls this; the method
+        names are the engine-pool surface listed in
+        :data:`_ROLLOUT_POOL_METHODS`. Coroutine results are driven to
+        completion here so the owner stays a threaded actor: an async method
+        would put every blocking control-plane call (notably ``drain``) on a
+        single event loop.
+        """
+        if method not in _ROLLOUT_POOL_METHODS:
+            raise ValueError(f"Unsupported rollout pool method: {method}")
+        if self._rollout_pool is None:
+            raise RuntimeError("The rollout engine pool has not been created on this owner")
+        result = getattr(self._rollout_pool, method)(*args, **kwargs)
+        if asyncio.iscoroutine(result):
+            return asyncio.run(result)
+        return result
+
     def create_role(self, args: Any, role: Role | str, pool_configs: Mapping[str, Mapping[str, Any]]) -> None:
         role = Role(role)
         if role in self._role_pools:
@@ -799,6 +857,13 @@ class TaskInferenceManager:
 
     def shutdown_role(self, role: Role | str) -> None:
         role = Role(role)
+        if role is Role.ROLLOUT and self._rollout_pool is not None:
+            # dispose stops the monitor threads and closes the models through
+            # the same manager the pools are bound to.
+            self._rollout_pool.dispose()
+            self._rollout_pool = None
+            self._role_pools.pop(role, None)
+            return
         if role in self._role_pools:
             self._control_manager.shutdown(role=role)
             self._role_pools.pop(role, None)
@@ -826,7 +891,10 @@ class TaskInferenceManager:
             raise RuntimeError("Failed to shut down one or more inference roles") from errors[0]
 
 
-TaskInferenceManagerActor = ray.remote(num_cpus=1, num_gpus=0)(TaskInferenceManager)
+# Rollout engine operations get their own execution slots: a scale-out runs
+# for minutes and must not consume the slots the control plane needs for
+# admission, completion reports and drains.
+TaskInferenceManagerActor = ray.remote(num_cpus=1, num_gpus=0, concurrency_groups={"rollout": 8})(TaskInferenceManager)
 
 # A drain blocks inside this actor until the registered requests report
 # completion, and those reports arrive as calls on this same actor. One
@@ -835,7 +903,18 @@ _TASK_MANAGER_CONCURRENCY = 8
 
 
 def create_task_inference_manager(args: Any, runtime_env: dict[str, Any] | None = None) -> Any:
-    """Create the single task-level CPU inference control-plane actor."""
+    """Create the single task-level CPU inference control-plane actor.
+
+    It is pinned to the head node because it starts the SGLang routers and the
+    rest of the job resolves a router by the head node's address.
+    """
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    from relax.core.node_group_affinity import require_control_plane_resource_on_node
+    from relax.distributed.ray.placement_group import _get_head_node_id
+
+    head_node_id = _get_head_node_id()
+    require_control_plane_resource_on_node(args, head_node_id)
     return TaskInferenceManagerActor.options(
         **with_control_plane_affinity(
             args,
@@ -844,6 +923,7 @@ def create_task_inference_manager(args: Any, runtime_env: dict[str, Any] | None 
                 "num_gpus": 0,
                 "runtime_env": runtime_env,
                 "max_concurrency": _TASK_MANAGER_CONCURRENCY,
+                "scheduling_strategy": NodeAffinitySchedulingStrategy(node_id=head_node_id, soft=False),
             },
         )
     ).remote()
@@ -867,6 +947,49 @@ _POOL_METHODS = frozenset(
     }
 )
 _OWNED_KWARGS = frozenset({"inference_manager", "model_id", "defer_init", "placement_manager_handle"})
+
+# The rollout engine-pool surface the rollout Ray entry point may drive. It is
+# the pool's public API minus the pieces the owner drives itself (creation and
+# shutdown), kept explicit so no caller can reach an arbitrary attribute.
+_ROLLOUT_POOL_METHODS = frozenset(
+    {
+        "call",
+        "cancel_all_scale_out_requests",
+        "cancel_scale_out",
+        "check_weights",
+        "clear_num_new_engines",
+        "complete_inference_weight_update",
+        "create_scale_in_request",
+        "create_scale_out_request",
+        "execute_scale_in",
+        "execute_scale_out",
+        "get_discovery_snapshot",
+        "get_engines_info",
+        "get_primary_router_address",
+        "get_rollout_engines_and_lock",
+        "get_router_address",
+        "get_scale_in_status",
+        "get_scale_out_status",
+        "get_status",
+        "get_weight_sync_lock",
+        "health_monitoring_pause",
+        "health_monitoring_resume",
+        "inject_ci_fault",
+        "invalidate_inference_state",
+        "list_all_scale_in_requests",
+        "list_all_scale_out_requests",
+        "offload",
+        "onload",
+        "onload_kv",
+        "onload_weights",
+        "ready",
+        "recover_rollout_engines",
+        "refresh_inference_state",
+        "set_force_unhealthy",
+        "set_weight_updating",
+        "sync_weights_for_scaled_out_engines",
+    }
+)
 
 
 def _create_model_pool(role: Role, *args: Any, **kwargs: Any) -> Any:

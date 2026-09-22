@@ -4,8 +4,8 @@
 
 The batch is sealed at submit time, so the validator compares what came back
 against what was promised: presence, order, per-field row counts and the loss
-mask. A single unscored sample fails the whole batch rather than publishing rows
-whose distillation targets are missing.
+mask. A single unscored sample fails the whole batch rather than publishing
+rows whose distillation targets are missing.
 """
 
 import asyncio

@@ -332,6 +332,7 @@ class Rollout(Base):
         config: Namespace,
         data_source: Optional[Any] = None,
         runtime_env: Optional[dict] = None,  # pyright: ignore[reportMissingTypeArgument]
+        inference_manager_handle: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -340,7 +341,11 @@ class Rollout(Base):
         tq.init(self.config.tq_config)
         self.data_system_client = tq.get_client()
         self.rollout_manager, self.num_rollout_per_epoch = create_rollout_manager(
-            config, pg, data_source=data_source, runtime_env=runtime_env
+            config,
+            pg,
+            data_source=data_source,
+            runtime_env=runtime_env,
+            inference_manager_handle=inference_manager_handle,
         )
         self.step = 0
         self.data_source = data_source

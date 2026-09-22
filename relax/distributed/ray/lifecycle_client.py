@@ -3,11 +3,11 @@
 """Ray-side client for the task's lifecycle coordinator.
 
 Callers name the *phase* they need -- ``genrm``, ``teacher``, ``inference`` --
-never the activation group: the group is named after the shared GPU slice and is
-therefore only known once placement resolved. Every method degrades to ``None``
-or an empty result when the task has no coordinator, which is the normal case for
-a layout whose roles have their own GPUs; a caller then keeps its existing direct
-path instead of failing.
+never the activation group: the group is named after the shared GPU slice and
+is therefore only known once placement resolved. Every method degrades to
+``None`` or an empty result when the task has no coordinator, which is the
+normal case for a layout whose roles have their own GPUs; a caller then keeps
+its existing direct path instead of failing.
 """
 
 from typing import Any, Sequence
@@ -108,8 +108,8 @@ class PhaseClient:
     def release_all(self, *, operation_id: str, timeout_s: float | None = None) -> tuple[PhaseResult, ...]:
         """Empty every activation group and confirm each release.
 
-        This is the training handover: an empty target set drains and deactivates
-        whatever occupies the group and activates nothing.
+        This is the training handover: an empty target set drains and
+        deactivates whatever occupies the group and activates nothing.
         """
         results = []
         for group in self.activation_groups():
@@ -119,7 +119,8 @@ class PhaseClient:
         return tuple(results)
 
     def confirm_training_release(self, evidence: Any, *, operation_id: str) -> tuple[Any, ...]:
-        """Report training's release for every group it shares with inference."""
+        """Report training's release for every group it shares with
+        inference."""
         results = []
         for group in self.activation_groups():
             results.append(

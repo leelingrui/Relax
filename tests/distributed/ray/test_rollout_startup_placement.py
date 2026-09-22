@@ -122,23 +122,20 @@ def test_rollout_startup_failure_keeps_the_controller_owned_group(startup):
     assert ledger.release(_view(pg)).remove_placement_group is False
 
 
-def test_rollout_manager_uses_one_ledger_on_the_compatibility_path():
+def test_rollout_pool_uses_the_injected_ledger_for_every_call():
+    """The task owner's ledger is the only one; the pool has no fallback."""
     from conftest import create_test_manager
 
     manager = create_test_manager()
+    owner_ledger = object()
+    manager._placement_ledger = owner_ledger
 
-    # No task owner injected: the manager keeps a single planner of its own
-    # rather than a fresh ledger per call.
-    ledger = manager._placement_ledger
-    assert isinstance(ledger, PlacementPlanner)
-    assert manager._placement_ledger is ledger
+    assert manager._placement_ledger is owner_ledger
 
 
-def test_rollout_manager_prefers_the_task_owner_ledger():
-    from conftest import create_test_manager
+def test_rollout_pool_construction_requires_the_owner_ledger():
+    import inspect
 
-    manager = create_test_manager()
-    owner = object()
-    manager.task_inference_manager = owner
-
-    assert manager._placement_ledger is owner
+    parameters = inspect.signature(module.RolloutEnginePool.__init__).parameters
+    for name in ("inference_manager", "placement_ledger"):
+        assert parameters[name].default is inspect.Parameter.empty, f"{name} must stay required"

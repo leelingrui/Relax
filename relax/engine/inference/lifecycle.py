@@ -386,8 +386,7 @@ class LifecycleCoordinator:
     # Plans and validation.
     # ------------------------------------------------------------------
     def register_plan(self, plan: PhasePlan) -> PhasePlan:
-        """Register a fixed plan; re-registering an identical plan is a
-        no-op."""
+        """Register a fixed plan; an identical re-registration is a no-op."""
         with self._lock:
             previous = self._plans.get(plan.plan_id)
             if previous is not None:
@@ -521,8 +520,8 @@ class LifecycleCoordinator:
     ) -> SwitchResult:
         """Make ``target`` the sole occupant of ``activation_group``.
 
-        The current occupant comes from this Coordinator's own state, not from a
-        caller-supplied ``source_model``: a stale source would deactivate the
+        The current occupant comes from this Coordinator's own state, not from
+        a caller-supplied ``source_model``: a stale source would deactivate the
         wrong role. Switching never edits routing or the default model.
         """
         targets = (target,) if isinstance(target, ModelRef) else tuple(target)
@@ -544,7 +543,8 @@ class LifecycleCoordinator:
         timeout_s: float | None = None,
         tags: list[str] | None = None,
     ) -> PhaseResult:
-        """Activate a whole phase of the plan that owns ``activation_group``."""
+        """Activate a whole phase of the plan that owns
+        ``activation_group``."""
         plan, phase = self._resolve_phase_by_group(activation_group, target_phase)
         return self._execute(
             activation_group,

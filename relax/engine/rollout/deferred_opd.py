@@ -43,7 +43,8 @@ def deferred_opd_active(args: Any) -> bool:
 
 
 def required_scoring_fields(opd_manager: Any) -> tuple[str, ...]:
-    """The training fields the scorer must produce for every eligible sample."""
+    """The training fields the scorer must produce for every eligible
+    sample."""
     return tuple(field for field in opd_manager.schema_opd_transfer_data() if field not in _GENERATION_OWNED_FIELDS)
 
 
@@ -107,8 +108,8 @@ class DeferredOpdSession:
     ) -> None:
         """Stand in for ``transfer_batch_to_data_system`` and stage instead.
 
-        Keeps the helper's signature so the step's publication points do not have
-        to know whether scoring is deferred.
+        Keeps the helper's signature so the step's publication points do not
+        have to know whether scoring is deferred.
         """
         del args, data_system_client
         if not batch_samples:

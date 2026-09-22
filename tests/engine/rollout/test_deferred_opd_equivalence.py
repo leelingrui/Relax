@@ -3,10 +3,11 @@
 """Deferred scoring must produce exactly the immediate path's training fields.
 
 Same samples, same teacher responses: the only difference is *when* the teacher
-runs. If the deferred fields differed, the loss would see different distillation
-targets depending on the GPU layout, which is the one thing the deferred pipeline
-must not change. Out-of-order completion is included, because the whole point of
-correlating by sample identity is that arrival order must not matter.
+runs. If the deferred fields differed, the loss would see different
+distillation targets depending on the GPU layout, which is the one thing the
+deferred pipeline must not change. Out-of-order completion is included, because
+the whole point of correlating by sample identity is that arrival order must
+not matter.
 """
 
 import asyncio
@@ -104,7 +105,8 @@ def teacher_response(sample: Sample) -> LogprobResponse:
 
 
 def install_fake_teacher(opd: OpdManager, *, reverse_order: bool = False) -> list[int]:
-    """Answer every request from the sample identity, optionally out of order."""
+    """Answer every request from the sample identity, optionally out of
+    order."""
     completed: list[int] = []
 
     async def fake_post(session, url, payload, sample, err_tag):
@@ -199,9 +201,7 @@ def test_multimodal_and_multi_teacher_routing_keep_the_fields_identical(monkeypa
     args = build_args(opd_teacher_routes='{"math": "/math", "vl": "/vl"}')
     args.opd_teacher_routes_map = {"math": ["http://math:1/generate"], "vl": ["http://vl:1/generate"]}
     immediate = run_immediate(args, build_samples(multimodal=True, routes=True))
-    deferred, _published = run_deferred(
-        args, build_samples(multimodal=True, routes=True), monkeypatch=monkeypatch
-    )
+    deferred, _published = run_deferred(args, build_samples(multimodal=True, routes=True), monkeypatch=monkeypatch)
     assert deferred == immediate
 
 

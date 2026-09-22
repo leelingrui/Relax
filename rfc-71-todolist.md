@@ -237,14 +237,38 @@ Phase 3 验收：
 
 目标：在 Phase 3 控制面和 Phase 4 placement ledger 稳定后，Rollout 负责生成业务，统一 Manager 负责所有角色的引擎创建、资源和生命周期。
 
-- [ ] 将生成、评估、数据源、奖励后处理和队列传输归入 RolloutWorkload。
-- [ ] 引擎创建、资源所有权、恢复和关闭完全迁入统一 Manager。
+### 6A：RolloutWorkload 与引擎池分离
+
+- [x] 将生成、评估、数据源、奖励后处理和队列传输归入 RolloutWorkload。新增 `relax/engine/rollout/workload.py`：`RolloutWorkload` 持有 data_source、TQ client、可热重载的 rollout/eval/reward/convert 函数、rollout_id、dynamic global batch size、tokenizer 与 debug dump；`ReloadScope.ROLLOUT_MANAGER` 的属性随之迁到 workload，`RolloutManager` 不再继承 `ReloadableMixin`，改为显式转发 5 个 reload 入口。workload 只通过 `RolloutInferencePort`（`resume_health_monitoring`/`inject_ci_fault`/`onload_kv`/`router_base_url`）访问推理侧，不持有 `RolloutServer`/`EngineGroup`/引擎 actor handle。`RolloutManager` 保留同名 Ray 方法作为薄转发，`RolloutService`、SFT predict、训练 actor 的调用不变。
+
+### 6B：Rollout 引擎池迁入统一 Manager 进程
+
+- [x] 引擎创建、资源所有权、恢复和关闭完全迁入统一 Manager。分两步完成：
+  - 6B-1 进程内拆分：`RolloutManager` 拆为 `RolloutEnginePool`（引擎、placement、健康、权重同步、伸缩、关闭）和 Ray actor 外壳；外壳只保留 workload 转发和引擎转发，不再持有任何引擎状态。
+  - 6B-2 进程级迁移：`TaskInferenceManager.create_rollout_role(args, pg)` 在 owner 自己的进程里创建 `RolloutEnginePool`，用 owner 的 `for_role(ROLLOUT)` 视图和 `PlacementPlanner` 实例，engine actor handle 全部落在 owner 进程；`Role.ROLLOUT` 进入 `_role_pools`，discovery/准入/lifecycle 走 `_control_manager`，不再经 `_ExternalPoolRuntime` 回调 host。`RolloutManager._engine/_engine_async` 通过 owner 的 `rollout_operation`（显式白名单 `_ROLLOUT_POOL_METHODS`）转发；`dispose` 转为 `shutdown_role(ROLLOUT)`。
+  - 配套：owner actor 增加 `rollout` 并发组（长耗时 scale-out 不占用控制面槽位），并固定到 head node（router 在 owner 进程内启动，作业按 head node 地址解析 router）；`start_rollout_servers` 写回的 router 端点由 `create_rollout_role` 返回、rollout 进程写回自己的 `args`。
+
+### 6C：删除 Rollout 侧兼容回退（原属 Phase 7 清理项，前置已满足）
+
+- [x] 删除 `RolloutManager` 的本地 pool 回退：owner handle 变必填（缺失即 `ValueError`），`_engine`/`_engine_async`/`dispose` 收敛为单一 owner 路径。`Controller.register_all_serve` 先建 owner 再建 Service（`controller.py:734` 早于 `:493`），生产路径不可能走到回退。
+
+- [x] 删除 Rollout 侧的 role-local placement 回退：`RolloutEnginePool.__init__` 的 `inference_manager`/`placement_ledger` 变必填，`_placement_ledger` 由多级回退 property 改为注入属性，`start_rollout_servers` 的 `placement_manager_handle` 变必填。GenRM/Teacher 的同类回退（`genrm.py`、`teacher_manager.py`、`placement_group.py`、`opd_utils.py`）绑定在无 task handle 的 `InferenceRoleManager` 分支上，不是死代码，仍归 Phase 7。
+
+- [x] 修复 6B 引入的生产缺陷：`init_http_client` 随引擎池迁入 owner 进程后，rollout 进程不再初始化全局 httpx 客户端，而生成路径（`sglang_rollout.py` 的 `post`/`get`）就在该进程，首个 rollout step 必然 `AttributeError: 'NoneType' object has no attribute 'post'`。已在 `RolloutManager.__init__` 补一次幂等初始化。
+
+- [x] 修复 6B 引入的事件循环阻塞：`_ManagerInferencePort.resume_health_monitoring`/`inject_ci_fault` 原为同步方法，在 workload 的 async 生成路径上直接 `ray.get` 跨进程等待，owner 的 `rollout` 组被 scale-out 占满时会停住整个 rollout 事件循环（连带所有在途 HTTP 生成）。已改为 async 并走 `_engine_async`。
+
 - [ ] 将 Phase 3 遗留的 EngineGroupSpec 运行时创建、稳定副本身份和 PD Router 投影接入统一 EnginePool。
+
 - [ ] 将 GenRM/Teacher 专用 SGLang 初始化合并到公共 SGLangEngine/EnginePool 路径。
+
 - [ ] 将 Rollout 的 weights/KV 分阶段恢复、权重锁、恢复五元组和伸缩协议适配为统一 Manager 操作。
-- [ ] workload 通过明确接口请求推理和阶段切换，不直接操作 GPU bundles 或私有引擎对象。
+
+- [x] workload 通过明确接口请求推理和阶段切换，不直接操作 GPU bundles 或私有引擎对象。6A 的 `RolloutInferencePort` 即此接口，`RolloutWorkload` 内无 placement group、`RolloutServer`/`EngineGroup` 或引擎 actor handle。遗留尾巴：`workload.py` 仍反向 import `relax.distributed.ray.rollout._log_eval_rollout_data`，该函数应下沉到 `engine/` 或 `utils/metrics`。
+
 - [ ] 迁移训练侧权重同步与 manager 连接点。
-- [ ] 检查 Agentic、Autoscaler、评估和 SFT predict 等兼容调用方。
+
+- [x] 检查 Agentic、Autoscaler、评估和 SFT predict 等兼容调用方。SFT predict 走 `generate_predict`/`run_predict`/`offload`（`engine/sft/predict/loop.py:197`、`runner.py:110,129`），外壳均保留同名方法；`engine/rollout/scoring_phase.py:35` 读的 `task_inference_manager` 属性仍在外壳上；Agentic（自行 `init_http_client`）与 Autoscaler（`utils/scale_utils.py`）不直接引用 RolloutManager 属性。
 
 验收：
 
@@ -706,4 +730,12 @@ GenRM defer 示例在后处理内执行 Rollout offload → named GenRM onload �
 - 2026-09-22 Phase 5A 修正的真实缺陷：`_ExternalPoolRuntime.is_onloaded` 原先返回本地缓存，等于"调用过 offload 就算释放"，现改为向 host 查询且不可达时报告仍占用；`RolloutManager.call("onload"/"offload")` 原先直达 pool，绕过 `_offload_local` 的健康监控暂停与 `status`，现改走自身入口；`TaskInferenceManagerActor` 原为单并发槽，drain 会因等不到 `complete_request` 而必然超时，现设 `max_concurrency` 并为非 RPC 的复合更新加锁。阻塞原因区分 `inference`/`training`：推理侧未确认释放可由重试排空恢复，训练侧 ranks 未确认则绝对拒绝（重排推理引擎对训练占用的显存无效）。
 - 2026-09-22 Phase 5A 接线：`Controller.register_all_serve` 末尾创建任务级 coordinator（已获确认的受保护改动）；`Service.set_inference_manager` → `Actor` → `ActorGroup` → `TrainRayActor` 注入 owner handle；megatron actor 的 `train()`/`update_weights()` 经 coordinator 释放与上报，保留 gloo 屏障与 weights/KV 两段恢复。
 - 2026-09-22 Phase 5B Deferred OPD：新增 `relax/engine/rollout/deferred.py`（sealed BatchRef、固定状态序、校验、批间串行执行器）、`relax/engine/rollout/deferred_opd.py`（步内 staging、步末 flush、teacher/student 两阶段）与 `relax/engine/rollout/scoring_phase.py`（同步/异步阶段上下文）。`OpdManager` 拆出可独立调度的评分阶段，即时路径行为不变。修正 `is_last` 未从 staged 记录传入 `submit_deferred` 的缺陷（会让流式分区永不关闭）。
+- 2026-09-22 Phase 6B 修复两个 Phase 3 引入、CPU 回归覆盖不到的生产缺陷（都发生在真实 Ray actor 创建/部署时）：
+  - `RolloutManager` 的 `ready`/`call` 带 `@ray.method(concurrency_group="control")`，但类上没有声明 `control` 组。Ray 在 `ActorClass._remote` 里 `assert cg_name in concurrency_groups_dict`，因此 `RolloutManager.remote(...)` 必然 AssertionError——rollout 角色自 Phase 3 起无法启动。已补声明 `"control": 1`，并新增静态回归 `test_every_declared_concurrency_group_exists`（不需要起 Ray）。
+  - `Service._deploy` 对 role=="rollout" 传 `inference_manager_handle`，但 `components/rollout.py::Rollout.__init__` 没有这个参数，`serve.run` 绑定即 TypeError。已在 `Rollout.__init__` 和 `create_rollout_manager` 补齐参数并透传到 `RolloutManager`——这同时是 6B 所需的 owner handle 通路。
+- 2026-09-22 Phase 6B 回归：新增 `tests/distributed/ray/test_rollout_owner_pool.py`（14 项：owner 建池/幂等/路由 operation 记录/`rollout_operation` 同步与协程/白名单拒绝/无池报错/`shutdown_role`/`shutdown_all`/白名单方法存在性/入口转发/协程转发/`dispose` 走 owner/router 端点写回/并发组声明）。`tests/distributed/ray` + `tests/components` + `tests/core` `639 passed`，`tests/distributed/ray` + `tests/engine` `1054 passed`；改动文件 pre-commit 与仓库级 gitleaks 通过。真实 Ray/多节点 GPU 启动验收未执行：未提供集群与硬件配置。
+- 2026-09-22 记录：`pre-commit run --all-files` 会重排 Phase 5A 落地的 9 个文件的 docstring（`lifecycle_client.py`、`lifecycle.py`、`phase_plans.py`、`deferred.py`、`deferred_opd.py`、`scoring_phase.py` 及对应 4 个测试），说明 `c6b5e52` 实际未通过全仓 pre-commit。这些与 Phase 6 无关，但为让分支重新通过全仓 pre-commit，已随 Phase 6 提交一并纳入。docformatter 原本会把两个标识符折断（`--opd-deferred-scoring`、`no-op`），已改写这两处措辞消除折断：`phase_plans.py` 把标志名单独成段，`lifecycle.py` 的 summary 缩短到一行内。docformatter 1.3.1 无行内豁免机制，只能靠措辞规避。
+- 2026-09-22 Phase 6A RolloutWorkload：`relax/distributed/ray/rollout.py` 的 `RolloutManager` 由 3800 行的"引擎池 + 业务"合体拆为"引擎池 + 转发"，生成业务移入 `relax/engine/rollout/workload.py`。`tests/distributed/ray/conftest.py::create_test_manager` 补 workload 占位（`rollout_id` 现为只读转发属性）。回归：`tests/distributed/ray` + `tests/engine/rollout` `631 passed`，`tests/components` + `tests/core` + `tests/engine` + agentic/metrics `711 passed`；改动文件 pre-commit（ruff/ruff-format/docformatter）通过。仓库级 gitleaks 在 `tests/engine/inference/test_lifecycle.py:669`（Phase 5A 引入的 `coordinator_epoch="other-epoch"`）报误判，已改为局部变量后通过。
+- 2026-09-23 Phase 6C 发现（留给 Phase 7）：删除 Rollout 侧回退后，`TaskInferenceManager.register_external_role` 在生产代码中已无调用方（仅 `tests/distributed/ray/test_inference_role.py` 与 `test_lifecycle_coordination.py` 使用），external-role 注册路径随 `InferenceRoleManager` 分支一并退役。
+- 2026-09-23 Phase 6C：删除 Rollout 侧两条兼容回退（本地 pool、role-local placement ledger），并修复 6B 引入的两个生产缺陷（rollout 进程缺 `init_http_client`、推理端口同步 `ray.get` 阻塞生成事件循环）。`start_rollout_servers` 失败回滚路径里残留的 `ledger` 变量一并改为参数本身。回归：`tests/distributed/ray` + `tests/core` + `tests/components` `654 passed`。测试调整：`conftest.create_test_manager` 显式注入 ledger；`test_rollout_startup_placement` 的两个兼容路径用例改写为"只用注入的 ledger"与"构造参数必填"；`test_rollout_owner_pool` 补"无 owner 拒绝启动"。真实 Ray/GPU 验收仍未执行。
 - 2026-09-22 Phase 5 回归：新增 `tests/engine/inference/test_lifecycle.py`(30)、`test_phase_plans.py`(8)、`test_gateway_cancellation.py`(9)、`tests/distributed/ray/test_lifecycle_coordination.py`(13)、`tests/engine/rollout/test_deferred_opd.py`(19)、`test_deferred_opd_session.py`(8)、`test_deferred_opd_equivalence.py`(5)。`tests/core` 修正一处测试缺陷：`test_controller_s3_cleanup_runs_after_initial_sync_before_service_run` 用 `__new__` 手工装配 Controller，未跟上新增的 `_inference_manager_handle`（生产代码 `__init__` 已初始化，故修测试）。真实 Ray/多节点 GPU 阶段切换验收未执行：未提供集群与硬件配置。

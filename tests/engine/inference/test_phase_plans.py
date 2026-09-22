@@ -5,8 +5,8 @@ guesswork.
 
 The property under test is that a layout is only sequenced when it has to be: a
 GenRM that shares the rollout bundles while staying resident must not be
-serialized against generation, while a deferred scorer must be sequenced whether
-or not it shares a slice.
+serialized against generation, while a deferred scorer must be sequenced
+whether or not it shares a slice.
 """
 
 from types import SimpleNamespace
@@ -97,7 +97,8 @@ def test_deferred_genrm_on_shared_bundles_becomes_one_plan():
 
 
 def test_deferred_scorer_without_a_shared_slice_still_gets_its_own_plan():
-    """Deferred means "asleep outside its stage", which needs sequencing too."""
+    """Deferred means "asleep outside its stage", which needs sequencing
+    too."""
     args = build_args(_genrm_instances_resolved={"a": {}}, defer_reward_to_post_process=True)
     targets = phase_targets_from_args(args, roles=["rollout", "genrm"])
     plans = phase_plans_from_contentions(targets, (), deferred=deferred_phases(args))

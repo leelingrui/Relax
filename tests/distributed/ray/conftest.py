@@ -23,21 +23,15 @@ try:
 
     from relax.distributed.ray.rollout import (
         EngineGroup,
+        RolloutEnginePool,
         RolloutServer,
     )
+    from relax.engine.inference.placement import PlacementPlanner
 
-    # Extract the original Python class from the Ray actor wrapper so we can
-    # create lightweight instances without calling the heavy __init__.
-    from relax.distributed.ray.rollout import RolloutManager as _RayRM
-
-    # Ray's ActorClass stores the original Python class at
-    # __ray_metadata__.modified_class (Ray 2.x).
-    _meta = getattr(_RayRM, "__ray_metadata__", None)
-    _OriginalRM = getattr(_meta, "modified_class", None) or _RayRM
     HAS_DEPS = True
 except ImportError:
     HAS_DEPS = False
-    _OriginalRM = None
+    RolloutEnginePool = None
 
 
 # ---------------------------------------------------------------------------
@@ -213,18 +207,23 @@ def make_rollout_server(
 # Testable RolloutManager factory
 # ---------------------------------------------------------------------------
 def create_test_manager(args=None, servers=None):
-    """Create a ``RolloutManager`` instance for testing.
+    """Create a ``RolloutEnginePool`` instance for testing.
 
+    The pool owns the engines, placement and scaling state that these tests
+    exercise; the Ray actor shell (``RolloutManager``) only forwards to it.
     Bypasses ``__init__`` entirely and sets up the minimal state needed by the
     scaling methods.
     """
-    if _OriginalRM is None:
+    if RolloutEnginePool is None:
         pytest.skip("Cannot create test manager: dependencies missing")
     if args is None:
         args = make_mock_args()
 
-    manager = object.__new__(_OriginalRM)
+    manager = object.__new__(RolloutEnginePool)
     manager.args = args
+    # Production injects the task owner's single ledger; the pool has no
+    # fallback of its own, so the factory has to supply one.
+    manager._placement_ledger = PlacementPlanner()
     manager.servers = servers if servers is not None else {}
     manager._scale_out_requests = {}
     manager._scale_in_requests = {}

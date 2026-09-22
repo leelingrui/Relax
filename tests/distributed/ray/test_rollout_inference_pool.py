@@ -53,7 +53,6 @@ def _manager(groups: list[Any]) -> Any:
     server = make_rollout_server(engine_groups=groups)
     manager = create_test_manager(servers={"default": server})
     manager.status = "onload"
-    manager.rollout_id = 1
     manager.rollout_engine_lock = MagicMock()
     manager.inference_manager = InferenceManager(Role.ROLLOUT)
     manager.inference_manager.register_model(
