@@ -5,7 +5,7 @@ admission."""
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, NamedTuple
 
 
 class Role(str, Enum):
@@ -194,3 +194,19 @@ class RouteTarget:
 
     model_id: str
     base_url: str
+
+
+class RolloutEngineWiring(NamedTuple):
+    """What a training backend needs to open its weight-sync channel.
+
+    A tuple rather than a dataclass because the training backends unpack it
+    positionally; the names are here so a field cannot be read out of order.
+    ``num_new_engines`` counts the engines added since the last sync, which is
+    what tells the backend whether the channel has to be rebuilt at all.
+    """
+
+    engines: list
+    engine_lock: Any
+    num_new_engines: int
+    engine_gpu_counts: list
+    engine_gpu_offsets: list

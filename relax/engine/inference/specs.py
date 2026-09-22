@@ -22,11 +22,20 @@ class ReplicaSpec:
             raise ValueError("Node ranks must be unique and non-negative")
 
 
-def replicas_from_slots(prefix: str, num_slots: int, nodes_per_engine: int) -> tuple[ReplicaSpec, ...]:
+def replicas_from_slots(
+    prefix: str, num_slots: int, nodes_per_engine: int, *, first_slot: int = 0
+) -> tuple[ReplicaSpec, ...]:
+    """Name the replicas of one engine group.
+
+    ``first_slot`` offsets the identity, not the node ranks: a group that
+    starts at engine slot N names its replicas from N while its ranks stay
+    local to the group. That keeps an identity stable for the life of the
+    replica even when another group is added or removed around it.
+    """
     if num_slots < 0 or nodes_per_engine < 1 or num_slots % nodes_per_engine:
         raise ValueError("Engine slots must contain complete logical replicas")
     return tuple(
-        ReplicaSpec(f"{prefix}/replica-{head}", tuple(range(head, head + nodes_per_engine)))
+        ReplicaSpec(f"{prefix}/replica-{first_slot + head}", tuple(range(head, head + nodes_per_engine)))
         for head in range(0, num_slots, nodes_per_engine)
     )
 

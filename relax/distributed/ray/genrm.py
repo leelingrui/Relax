@@ -133,7 +133,15 @@ class GenRMEngineAdapter:
         return getattr(backend, name)
 
     def _build_engine_init_kwargs(self, rank: int, addr_and_ports: dict) -> dict:
-        return {**addr_and_ports, "router_ip": self.router_ip, "router_port": self.router_port}
+        # The judge's weights are static, so it never joins DCS; it registers
+        # at its own Router as soon as it has one, like the teacher does.
+        return {
+            **addr_and_ports,
+            "router_ip": self.router_ip,
+            "router_port": self.router_port,
+            "skip_dcs_registration": True,
+            "skip_router_registration": not bool(self.router_ip and self.router_port),
+        }
 
     def shutdown(self) -> None:
         from relax.distributed.ray.rollout import stop_launched_routers

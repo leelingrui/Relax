@@ -811,6 +811,25 @@ class TaskInferenceManager:
             raise ValueError(f"Unsupported rollout pool method: {method}")
         if self._rollout_pool is None:
             raise RuntimeError("The rollout engine pool has not been created on this owner")
+        if method not in _ROLLOUT_TRACKED_OPERATIONS:
+            return self._run_rollout_method(method, *args, **kwargs)
+
+        # An elastic operation is recorded like every other role's, so one
+        # ``get_operation`` answers for the whole task. Only the externally
+        # triggered ones are recorded: onload/offload and recovery run on every
+        # training step and would grow this ledger without bound.
+        request_id = args[0] if args and isinstance(args[0], str) else uuid4().hex
+        operation_id = f"{method}:{Role.ROLLOUT.value}:{request_id}"
+        self._operations[operation_id] = OperationSnapshot(operation_id, self.manager_epoch, "running", method)
+        try:
+            result = self._run_rollout_method(method, *args, **kwargs)
+        except Exception as exc:
+            self._operations[operation_id] = replace(self._operations[operation_id], status="failed", error=str(exc))
+            raise
+        self._operations[operation_id] = replace(self._operations[operation_id], status="completed", result=result)
+        return result
+
+    def _run_rollout_method(self, method: str, /, *args: Any, **kwargs: Any) -> Any:
         result = getattr(self._rollout_pool, method)(*args, **kwargs)
         if asyncio.iscoroutine(result):
             return asyncio.run(result)
@@ -947,6 +966,19 @@ _POOL_METHODS = frozenset(
     }
 )
 _OWNED_KWARGS = frozenset({"inference_manager", "model_id", "defer_init", "placement_manager_handle"})
+
+# The elastic operations an outside caller triggers, and which therefore get a
+# recorded operation. Per-step traffic (onload/offload, recovery) is left out
+# on purpose: recording it would grow the owner's ledger for the whole run.
+_ROLLOUT_TRACKED_OPERATIONS = frozenset(
+    {
+        "cancel_all_scale_out_requests",
+        "cancel_scale_out",
+        "execute_scale_in",
+        "execute_scale_out",
+        "sync_weights_for_scaled_out_engines",
+    }
+)
 
 # The rollout engine-pool surface the rollout Ray entry point may drive. It is
 # the pool's public API minus the pieces the owner drives itself (creation and

@@ -540,3 +540,41 @@ def test_multi_instance_genrm_slices_do_not_collide_in_one_ledger():
         "genrm/judge-a/replica-0",
         "genrm/judge-b/replica-0",
     }
+
+
+def test_genrm_init_uses_own_router_without_dcs():
+    """The judge's static weights never join DCS; the adapter says so.
+
+    This used to be hardcoded in a ``GenRMEngine.init`` override, which meant
+    the judge could not start through the common engine path.
+    """
+    from relax.distributed.ray.genrm import GenRMEngineAdapter
+
+    adapter = object.__new__(GenRMEngineAdapter)
+    adapter.router_ip = "genrm-router"
+    adapter.router_port = 3200
+    addr = {"host": "judge.test", "port": 16000, "nccl_port": 16001, "dist_init_addr": "judge.test:16002"}
+
+    result = adapter._build_engine_init_kwargs(0, addr)
+
+    assert result == dict(
+        addr,
+        router_ip="genrm-router",
+        router_port=3200,
+        skip_dcs_registration=True,
+        skip_router_registration=False,
+    )
+    assert "skip_dcs_registration" not in addr
+
+
+def test_genrm_without_a_router_skips_router_registration():
+    """debug_train_only leaves the judge with no router to register at."""
+    from relax.distributed.ray.genrm import GenRMEngineAdapter
+
+    adapter = object.__new__(GenRMEngineAdapter)
+    adapter.router_ip = ""
+    adapter.router_port = 0
+
+    result = adapter._build_engine_init_kwargs(0, {})
+
+    assert result["skip_router_registration"] is True

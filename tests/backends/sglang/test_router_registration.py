@@ -432,8 +432,9 @@ def test_static_engine_uses_common_startup_without_policy_load_plan(
     else:
         engine._init_normal.assert_called_once_with(compute.return_value[0], apply_policy_load_plan=False)
         engine._init_external.assert_not_called()
-    if genrm:
-        assert engine._skip_router_registration is True
+    # Both classes take the same startup path; what a static role skips is
+    # decided by its adapter's init kwargs, not by the engine class.
+    assert engine._skip_router_registration is False
 
 
 def test_genrm_engine_defaults_to_checkpoint_weights(sglang_engine_module):

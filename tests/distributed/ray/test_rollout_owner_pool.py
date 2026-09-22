@@ -34,12 +34,11 @@ class _FakePool:
 
     instances: list["_FakePool"] = []
 
-    def __init__(self, args, pg, *, inference_manager=None, placement_ledger=None, task_inference_manager=None):
+    def __init__(self, args, pg, *, inference_manager, placement_ledger):
         self.args = args
         self.pg = pg
         self.inference_manager = inference_manager
         self.placement_ledger = placement_ledger
-        self.task_inference_manager = task_inference_manager
         self.model_pools = {"default": object()}
         self.disposed = False
         self.calls: list[tuple] = []
@@ -55,6 +54,12 @@ class _FakePool:
     async def offload(self):
         self.calls.append(("offload",))
         return "offloaded"
+
+    async def execute_scale_out(self, request_id):
+        self.calls.append(("execute_scale_out", request_id))
+        if request_id == "doomed":
+            raise RuntimeError("engine bring-up failed")
+        return f"scaled:{request_id}"
 
     def dispose(self) -> None:
         self.disposed = True
@@ -76,8 +81,8 @@ def test_create_rollout_role_builds_the_pool_on_the_owner_manager_and_ledger(own
     assert pool.inference_manager.role is Role.ROLLOUT
     assert pool.inference_manager.manager_epoch == owner._control_manager.manager_epoch
     assert pool.placement_ledger is owner._placement_planner
-    # The owner holds the pool directly, so there is no host to call back into.
-    assert pool.task_inference_manager is None
+    # The owner holds the pool directly, so the pool takes no handle back to it.
+    assert not hasattr(pool, "task_inference_manager")
     assert owner._role_pools[Role.ROLLOUT] is pool.model_pools
 
 
@@ -245,3 +250,40 @@ def test_every_declared_concurrency_group_exists() -> None:
     for name in dir(metadata.modified_class):
         group = getattr(getattr(metadata.modified_class, name), "__ray_concurrency_group__", None)
         assert group is None or group in declared, f"{name} -> {group}"
+
+
+# ======================== recorded elastic operations ======================
+
+
+def test_an_elastic_operation_is_recorded_under_its_request_id(owner: TaskInferenceManager) -> None:
+    """One ``get_operation`` has to answer for rollout like every other
+    role."""
+    owner.create_rollout_role(SimpleNamespace(), "pg-handle")
+
+    assert owner.rollout_operation("execute_scale_out", "req-7") == "scaled:req-7"
+
+    operation = owner.get_operation("execute_scale_out:rollout:req-7")
+    assert (operation.status, operation.kind, operation.result) == ("completed", "execute_scale_out", "scaled:req-7")
+    assert operation.owner_epoch == owner.manager_epoch
+
+
+def test_a_failed_elastic_operation_is_recorded_and_still_raises(owner: TaskInferenceManager) -> None:
+    owner.create_rollout_role(SimpleNamespace(), "pg-handle")
+
+    with pytest.raises(RuntimeError, match="engine bring-up failed"):
+        owner.rollout_operation("execute_scale_out", "doomed")
+
+    operation = owner.get_operation("execute_scale_out:rollout:doomed")
+    assert operation.status == "failed"
+    assert "engine bring-up failed" in operation.error
+
+
+def test_per_step_traffic_leaves_no_operation_behind(owner: TaskInferenceManager) -> None:
+    """Recording every onload would grow the ledger for the whole run."""
+    owner.create_rollout_role(SimpleNamespace(), "pg-handle")
+
+    owner.rollout_operation("get_status")
+    owner.rollout_operation("offload")
+
+    recorded = [key for key in owner._operations if "rollout" in key and not key.startswith("routes:")]
+    assert recorded == []

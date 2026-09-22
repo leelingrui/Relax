@@ -1214,7 +1214,7 @@ def _get_engines(args, data_system_client):
         # No ray installed, or no current actor (driver process / unit tests).
         logger.debug(f"native generate_rollout: not inside a Ray actor ({e}); trying the data client.")
     if manager is not None:
-        engines, *_rest = ray.get(manager.get_rollout_engines_and_lock.remote())
+        engines = ray.get(manager.get_rollout_engines_and_lock.remote()).engines
         if engines:
             return list(engines)
 

@@ -2509,9 +2509,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.recover_rollout_engines.remote())
             dist.barrier(group=get_gloo_group())
 
-        rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
-            self.rollout_manager.get_rollout_engines_and_lock.remote()
-        )
+        wiring = ray.get(self.rollout_manager.get_rollout_engines_and_lock.remote())
+        rollout_engines = wiring.engines
+        rollout_engine_lock = wiring.engine_lock
+        num_new_engines = wiring.num_new_engines
+        engine_gpu_counts = wiring.engine_gpu_counts
+        engine_gpu_offsets = wiring.engine_gpu_offsets
 
         # Disaggregate PPO tears down the actor↔rollout NCCL groups on sleep(),
         # so we must wake_up() fully (not just reload_process_groups) and force

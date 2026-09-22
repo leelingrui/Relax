@@ -1466,29 +1466,6 @@ class GenRMEngine(SGLangEngine):
         kwargs.pop("num_gpus_per_engine", None)
         return _compute_genrm_server_args(*args, **kwargs)
 
-    def init(
-        self,
-        dist_init_addr,
-        port,
-        nccl_port,
-        host=None,
-        disaggregation_bootstrap_port=None,
-        router_ip="",
-        router_port=0,
-    ):
-        """Compatibility facade for the common static-engine startup path."""
-        return super().init(
-            dist_init_addr,
-            port,
-            nccl_port,
-            host=host,
-            disaggregation_bootstrap_port=disaggregation_bootstrap_port,
-            router_ip=router_ip,
-            router_port=router_port,
-            skip_dcs_registration=True,
-            skip_router_registration=not bool(router_ip and router_port),
-        )
-
     def release_memory_occupation(self):
         # GenRM is colocated on the training GPUs, so it must offload at the
         # rollout->train transition. Two failure modes are defended against here:
@@ -1584,6 +1561,67 @@ def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None)
     return speculative_algorithm is not None
 
 
+def _finalize_server_args(
+    args,
+    kwargs: dict,
+    *,
+    rank,
+    worker_type: str,
+    overrides: dict | None,
+    overrides_label: str,
+) -> tuple[dict, list]:
+    """Turn a role's base server arguments into the final ServerArgs kwargs.
+
+    Every role builds its own base ``kwargs`` -- the model, the parallel sizes
+    and the memory policy genuinely differ -- but from here on the assembly is
+    the same: inherit the ``--sglang-*`` defaults for anything the role left
+    open, apply that role's overrides on top, then drop whatever the installed
+    SGLang does not know about.
+
+    An override naming a field this SGLang has no idea about is dropped with a
+    warning instead of reaching ``ServerArgs(**kwargs)``, where it would be a
+    TypeError at engine startup.
+    """
+    external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
+
+    server_arg_fields = dataclasses.fields(ServerArgs)
+    server_arg_field_names = {attr.name for attr in server_arg_fields}
+    unused_keys = set(kwargs.keys())
+    for attr in server_arg_fields:
+        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
+            continue
+        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
+            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
+        unused_keys.discard(attr.name)
+
+    for key, value in (overrides or {}).items():
+        if key not in server_arg_field_names:
+            logger.info(
+                f"Warning: {overrides_label} key {key!r} is not a ServerArgs field in the installed SGLang; dropping."
+            )
+            continue
+        if key in kwargs and kwargs[key] != value:
+            logger.info(f"{overrides_label}: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
+        kwargs[key] = value
+        unused_keys.discard(key)
+
+    if (
+        "cuda_graph_backend_prefill" in server_arg_field_names
+        and kwargs.get("enable_memory_saver")
+        and kwargs.get("cuda_graph_backend_prefill") is None
+    ):
+        # Breakable is SGLang's default prefill backend on CUDA, but it is incompatible with memory saver mode.
+        kwargs["cuda_graph_backend_prefill"] = "disabled"
+
+    # for compatibility with old args
+    if len(unused_keys) > 0:
+        logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")
+        for key in unused_keys:
+            kwargs.pop(key)
+
+    return kwargs, external_engine_need_check_fields
+
+
 def _compute_genrm_server_args(
     args,
     rank,
@@ -1667,40 +1705,15 @@ def _compute_genrm_server_args(
         kwargs["enable_return_routed_experts"] = True
     if args.fp16:
         kwargs["dtype"] = "float16"
-    external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
-    unused_keys = set(kwargs.keys())
-    for attr in dataclasses.fields(ServerArgs):
-        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
-            continue
-        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
-            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
-        unused_keys.discard(attr.name)
-
-    # Per-genrm overrides from --genrm-engine-config. Applied after base args
-    # and sglang_* defaults so user-supplied keys take highest priority. Keys
-    # not recognized by the installed SGLang ServerArgs are dropped with a
-    # warning rather than causing a TypeError at ServerArgs(**kwargs).
-    server_arg_fields = {f.name for f in dataclasses.fields(ServerArgs)}
-    for key, value in (args.genrm_engine_config or {}).items():
-        if key not in server_arg_fields:
-            logger.info(
-                f"Warning: --genrm-engine-config key {key!r} is not a ServerArgs field in the "
-                f"installed SGLang; dropping."
-            )
-            continue
-        if key in kwargs and kwargs[key] != value:
-            logger.info(f"genrm_engine_config: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
-        kwargs[key] = value
-        unused_keys.discard(key)
-
-    # for compatibility with old args
-    if len(unused_keys) > 0:
-        logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")
-        for key in unused_keys:
-            kwargs.pop(key)
-
-    return kwargs, external_engine_need_check_fields
+    return _finalize_server_args(
+        args,
+        kwargs,
+        rank=rank,
+        worker_type=worker_type,
+        overrides=args.genrm_engine_config,
+        overrides_label="--genrm-engine-config",
+    )
 
 
 def _compute_server_args(
@@ -1785,42 +1798,15 @@ def _compute_server_args(
         kwargs["enable_return_routed_experts"] = True
     if args.fp16:
         kwargs["dtype"] = "float16"
-    external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
-    server_arg_fields = dataclasses.fields(ServerArgs)
-    server_arg_field_names = {attr.name for attr in server_arg_fields}
-    unused_keys = set(kwargs.keys())
-    for attr in server_arg_fields:
-        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
-            continue
-        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
-            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
-        unused_keys.discard(attr.name)
-
-    # Per-engine-group overrides from --sglang-config YAML.
-    # Applied after base args so they take highest priority.
-    if sglang_overrides:
-        for key, value in sglang_overrides.items():
-            if key in kwargs:
-                logger.info(f"sglang_overrides: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
-            kwargs[key] = value
-            unused_keys.discard(key)
-
-    if (
-        "cuda_graph_backend_prefill" in server_arg_field_names
-        and kwargs.get("enable_memory_saver")
-        and kwargs.get("cuda_graph_backend_prefill") is None
-    ):
-        # Breakable is SGLang's default prefill backend on CUDA, but it is incompatible with memory saver mode.
-        kwargs["cuda_graph_backend_prefill"] = "disabled"
-
-    # for compatibility with old args
-    if len(unused_keys) > 0:
-        logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")
-        for key in unused_keys:
-            kwargs.pop(key)
-
-    return kwargs, external_engine_need_check_fields
+    return _finalize_server_args(
+        args,
+        kwargs,
+        rank=rank,
+        worker_type=worker_type,
+        overrides=sglang_overrides,
+        overrides_label="sglang_overrides",
+    )
 
 
 _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS = [

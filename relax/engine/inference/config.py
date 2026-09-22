@@ -80,6 +80,7 @@ class ModelConfig:
         model.resolve(args)
         if args.num_gpus_per_node < 1:
             raise ValueError("GPUs per node must be positive")
+        first_slot = 0
         for index, group in enumerate(model.engine_groups):
             group_id = f"{model.name}/group-{index}"
             gpus = group.num_gpus_per_engine
@@ -89,8 +90,15 @@ class ModelConfig:
             if not placeholder and gpus > args.num_gpus_per_node and gpus % args.num_gpus_per_node:
                 raise ValueError("Multi-node engines must occupy complete nodes")
             nodes = max(1, gpus // args.num_gpus_per_node)
-            replicas = () if placeholder else replicas_from_slots(group_id, group.num_gpus // gpus * nodes, nodes)
+            slots = group.num_gpus // gpus * nodes
+            # Replicas are named after the model and their engine slot, which
+            # is what discovery publishes, so the identity a group is created
+            # with is the identity it keeps. A placeholder group names nothing
+            # but still consumes its slot range, because the runtime advances
+            # the engine offset over it too.
+            replicas = replicas_from_slots(model.name, 0 if placeholder else slots, nodes, first_slot=first_slot)
             group.topology = EngineGroupSpec(group_id, replicas)
+            first_slot += slots
         return model
 
     @property

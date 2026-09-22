@@ -258,15 +258,30 @@ Phase 3 验收：
 
 - [x] 修复 6B 引入的事件循环阻塞：`_ManagerInferencePort.resume_health_monitoring`/`inject_ci_fault` 原为同步方法，在 workload 的 async 生成路径上直接 `ray.get` 跨进程等待，owner 的 `rollout` 组被 scale-out 占满时会停住整个 rollout 事件循环（连带所有在途 HTTP 生成）。已改为 async 并走 `_engine_async`。
 
-- [ ] 将 Phase 3 遗留的 EngineGroupSpec 运行时创建、稳定副本身份和 PD Router 投影接入统一 EnginePool。
+- [x] 将 Phase 3 遗留的 EngineGroupSpec 运行时创建、稳定副本身份和 PD Router 投影接入统一 EnginePool。三部分的落点：
 
-- [ ] 将 GenRM/Teacher 专用 SGLang 初始化合并到公共 SGLangEngine/EnginePool 路径。
+  - 稳定副本身份：`ModelConfig.resolved()` 用 discovery 的 `{model_id}/replica-{slot}` 命名副本并跨 engine group 连号（原为 `{model_id}/group-{i}/replica-{组内 head}`，与快照两套命名）；`EngineGroup` 增加 `model_id` 字段与 `replica_identity(slot)`，快照改为查 spec 而非现算 `rank_offset + index`，因此 scale-in 移走前面的组不再让幸存副本改名。placeholder 组不命名但保留 slot 区间，与运行时 `engine_offset` 对 placeholder 同样累加保持一致。
+  - EngineGroupSpec 驱动运行时创建：`start_rollout_servers` 的引擎数量改由 `topology.replicas` 的 node_ranks 总数决定，与 `num_gpus // num_gpus_per_engine` 不符时直接报错，避免配置与拓扑两处推导出不同的引擎集合。
+  - scale-out 未完成槽位的失败标识由第三套命名 `replica_{idx}` 改为 `scale-out/{request_id}/replica-{idx}`，与该副本的 placement group 标识一致，失败能对上它占用的资源。
+  - PD Router 投影：`refresh_inference_state` 已把 prefill/decode worker 折叠为 `{model_id}/pd-service` 单副本并暴露 router_url，worker 拓扑不外露（`test_rollout_inference_pool.py:155` 覆盖），本轮仅核实。
 
-- [ ] 将 Rollout 的 weights/KV 分阶段恢复、权重锁、恢复五元组和伸缩协议适配为统一 Manager 操作。
+- [x] 将 GenRM/Teacher 专用 SGLang 初始化合并到公共 SGLangEngine/EnginePool 路径。现状与落点：
+
+  - EnginePool：GenRM 与 Teacher 已同走 `MultiEngineManager`（并行拉起、健康检查、死引擎恢复），Phase 3 完成，本轮核实。
+  - ServerArgs 组装：`_compute_server_args` 与 `_compute_genrm_server_args` 原本各自复制了一遍尾部（继承 `--sglang-*` 默认、应用 overrides、清理当前 SGLang 不认识的键）。抽出公共 `_finalize_server_args`，两个入口共用；各角色的 base kwargs 保留在各自函数里，因为模型路径、并行度、warmup 与显存策略是角色的真实差异，不是重复。
+  - 由合并直接修掉的两个方向的缺陷：GenRM 此前没有 `cuda_graph_backend_prefill` 在 memory-saver 下的兼容修正，而它恰恰是 colocate 才开 memory saver 的角色；rollout 侧的 `--sglang-config` overrides 此前不校验 ServerArgs 字段名，未知键会绕过 unused_keys 清理直达 `ServerArgs(**kwargs)` 变成启动期 TypeError，现在统一为丢弃并告警。
+  - 引擎启动：删除 `GenRMEngine.init` 这个自称 "Compatibility facade" 的覆写（它硬编码 `skip_dcs_registration=True` 与 router 条件）。改由 `GenRMEngineAdapter._build_engine_init_kwargs` 显式传入，与 Teacher 的写法一致，`GenRMEngine` 由此只剩三项真实差异：checkpoint 权重来源、自己的 server-args 构造、colocate offload 的排空语义。
+
+- [x] 将 Rollout 的 weights/KV 分阶段恢复、权重锁、恢复五元组和伸缩协议适配为统一 Manager 操作。四部分的落点：
+
+  - weights/KV 分阶段恢复：`onload_weights`/`onload_kv` 已经走 `service_manager.call_wait(model, "onload", tags)`，即 `InferenceManager.onload(model_id, tags)`，本轮核实无需改动。
+  - 恢复五元组：新增 `RolloutEngineWiring`（`engine/inference/types.py`），`get_rollout_engines_and_lock`/`recover_rollout_engines` 返回它。NamedTuple 保持位置解包兼容，因此训练侧零破坏；`recover_rollout_engines` 不再重复拼装五元组，改为 recover 后复用同一构造。megatron/FSDP/native generation 三处消费改为字段访问，字段顺序错位会变成 AttributeError 而不是静默取错值。
+  - 权重锁：锁本身是 Ray actor 资源，留在引擎池（`InferenceManager` 是纯 Python 控制面，不持有 Ray 资源）；需要统一的是权重事务期间的准入，`set_weight_updating(True)` 与 `invalidate_inference_state` 都已调 `invalidate_model(state=STARTING)`，本轮去掉其中一处已恒真的 `hasattr(self, "inference_manager")` 防御（6C 之后 `inference_manager` 是必填构造参数）。
+  - 伸缩协议：owner 的 `rollout_operation` 现在为外部触发的弹性操作登记 `OperationSnapshot`（`execute_scale_out`/`execute_scale_in`/`cancel_scale_out`/`cancel_all_scale_out_requests`/`sync_weights_for_scaled_out_engines`），operation_id 为 `{method}:rollout:{request_id}`，失败也记录后重抛，因此一次 `get_operation` 可以回答包括 rollout 在内的所有角色。onload/offload 与 recovery 故意不登记：它们每个训练步都发生，登记会让 owner 的账本随训练时长无界增长。
 
 - [x] workload 通过明确接口请求推理和阶段切换，不直接操作 GPU bundles 或私有引擎对象。6A 的 `RolloutInferencePort` 即此接口，`RolloutWorkload` 内无 placement group、`RolloutServer`/`EngineGroup` 或引擎 actor handle。遗留尾巴：`workload.py` 仍反向 import `relax.distributed.ray.rollout._log_eval_rollout_data`，该函数应下沉到 `engine/` 或 `utils/metrics`。
 
-- [ ] 迁移训练侧权重同步与 manager 连接点。
+- [x] 迁移训练侧权重同步与 manager 连接点。训练侧的权重事务边界已经作用于统一控制面：`megatron/actor.py:2481` 的 `invalidate_inference_state` 与 `:2590` 的 `complete_inference_weight_update` 最终落到 owner 进程内 Manager 的 `invalidate_model`/发布刷新；引擎接线改为消费 `RolloutEngineWiring`。**刻意没做**训练侧直连 owner 的 `rollout_operation`：`recover_rollout_engines` 依赖 `rollout_started`（workload 的 `rollout_id != -1`），这是 rollout 进程的状态，owner 与引擎池都不持有；绕过 rollout actor 会丢掉这个判据，让首个 generate 之前的恢复与初始 bring-up 竞态。经 rollout actor 的薄转发在这里是正确设计，不是遗留缺口。
 
 - [x] 检查 Agentic、Autoscaler、评估和 SFT predict 等兼容调用方。SFT predict 走 `generate_predict`/`run_predict`/`offload`（`engine/sft/predict/loop.py:197`、`runner.py:110,129`），外壳均保留同名方法；`engine/rollout/scoring_phase.py:35` 读的 `task_inference_manager` 属性仍在外壳上；Agentic（自行 `init_http_client`）与 Autoscaler（`utils/scale_utils.py`）不直接引用 RolloutManager 属性。
 
@@ -736,6 +751,9 @@ GenRM defer 示例在后处理内执行 Rollout offload → named GenRM onload �
 - 2026-09-22 Phase 6B 回归：新增 `tests/distributed/ray/test_rollout_owner_pool.py`（14 项：owner 建池/幂等/路由 operation 记录/`rollout_operation` 同步与协程/白名单拒绝/无池报错/`shutdown_role`/`shutdown_all`/白名单方法存在性/入口转发/协程转发/`dispose` 走 owner/router 端点写回/并发组声明）。`tests/distributed/ray` + `tests/components` + `tests/core` `639 passed`，`tests/distributed/ray` + `tests/engine` `1054 passed`；改动文件 pre-commit 与仓库级 gitleaks 通过。真实 Ray/多节点 GPU 启动验收未执行：未提供集群与硬件配置。
 - 2026-09-22 记录：`pre-commit run --all-files` 会重排 Phase 5A 落地的 9 个文件的 docstring（`lifecycle_client.py`、`lifecycle.py`、`phase_plans.py`、`deferred.py`、`deferred_opd.py`、`scoring_phase.py` 及对应 4 个测试），说明 `c6b5e52` 实际未通过全仓 pre-commit。这些与 Phase 6 无关，但为让分支重新通过全仓 pre-commit，已随 Phase 6 提交一并纳入。docformatter 原本会把两个标识符折断（`--opd-deferred-scoring`、`no-op`），已改写这两处措辞消除折断：`phase_plans.py` 把标志名单独成段，`lifecycle.py` 的 summary 缩短到一行内。docformatter 1.3.1 无行内豁免机制，只能靠措辞规避。
 - 2026-09-22 Phase 6A RolloutWorkload：`relax/distributed/ray/rollout.py` 的 `RolloutManager` 由 3800 行的"引擎池 + 业务"合体拆为"引擎池 + 转发"，生成业务移入 `relax/engine/rollout/workload.py`。`tests/distributed/ray/conftest.py::create_test_manager` 补 workload 占位（`rollout_id` 现为只读转发属性）。回归：`tests/distributed/ray` + `tests/engine/rollout` `631 passed`，`tests/components` + `tests/core` + `tests/engine` + agentic/metrics `711 passed`；改动文件 pre-commit（ruff/ruff-format/docformatter）通过。仓库级 gitleaks 在 `tests/engine/inference/test_lifecycle.py:669`（Phase 5A 引入的 `coordinator_epoch="other-epoch"`）报误判，已改为局部变量后通过。
+- 2026-09-23 Phase 6F GenRM 初始化合并：Phase 6 收尾。GenRM 不再有自己的引擎启动覆写，ServerArgs 组装尾部与 rollout 共用。新增 `tests/backends/sglang/test_server_args_assembly.py`（8 项：未知 override 丢弃、override 优先级、全局默认只填空缺、base 未知键清理、external 校验清单只含 base、memory-saver 的 prefill backend 修正、decode worker 的 hierarchical cache 例外、两个角色都走公共尾部）与两项 GenRM adapter init kwargs 回归。`test_router_registration.py::test_static_engine_uses_common_startup_without_policy_load_plan` 的 genrm 特例断言随之改写：跳过 Router 注册现在由 adapter 决定，不再由引擎类硬编码。
+- 2026-09-23 Phase 6E 引擎接线与伸缩账本：五元组 typed 化为 `RolloutEngineWiring`（NamedTuple，位置解包兼容，训练侧零破坏），伸缩操作登记进 owner 的 `_operations`。核实并记录了两处边界：权重锁作为 Ray 资源留在引擎池、训练侧不直连 owner（`rollout_started` 是 workload 状态）。新增 3 项 owner 操作账本回归（成功/失败/每步流量不登记），`_FakePool` 的构造签名同步为 6C 之后的必填形态。回归：`tests/distributed/ray` + `tests/engine/inference` `688 passed`，`tests/backends` 全量 `1218 passed, 1 failed`——失败项 `test_chunked_mtp_loss.py::test_is_training_logging_matches` 经 stash 验证为既有失败，与本批无关。
+- 2026-09-23 Phase 6D 副本身份：全仓原本有三套副本命名（config 的 `{model}/group-{i}/replica-{head}`、快照的 `{model}/replica-{rank_offset+head}`、scale-out 失败的 `replica_{idx}`），spec 因此形同虚设。现统一为 discovery 格式并在组创建时冻结。核对过 `replicas_from_slots` 的另一调用方 `model_spec_from_pool`（GenRM/Teacher）默认 `first_slot=0`，行为不变。新增 `tests/distributed/ray/test_replica_identity.py`（9 项：命名格式、跨组连号、placeholder 槽位、多节点单身份、spec 查表、scale-in 后不漂移、scale-out 组命名、超出 spec 的兜底不撞名、fixture 前提）。回归 `tests/distributed/ray` + `tests/engine/inference` + `tests/components` + `tests/core` `811 passed`。
 - 2026-09-23 Phase 6C 发现（留给 Phase 7）：删除 Rollout 侧回退后，`TaskInferenceManager.register_external_role` 在生产代码中已无调用方（仅 `tests/distributed/ray/test_inference_role.py` 与 `test_lifecycle_coordination.py` 使用），external-role 注册路径随 `InferenceRoleManager` 分支一并退役。
 - 2026-09-23 Phase 6C：删除 Rollout 侧两条兼容回退（本地 pool、role-local placement ledger），并修复 6B 引入的两个生产缺陷（rollout 进程缺 `init_http_client`、推理端口同步 `ray.get` 阻塞生成事件循环）。`start_rollout_servers` 失败回滚路径里残留的 `ledger` 变量一并改为参数本身。回归：`tests/distributed/ray` + `tests/core` + `tests/components` `654 passed`。测试调整：`conftest.create_test_manager` 显式注入 ledger；`test_rollout_startup_placement` 的两个兼容路径用例改写为"只用注入的 ledger"与"构造参数必填"；`test_rollout_owner_pool` 补"无 owner 拒绝启动"。真实 Ray/GPU 验收仍未执行。
 - 2026-09-22 Phase 5 回归：新增 `tests/engine/inference/test_lifecycle.py`(30)、`test_phase_plans.py`(8)、`test_gateway_cancellation.py`(9)、`tests/distributed/ray/test_lifecycle_coordination.py`(13)、`tests/engine/rollout/test_deferred_opd.py`(19)、`test_deferred_opd_session.py`(8)、`test_deferred_opd_equivalence.py`(5)。`tests/core` 修正一处测试缺陷：`test_controller_s3_cleanup_runs_after_initial_sync_before_service_run` 用 `__new__` 手工装配 Controller，未跟上新增的 `_inference_manager_handle`（生产代码 `__init__` 已初始化，故修测试）。真实 Ray/多节点 GPU 阶段切换验收未执行：未提供集群与硬件配置。

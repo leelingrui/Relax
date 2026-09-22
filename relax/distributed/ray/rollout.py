@@ -39,6 +39,7 @@ from relax.engine.inference.types import (
     ReplicaSnapshot,
     Role,
     RoleSnapshot,
+    RolloutEngineWiring,
     RoutingSpec,
 )
 from relax.engine.rollout.workload import RolloutWorkload
@@ -303,6 +304,7 @@ class EngineGroup:
     sglang_overrides: dict = dataclasses.field(default_factory=dict)
     router_ip: str | None = None
     router_port: int | None = None
+    model_id: str = "default"  # the model this group serves; part of every replica identity
     is_scaled_out: bool = False  # True for groups added via scale-out, False for initial groups
     skip_dcs_registration: bool = False  # Skip DCS registration for scaled-out engines
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
@@ -321,10 +323,30 @@ class EngineGroup:
         if self.spec is None:
             self.spec = EngineGroupSpec(
                 f"group-{self.rank_offset}",
-                replicas_from_slots(f"group-{self.rank_offset}", len(self.all_engines), self.nodes_per_engine),
+                replicas_from_slots(
+                    self.model_id,
+                    len(self.all_engines),
+                    self.nodes_per_engine,
+                    first_slot=self.rank_offset,
+                ),
             )
         elif sum(len(replica.node_ranks) for replica in self.spec.replicas) != len(self.all_engines):
             raise ValueError("EngineGroup slots do not match its replica specification")
+
+    def replica_identity(self, slot: int) -> str:
+        """The stable identity of the replica whose first engine is ``slot``.
+
+        ``slot`` indexes ``all_engines``, so it is the head of a logical
+        replica. The identity comes from the spec the group was created with,
+        never from the group's current position, which scale-in shifts.
+        """
+        index = slot // self.nodes_per_engine
+        replicas = self.spec.replicas if self.spec is not None else ()
+        if index < len(replicas):
+            return replicas[index].replica_id
+        # A group that outgrew its spec (engines appended without a respec)
+        # still needs a name that cannot collide with the recorded ones.
+        return f"{self.model_id}/replica-{self.rank_offset + slot}"
 
     @property
     def nodes_per_engine(self):
@@ -1048,13 +1070,15 @@ class RolloutEnginePool:
         """All node-0 engines across all servers / models."""
         return [e for srv in self.servers.values() for e in srv.engines]
 
-    def get_rollout_engines_and_lock(self, model_name: str | None = None):
+    def get_rollout_engines_and_lock(self, model_name: str | None = None) -> RolloutEngineWiring:
         srv = self._get_server(model_name)
-        engines = srv.engines if srv else []
-        gpu_counts = srv.engine_gpu_counts if srv else []
-        gpu_offsets = srv.engine_gpu_offsets if srv else []
-        num_new = srv.num_new_engines if srv else 0
-        return engines, self.rollout_engine_lock, num_new, gpu_counts, gpu_offsets
+        return RolloutEngineWiring(
+            srv.engines if srv else [],
+            self.rollout_engine_lock,
+            srv.num_new_engines if srv else 0,
+            srv.engine_gpu_counts if srv else [],
+            srv.engine_gpu_offsets if srv else [],
+        )
 
     def get_weight_sync_lock(self):
         """Return the distributed Lock actor used to serialise DCS weight sync
@@ -1105,7 +1129,9 @@ class RolloutEnginePool:
     def get_status(self):
         return self.status
 
-    def recover_rollout_engines(self, model_name: str | None = None, *, rollout_started: bool = True):
+    def recover_rollout_engines(
+        self, model_name: str | None = None, *, rollout_started: bool = True
+    ) -> RolloutEngineWiring:
         """Restart any dead rollout engines and update num_new_engines for
         update_weights detection.
 
@@ -1114,20 +1140,9 @@ class RolloutEnginePool:
         """
         self.health_monitoring_pause()
         srv = self._get_server(model_name)
-        if not rollout_started or srv is None:
-            engines = srv.engines if srv else []
-            gpu_counts = srv.engine_gpu_counts if srv else []
-            gpu_offsets = srv.engine_gpu_offsets if srv else []
-            return engines, self.rollout_engine_lock, (srv.num_new_engines if srv else 0), gpu_counts, gpu_offsets
-
-        self.service_manager.call_wait(srv.model_name, "recover")
-        return (
-            srv.engines,
-            self.rollout_engine_lock,
-            srv.num_new_engines,
-            srv.engine_gpu_counts,
-            srv.engine_gpu_offsets,
-        )
+        if rollout_started and srv is not None:
+            self.service_manager.call_wait(srv.model_name, "recover")
+        return self.get_rollout_engines_and_lock(model_name)
 
     def clear_num_new_engines(self, model_name: str | None = None):
         # when fault tolerance is not enabled, we need to manually clear num_new_engines after update_weights
@@ -1638,7 +1653,7 @@ class RolloutEnginePool:
                         except Exception as e:
                             logger.warning(f"[ScaleOut] PG for replica {idx} failed: {e}")
                             pending_indices.discard(idx)
-                            failed_replica_ids.append(f"replica_{idx}")
+                            failed_replica_ids.append(f"scale-out/{request.request_id}/replica-{idx}")
                             failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.PROVISION_FAILED))
                             try:
                                 ray.util.remove_placement_group(per_replica_pgs[idx])
@@ -1686,7 +1701,9 @@ class RolloutEnginePool:
                             # Should not normally happen since _bring_up_single_replica
                             # catches exceptions internally, but handle defensively.
                             logger.exception(f"[ScaleOut] Unexpected exception during parallel bring-up: {result}")
-                            failed_replica_ids.append(f"replica_{replica_idx_for_result}")
+                            failed_replica_ids.append(
+                                f"scale-out/{request.request_id}/replica-{replica_idx_for_result}"
+                            )
                             failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_FAILED))
                             try:
                                 ray.util.remove_placement_group(per_replica_pgs[replica_idx_for_result])
@@ -1700,7 +1717,7 @@ class RolloutEnginePool:
                             committed_pg_indices.add(idx)
                             logger.info(f"[ScaleOut] ✅ Replica {idx} successfully brought up as {engine_id}")
                         else:
-                            failed_replica_ids.append(f"replica_{idx}")
+                            failed_replica_ids.append(f"scale-out/{request.request_id}/replica-{idx}")
                             if reason:
                                 failure_reasons.append(reason)
                             logger.warning(f"[ScaleOut] ❌ Replica {idx} failed during bring-up: {reason}")
@@ -1721,7 +1738,7 @@ class RolloutEnginePool:
             # Phase B: Handle remaining pending PGs (timed out)
             for idx in list(pending_indices):
                 logger.warning(f"[ScaleOut] Replica {idx} timed out waiting for resources")
-                failed_replica_ids.append(f"replica_{idx}")
+                failed_replica_ids.append(f"scale-out/{request.request_id}/replica-{idx}")
                 failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.PROVISION_TIMEOUT))
                 try:
                     ray.util.remove_placement_group(per_replica_pgs[idx])
@@ -1843,6 +1860,7 @@ class RolloutEnginePool:
                 gpu_offset=placement.reserved_offset,
                 router_ip=srv.router_ip,
                 router_port=srv.router_port,
+                model_id=srv.model_name,
                 is_scaled_out=True,
                 skip_dcs_registration=True,  # Will be done in _finalize_engine_group_registration
                 skip_router_registration=True,  # Will be done in _finalize_engine_group_registration
@@ -2177,6 +2195,7 @@ class RolloutEnginePool:
                 gpu_offset=0,
                 router_ip=router_ip,
                 router_port=router_port,
+                model_id=srv.model_name,
                 is_scaled_out=True,
                 skip_dcs_registration=False,  # Already registered above
                 pg_owner=PlacementOwner.EXTERNAL,
@@ -3282,7 +3301,7 @@ class RolloutEnginePool:
                         # An unreachable worker may still be registered at the Router.
                         router_members_ready = False
                     replica = ReplicaSnapshot(
-                        f"{name}/replica-{group.rank_offset + replica_index}",
+                        group.replica_identity(replica_index),
                         LifecycleState.READY if ready else (LifecycleState.STARTING if alive else LifecycleState.DEAD),
                         observation.get("base_url"),
                         version,
@@ -3545,7 +3564,10 @@ class RolloutEnginePool:
             ):
                 return False
             self._training_weight_updating = is_updating
-            if is_updating and hasattr(self, "inference_manager"):
+            if is_updating:
+                # Close admission now rather than at the next refresh: the
+                # window in between would route requests at engines whose
+                # weights are being replaced.
                 for name in self.servers:
                     self.inference_manager.invalidate_model(name, state=LifecycleState.STARTING)
             return True
@@ -4585,7 +4607,7 @@ class RolloutManager:
     def dispose(self):
         return ray.get(self.task_inference_manager.shutdown_role.remote(Role.ROLLOUT))
 
-    def get_rollout_engines_and_lock(self, model_name: str | None = None):
+    def get_rollout_engines_and_lock(self, model_name: str | None = None) -> RolloutEngineWiring:
         return self._engine("get_rollout_engines_and_lock", model_name)
 
     def get_weight_sync_lock(self):
@@ -4607,7 +4629,7 @@ class RolloutManager:
         return self._engine("get_status")
 
     @ray.method(concurrency_group="recover_rollout_engines")
-    def recover_rollout_engines(self, model_name: str | None = None):
+    def recover_rollout_engines(self, model_name: str | None = None) -> RolloutEngineWiring:
         return self._engine("recover_rollout_engines", model_name, rollout_started=self.workload.rollout_id != -1)
 
     def clear_num_new_engines(self, model_name: str | None = None):
@@ -5074,6 +5096,18 @@ def start_rollout_servers(
                 num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
                 num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
                 planned = planned_by_id[f"{model_cfg.name}/group-{group_index}"]
+                # The topology resolved with the model is what the engines are
+                # created from; a mismatch means the two were derived from
+                # different configurations and the identities would not line up.
+                topology = group_cfg.topology
+                if topology is not None and group_cfg.worker_type != "placeholder":
+                    spec_engines = sum(len(replica.node_ranks) for replica in topology.replicas)
+                    if spec_engines != num_engines:
+                        raise ValueError(
+                            f"Engine group {model_cfg.name}/group-{group_index} resolves to {num_engines} engines "
+                            f"but its topology describes {spec_engines}"
+                        )
+                    num_engines = spec_engines
 
                 group = EngineGroup(
                     args=args,
@@ -5087,6 +5121,7 @@ def start_rollout_servers(
                     sglang_overrides=dict(group_cfg.overrides),
                     router_ip=router_ip,
                     router_port=router_port,
+                    model_id=model_cfg.name,
                     spec=group_cfg.topology,
                     placement=planned,
                     pg_owner=PlacementOwner.CONTROLLER,
