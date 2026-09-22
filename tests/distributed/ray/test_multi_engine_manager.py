@@ -82,6 +82,17 @@ class _FakeManager(MultiEngineManager):
         return {}
 
 
+def test_legacy_placement_hook_remains_compatible():
+    manager = _FakeManager(num_slots=1)
+
+    placement, owns_pg, gpu_index, planned = manager._resolve_planned_placement(0)
+
+    assert placement == ("pg-0", [0], [0])
+    assert owns_pg is False
+    assert gpu_index == 0
+    assert planned is None
+
+
 class _FakeEngineActorCls:
     """Stand-in engine "actor class"; ``ray.remote(cls)`` in the base class
     just needs something ``.options(...).remote(...)`` works on."""
@@ -184,12 +195,26 @@ def test_offload_onload_are_idempotent_when_state_unchanged(_patch_ray):
     manager.onload()
     assert manager.is_onloaded()
     for engine in manager.all_engines:
-        assert engine.calls == ["release_memory_occupation", "resume_memory_occupation"]
+        assert engine.calls == ["release_memory_occupation", "resume_memory_occupation", "get_inference_observation"]
 
     # A second onload (no tags) while already onloaded must not re-fire the RPC.
     manager.onload()
     for engine in manager.all_engines:
-        assert engine.calls == ["release_memory_occupation", "resume_memory_occupation"]
+        assert engine.calls == ["release_memory_occupation", "resume_memory_occupation", "get_inference_observation"]
+
+
+def test_partial_onload_keeps_offload_enabled_without_marking_memory_ready(_patch_ray):
+    manager = _FakeManager(num_slots=1)
+    manager.offload()
+    manager.onload(tags=["weights"])
+    assert manager.is_onloaded()
+    assert not manager._memory_ready
+    engine = manager.all_engines[0]
+    engine.calls.clear()
+    manager.offload()
+    assert engine.calls == ["release_memory_occupation"]
+    manager.onload()
+    assert manager._memory_ready
 
 
 def test_retire_engines_kills_and_nulls_the_slot(_patch_ray):
@@ -255,3 +280,263 @@ def test_shutdown_removes_owned_placement_group_but_not_borrowed_one(_patch_ray,
     borrowing_manager = _FakeManager(num_slots=1, owns_pg=False)
     borrowing_manager.shutdown()
     assert removed_pgs == []
+
+
+def test_shutdown_releases_the_planned_slice_before_removing_its_group(_patch_ray, monkeypatch):
+    from relax.engine.inference.placement import (
+        PlacementGroupView,
+        PlacementOwner,
+        PlacementPlanner,
+        PlacementRequest,
+    )
+
+    placement_group_submodule = sys.modules["ray.util.placement_group"]
+    removed_pgs = []
+    monkeypatch.setattr(placement_group_submodule, "remove_placement_group", lambda pg: removed_pgs.append(pg))
+
+    ledger = PlacementPlanner()
+    view = PlacementGroupView((0,), (0,), PlacementOwner.MANAGER, identity="own-pg")
+    request = PlacementRequest(
+        group_id="teacher/math/replica-0",
+        worker_type="regular",
+        num_gpus=1,
+        num_gpus_per_engine=1,
+        num_gpus_per_node=8,
+    )
+
+    class _PlannedManager(_FakeManager):
+        """A manager whose slot comes from the shared ledger, as the migrated
+        adapters' slots do."""
+
+        def _resolve_planned_placement(self, rank):
+            (planned,) = ledger.plan((request,), view)
+            return ("own-pg", [0], [0]), True, 0, planned
+
+        def _release_placement(self, placement):
+            return ledger.release(placement)
+
+    manager = _PlannedManager(num_slots=1, owns_pg=True)
+    assert len(ledger.allocations(view)) == 1
+
+    manager.shutdown()
+
+    assert removed_pgs == ["own-pg"]
+    assert ledger.allocations(view) == ()
+
+
+def test_manager_onload_skips_resume_for_newly_rebuilt_engine(_patch_ray):
+    manager = _FakeManager(num_slots=2)
+    manager.offload()
+    manager._retire_engines([0])
+    survivor = manager.all_engines[1]
+    survivor.calls.clear()
+
+    manager.onload()
+
+    assert manager.all_engines[0].calls == ["init", "get_inference_observation"]
+    assert survivor.calls == ["resume_memory_occupation", "get_inference_observation"]
+    assert manager.is_onloaded()
+
+
+def test_manager_onload_rebuilds_engine_that_died_while_sleeping(_patch_ray):
+    manager = _FakeManager(num_slots=1)
+    manager.offload()
+    old = manager.all_engines[0]
+    old.dead_methods = frozenset({"resume_memory_occupation"})
+
+    manager.onload()
+
+    assert old in _patch_ray.killed
+    assert manager.all_engines[0] is not old
+    assert manager.all_engines[0].calls == ["init", "get_inference_observation"]
+    assert manager.is_onloaded()
+
+
+def test_pool_snapshot_keeps_replica_identity_and_surviving_admission(_patch_ray, monkeypatch):
+    from relax.distributed.ray import multi_engine_manager as module
+    from relax.engine.inference.types import LifecycleState, Role
+
+    manager = _FakeManager(num_slots=2)
+    manager.router_url = "http://router"
+    manager._retire_engines([0])
+    monkeypatch.setattr(
+        module.ray,
+        "get",
+        lambda *args, **kwargs: {"healthy": True, "router_registered": True, "base_url": "http://survivor"},
+    )
+    manager._publish_engine_state()
+    snapshot = manager.get_discovery_snapshot(role=Role.GENRM, model_id="judge")
+    assert snapshot.models[0].admission
+    assert snapshot.models[0].replicas[0].state == LifecycleState.DEAD
+    assert snapshot.models[0].replicas[1].engine_id == "judge/replica-1"
+    monkeypatch.setattr(module.ray, "get", lambda *args, **kwargs: pytest.fail("Discovery must not issue RPCs"))
+    dead = manager.get_discovery_snapshot(role=Role.GENRM, model_id="judge", status_filter="dead")
+    assert len(dead.models[0].replicas) == 1
+    assert manager.get_discovery_snapshot(role=Role.GENRM, model_id="judge") == snapshot
+
+
+def test_pool_address_allocation_failure_rolls_back_created_actors(_patch_ray, monkeypatch):
+    manager = _FakeManager(num_slots=2)
+    manager._retire_engines([0, 1])
+
+    def fail_ports(**kwargs):
+        raise RuntimeError("port allocation failed")
+
+    monkeypatch.setattr(manager, "_allocate_engine_addr_and_ports", fail_ports)
+    with pytest.raises(RuntimeError, match="port allocation failed"):
+        manager._init_engines([0, 1])
+    assert manager.all_engines == [None, None]
+    assert not manager._engine_placements
+    assert all(engine in _patch_ray.killed for engine in _patch_ray.created)
+
+
+def test_pool_recovery_retires_surviving_multinode_followers(_patch_ray):
+    from relax.engine.inference.specs import replicas_from_slots
+
+    manager = _FakeManager(num_slots=2)
+    manager.nodes_per_engine = 2
+    manager.replica_specs = replicas_from_slots("default", 2, 2)
+    follower = manager.all_engines[1]
+    manager.all_engines[0] = None
+    rebuilt = manager.recover()
+    assert rebuilt == {0, 1}
+    assert follower in _patch_ray.killed
+    assert all(engine is not None for engine in manager.all_engines)
+
+
+@pytest.mark.parametrize("role", ["teacher", "genrm"])
+@pytest.mark.parametrize("defer_init", [False, True])
+@pytest.mark.parametrize("shared_manager", [False, True])
+def test_model_pool_real_constructor_with_fake_engines(monkeypatch, role, defer_init, shared_manager):
+    from unittest.mock import MagicMock
+
+    from relax.distributed.ray import genrm, teacher_manager
+    from relax.distributed.ray.model_pool import ModelPool, create_model_pool
+    from relax.engine.inference.manager import InferenceManager
+    from relax.engine.inference.types import Role, RoutingSpec
+
+    args = SimpleNamespace(
+        num_gpus_per_node=4,
+        rollout_num_gpus=0,
+        fully_async=False,
+        genrm_num_gpus=2,
+        genrm_num_gpus_per_engine=2,
+        genrm_model_path="judge-checkpoint",
+        genrm_engine_config={"context_length": 1024},
+        debug_train_only=False,
+    )
+    pg = ("pg", [0, 1], [0, 1])
+    rollout = sys.modules["relax.distributed.ray.rollout"]
+    monkeypatch.setattr(rollout, "_start_router", lambda *a, **k: ("router", 3100))
+    monkeypatch.setattr(rollout, "stop_launched_routers", MagicMock())
+    monkeypatch.setattr(genrm, "init_http_client", lambda args: None)
+    monkeypatch.setattr(genrm, "GenRMEngine", _FakeEngineActorCls)
+    monkeypatch.setattr(genrm, "Lock", MagicMock())
+    monkeypatch.setattr(genrm, "with_control_plane_affinity", lambda args, options: options)
+    monkeypatch.setattr(
+        genrm,
+        "_allocate_genrm_engine_addr_and_ports",
+        lambda **kw: {rank: {"host": "h", "port": 1} for rank, _ in kw["new_engines"]},
+    )
+    monkeypatch.setattr(teacher_manager, "SGLangEngine", _FakeEngineActorCls)
+    monkeypatch.setattr(
+        teacher_manager,
+        "build_teacher_overrides",
+        lambda *a, **k: {"model_path": "teacher-checkpoint", "context_length": 2048},
+    )
+    monkeypatch.setattr(teacher_manager, "build_teacher_engine_args", lambda args, overrides: SimpleNamespace())
+    monkeypatch.setattr(teacher_manager, "find_available_port", lambda port: port)
+    monkeypatch.setattr(
+        teacher_manager,
+        "_allocate_rollout_engine_addr_and_ports_normal",
+        lambda **kw: ({rank: {"host": "h", "port": 1} for rank, _ in kw["rollout_engines"]}, None),
+    )
+    kwargs = (
+        {"pg": pg}
+        if role == "genrm"
+        else {
+            "num_replicas": 1,
+            "gpus_per_replica": 2,
+            "pg": pg,
+            "shared_pg": True,
+        }
+    )
+    manager = InferenceManager(Role(role)) if shared_manager else None
+    pool = create_model_pool(role, args, inference_manager=manager, defer_init=defer_init, **kwargs)
+    if shared_manager:
+        assert pool.inference_manager is manager
+        manager.configure_routes(RoutingSpec(default_model="default"), operation_id="routes")
+    assert type(pool) is ModelPool
+    adapter = pool.backend
+    assert not isinstance(adapter, MultiEngineManager)
+    assert "all_engines" not in vars(adapter)
+    assert "num_new_engines" not in vars(adapter)
+    assert pool.inference_manager.snapshot().role == role
+    assert adapter.model_spec.model_path == ("judge-checkpoint" if role == "genrm" else "teacher-checkpoint")
+    assert adapter.model_spec.engine_groups[0].num_gpus_per_engine == 2
+    assert adapter.model_spec.engine_groups[0].overrides["context_length"] == (1024 if role == "genrm" else 2048)
+    if defer_init:
+        assert adapter.num_new_engines == 0
+        pool.initialize()
+    assert adapter.num_new_engines == 1
+    assert len(adapter.engines) == 1
+    pool.offload()
+    assert not pool.is_onloaded()
+    pool.onload()
+    assert pool.is_onloaded()
+    pool.shutdown()
+    actor = genrm.GenRMManager if role == "genrm" else teacher_manager.TeacherManager
+    actor_cls = getattr(getattr(actor, "__ray_metadata__", None), "modified_class", actor)
+    for method in ("onload", "offload", "health_check", "recover", "shutdown", "is_onloaded"):
+        assert callable(getattr(actor_cls, method))
+
+
+def test_model_pool_runtime_is_onloaded_uses_runtime():
+    from unittest.mock import MagicMock
+
+    from relax.distributed.ray.model_pool import ModelPool
+
+    manager = MagicMock(spec=["bind_pool", "onload", "offload", "recover", "health_check", "shutdown"])
+    runtime = MagicMock(spec=["is_onloaded"])
+    runtime.is_onloaded.return_value = False
+    pool = ModelPool.from_runtime(manager, "model", runtime)
+    manager.bind_pool.assert_called_once_with("model", runtime)
+    assert pool.is_onloaded() is False
+    for method in ("onload", "offload", "recover", "health_check", "shutdown"):
+        getattr(pool, method)()
+        getattr(manager, method).assert_called_once_with("model")
+
+
+def test_multi_instance_genrm_slices_do_not_collide_in_one_ledger():
+    """Instances of a multi-instance role share one placement group, so their
+    slices must stay distinct in the single task-level ledger."""
+    from relax.distributed.ray.genrm import GenRMEngineAdapter
+    from relax.engine.inference.placement import PlacementOwner, PlacementPlanner
+
+    ledger = PlacementPlanner()
+    pg = ("shared", list(range(8)), list(range(8)))
+    planned = []
+    for index, model_id in enumerate(("judge-a", "judge-b")):
+        adapter = object.__new__(GenRMEngineAdapter)
+        adapter.args = SimpleNamespace(
+            num_gpus_per_node=4,
+            rollout_num_gpus=4,
+            fully_async=False,
+            genrm_num_gpus=2,
+            genrm_num_gpus_per_engine=2,
+        )
+        adapter.pg = pg
+        adapter.nodes_per_engine = 1
+        adapter.num_gpu_per_engine = 2
+        adapter.bundle_offset = index * 2
+        adapter.placement_owner = PlacementOwner.CONTROLLER
+        adapter._placement_ledger = ledger
+        adapter._placement_model_id = model_id
+        planned.append(adapter._resolve_planned_placement(0)[3])
+
+    # Both sit behind the rollout region, at their own instance offset.
+    assert [item.reserved_offset for item in planned] == [4, 6]
+    assert {item.group_id for item in ledger.allocations()} == {
+        "genrm/judge-a/replica-0",
+        "genrm/judge-b/replica-0",
+    }

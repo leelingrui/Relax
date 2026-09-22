@@ -136,6 +136,19 @@ def _pick_teacher_url(args, sample=None) -> str:
     return args.opd_teacher_url
 
 
+def _teacher_request_target(args, sample, payload: dict) -> tuple[str, dict]:
+    # Validate legacy routing even when the actual request uses the Gateway.
+    teacher_url = _pick_teacher_url(args, sample)
+    gateway_url = getattr(args, "opd_teacher_gateway_url", None)
+    if not gateway_url:
+        return teacher_url, payload
+    payload = dict(payload)
+    if getattr(args, "opd_teacher_routes_map", None):
+        key_field = getattr(args, "opd_teacher_key", None) or "data_source"
+        payload["route_key"] = sample.metadata[key_field]
+    return f"{gateway_url.rstrip('/')}/generate", payload
+
+
 class OpdManager:
     def __init__(self, args):
         self.args = args
@@ -233,6 +246,49 @@ class OpdManager:
             sample.student_topk_token_ids = np.vstack([sample.student_topk_token_ids, token_ids])
             sample.student_topk_log_probs = np.vstack([sample.student_topk_log_probs, log_probs])
 
+    @property
+    def needs_student_prefill(self) -> bool:
+        """Whether this token selection needs a second pass on the student."""
+        return self.topk_worker is not None and self.topk_worker.spec.student_at_teacher
+
+    async def prepare_teacher_inputs(self, samples: Sequence[Sample]) -> None:
+        """Build the teacher-side inputs OPSD expands before any request."""
+        if self.opsd_worker is not None:
+            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in samples])
+
+    async def score_teacher(
+        self, samples: Sequence[Sample], session: aiohttp.ClientSession | None = None
+    ) -> list[bool]:
+        """Run teacher prefill for ``samples`` and report per-sample success.
+
+        Separated from :meth:`prefill` so a deferred pipeline can run this
+        stage inside the teacher's activation phase and the student stage in
+        another, instead of holding both models resident at once.
+        """
+        if session is not None:
+            return list(await asyncio.gather(*[self._teacher_prefill(s, session) for s in samples]))
+        async with _create_teacher_client_session(self.args) as owned:
+            return list(await asyncio.gather(*[self._teacher_prefill(s, owned) for s in samples]))
+
+    async def score_student_at_teacher(
+        self,
+        samples: Sequence[Sample],
+        session: aiohttp.ClientSession | None = None,
+        encode_multimodal_inputs: EncodeMultimodalInputs | None = None,
+    ) -> None:
+        """Second pass on the student, for token selections that need it."""
+        if not self.needs_student_prefill:
+            return
+        if session is not None:
+            await asyncio.gather(*[self._student_prefill(s, session, encode_multimodal_inputs) for s in samples])
+            return
+        async with _create_teacher_client_session(self.args) as owned:
+            await asyncio.gather(*[self._student_prefill(s, owned, encode_multimodal_inputs) for s in samples])
+
+    def assemble_transfer(self, samples: Sequence[Sample]) -> None:
+        """Assemble the per-sample training channels from the scored fields."""
+        self._assemble_transfer(list(samples))
+
     async def prefill(
         self,
         samples: Sample | Sequence[Sample],
@@ -240,17 +296,12 @@ class OpdManager:
     ) -> None:
         sample_list = list(samples) if isinstance(samples, Sequence) else [samples]
 
-        if self.opsd_worker is not None:
-            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
+        await self.prepare_teacher_inputs(sample_list)
 
         async with _create_teacher_client_session(self.args) as session:
-            fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
+            fetch_results = await self.score_teacher(sample_list, session)
             self._raise_if_all_failed(sample_list, fetch_results)
-
-            if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
-                await asyncio.gather(
-                    *[self._student_prefill(s, session, encode_multimodal_inputs) for s in sample_list]
-                )
+            await self.score_student_at_teacher(sample_list, session, encode_multimodal_inputs)
 
         self._assemble_transfer(sample_list)
 
@@ -312,7 +363,7 @@ class OpdManager:
             if mm_fields:
                 payload.update(mm_fields)
 
-        teacher_url = _pick_teacher_url(self.args, sample)
+        teacher_url, payload = _teacher_request_target(self.args, sample, payload)
         resp_obj = await self._post_logprob(session, teacher_url, payload, sample, "teacher prefill")
         if resp_obj is None:
             return False

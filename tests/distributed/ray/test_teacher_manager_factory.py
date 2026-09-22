@@ -5,7 +5,7 @@ from types import ModuleType, SimpleNamespace
 
 
 def _install_fake_teacher_manager(monkeypatch, captured):
-    teacher_manager_module = ModuleType("relax.distributed.ray.teacher_manager")
+    teacher_manager_module = ModuleType("relax.distributed.ray.inference_role")
 
     class _RemoteMethod:
         def __init__(self, name):
@@ -19,21 +19,15 @@ def _install_fake_teacher_manager(monkeypatch, captured):
         get_urls = _RemoteMethod("get_urls")
         offload = _RemoteMethod("offload")
 
-    class _TeacherManagerActor:
-        @classmethod
-        def options(cls, **options):
-            captured["options"] = options
-            return cls
+    def create_role_managers(args, role, pool_configs, runtime_env=None):
+        assert role == "teacher"
+        captured["runtime_env"] = runtime_env
+        captured["pool_configs"] = pool_configs
+        captured["handle"] = _TeacherManagerHandle()
+        return {"default": captured["handle"]}
 
-        @classmethod
-        def remote(cls, *args, **kwargs):
-            captured["remote_args"] = args
-            captured["remote_kwargs"] = kwargs
-            captured["handle"] = _TeacherManagerHandle()
-            return captured["handle"]
-
-    teacher_manager_module.TeacherManager = _TeacherManagerActor
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.teacher_manager", teacher_manager_module)
+    teacher_manager_module.create_role_managers = create_role_managers
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.inference_role", teacher_manager_module)
 
 
 def test_create_managed_opd_teacher_manager_offloads_shared_pg_teacher(monkeypatch, tmp_path):
@@ -68,14 +62,11 @@ def test_create_managed_opd_teacher_manager_offloads_shared_pg_teacher(monkeypat
     assert manager is captured["handle"]
     assert urls == ["http://teacher/generate"]
     assert captured["calls"] == ["get_urls", "offload"]
-    assert captured["options"] == {
-        "num_cpus": 1,
-        "num_gpus": 0,
-        "runtime_env": {"env_vars": {"A": "B"}},
-        "resources": {"stable_cpu": 1},
-    }
-    assert captured["remote_args"] == (args, 1, 4)
-    assert captured["remote_kwargs"] == {
+    assert captured["runtime_env"] == {"env_vars": {"A": "B"}}
+    assert captured["pool_configs"]["default"]["args"] == (args,)
+    assert captured["pool_configs"]["default"]["kwargs"] == {
+        "num_replicas": 1,
+        "gpus_per_replica": 4,
         "pg": ("pg", list(range(8)), list(range(8))),
         "shared_pg": True,
     }

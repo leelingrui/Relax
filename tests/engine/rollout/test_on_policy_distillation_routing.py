@@ -58,6 +58,45 @@ def _sample(data_source: str, group_index: int | None) -> Sample:
     return Sample(group_index=group_index, metadata={"data_source": data_source})
 
 
+def test_teacher_gateway_target_preserves_model_routing_and_payload():
+    args = _args()
+    args.opd_teacher_gateway_url = "http://gateway/teacher/"
+    payload = {"input_ids": [1, 2], "return_logprob": True}
+    url, forwarded = opd._teacher_request_target(args, _sample(VL_SOURCE, 0), payload)
+    assert url == "http://gateway/teacher/generate"
+    assert forwarded == {**payload, "route_key": VL_SOURCE}
+    assert "route_key" not in payload
+    assert args.opd_teacher_routes_map[VL_SOURCE] == VL_REPLICAS
+    with pytest.raises(KeyError):
+        opd._teacher_request_target(args, _sample("unknown", 0), payload)
+
+
+def test_teacher_request_target_keeps_external_raw_url():
+    args = Namespace(opd_teacher_url="http://external/generate")
+    payload = {"input_ids": [1]}
+    assert opd._teacher_request_target(args, None, payload) == (args.opd_teacher_url, payload)
+
+
+def test_teacher_gateway_deployment_uses_cpu_role_ingress(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from ray import serve
+
+    from relax.components import inference_gateway
+    from relax.utils import utils
+    from relax.utils.opd import opd_utils
+
+    deployment = MagicMock()
+    run = MagicMock()
+    monkeypatch.setattr(inference_gateway, "InferenceGatewayDeployment", deployment)
+    monkeypatch.setattr(serve, "run", run)
+    monkeypatch.setattr(utils, "get_serve_url", lambda prefix: f"http://serve{prefix}")
+    managers = {"text": object(), "vision": object()}
+    assert opd_utils._deploy_teacher_gateway(managers) == "http://serve/teacher"
+    deployment.bind.assert_called_once_with("teacher", role_manager_handle=managers["text"])
+    run.assert_called_once_with(deployment.bind.return_value, name="teacher_gateway", route_prefix="/teacher")
+
+
 def _interleaved_picks() -> dict[tuple[str, int], list[str]]:
     """Two data_sources alternating by ``group_index``, mirroring a merged
     dataset.

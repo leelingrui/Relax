@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
+from relax.components.inference_gateway import GATEWAY_REQUEST_HEADER
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
@@ -388,6 +389,14 @@ class Rollout(Base):
     def get_rollout_manager(self) -> Any:
         return self.rollout_manager
 
+    @staticmethod
+    def _require_gateway_request(request: Request) -> None:
+        if request.headers.get(GATEWAY_REQUEST_HEADER) != "1":
+            raise HTTPException(
+                status_code=403,
+                detail="Rollout inference must be accessed through the role Gateway",
+            )
+
     def set_barriers(
         self,
         *,
@@ -668,6 +677,10 @@ class Rollout(Base):
         self.status = "running"
         await self.rollout_manager.set_weight_updating.remote(False)
 
+        # The update lease alone is not evidence of ready weights. Re-observe
+        # health, Router registration and engine-reported versions afterwards.
+        await self.rollout_manager.refresh_inference_state.remote()
+
     @app.get("/recover_rollout_engines")
     async def recover_rollout_engines(self):
         self._logger.info("Recovering rollout engines")
@@ -819,8 +832,16 @@ class Rollout(Base):
         )
 
     @app.get("/engines")
-    async def get_engines(self, model_name: Optional[str] = None):
-        result = await self.rollout_manager.get_engines_info.remote(model_name)
+    async def get_engines(
+        self,
+        model_name: Optional[str] = None,
+        schema_version: Optional[int] = None,
+        status_filter: Optional[str] = None,
+    ):
+        if schema_version == 2:
+            snapshot = await self.rollout_manager.get_discovery_snapshot.remote(model_name, status_filter)
+            return snapshot.to_dict(status_filter)
+        result = await self.rollout_manager.get_engines_info.remote(model_name, status_filter)
         return result
 
     @app.post("/scale_in", response_model=ScaleInResponse)
@@ -920,6 +941,7 @@ class Rollout(Base):
 
     @app.post("/v1/chat/completions")
     async def chat_completions(self, request: Request):
+        self._require_gateway_request(request)
         body = await request.body()
         try:
             payload = ChatCompletionRequest.model_validate_json(body)
@@ -992,7 +1014,8 @@ class Rollout(Base):
         return {k: v for k, v in original_headers.items() if k.lower() not in hop_by_hop}
 
     @app.get("/v1/models", response_model=ModelListResponse)
-    async def list_models(self):
+    async def list_models(self, request: Request):
+        self._require_gateway_request(request)
         sglang_url = await self._get_sglang_url("/v1/models")
         client = self._get_proxy_client()
         try:

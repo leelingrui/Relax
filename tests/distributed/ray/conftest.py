@@ -177,7 +177,7 @@ def make_engine_group(
     if args is None:
         args = make_mock_args()
     if engines is None:
-        engines = [make_mock_engine()]
+        engines = [make_mock_engine() for _ in range(max(1, num_gpus_per_engine // args.num_gpus_per_node))]
     return EngineGroup(
         args=args,
         pg=None,
@@ -251,6 +251,30 @@ def create_test_manager(args=None, servers=None):
     manager._port_cursors = {}
     manager._eviction_monitor_stop = None
     manager._eviction_monitor_thread = None
+    from relax.distributed.ray.inference_role import UnifiedServiceManager
+    from relax.distributed.ray.model_pool import ModelPool
+    from relax.distributed.ray.rollout import _RolloutPoolRuntime
+    from relax.engine.inference.capabilities import WeightSource
+    from relax.engine.inference.manager import InferenceManager
+    from relax.engine.inference.specs import ModelSpec
+    from relax.engine.inference.types import Role, RoutingSpec
+
+    manager.status = None
+    manager.inference_manager = InferenceManager(Role.ROLLOUT)
+    pools = {}
+    for name, server in manager.servers.items():
+        manager.inference_manager.register_model(
+            ModelSpec(name, "test-checkpoint", weight_source=WeightSource.POLICY, allow_defer=True),
+            operation_id=f"register:{name}",
+        )
+        pools[name] = ModelPool.from_runtime(manager.inference_manager, name, _RolloutPoolRuntime(server))
+    manager.inference_manager.configure_routes(
+        RoutingSpec(default_model=next(iter(manager.servers)) if len(manager.servers) == 1 else None),
+        operation_id="routes",
+    )
+    manager.service_manager = UnifiedServiceManager(
+        Role.ROLLOUT, inference_manager=manager.inference_manager, pools=pools
+    )
     return manager
 
 

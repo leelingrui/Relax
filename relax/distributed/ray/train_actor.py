@@ -59,6 +59,9 @@ class TrainRayActor(RayActor):
         set_memory_role(role)
         self.with_ref = with_ref
         self.with_opd_teacher = with_opd_teacher
+        # Set by set_inference_manager once the control plane exists.
+        self._inference_manager_handle = None
+        self._phase_client = None
 
         torch.serialization.add_safe_globals([relax.utils.training.eval_config.EvalDatasetConfig])
 
@@ -129,3 +132,25 @@ class TrainRayActor(RayActor):
         """Set the managed OPD teacher manager for coordinated
         offload/onload."""
         self.teacher_manager = teacher_manager
+
+    def set_inference_manager(self, inference_manager_handle):
+        """Attach the task's inference control plane for phase coordination.
+
+        A layout whose roles have their own GPUs has no coordinator, and the
+        client then reports no sequenced phases so the existing direct
+        offload/onload path stays in use.
+        """
+        from relax.distributed.ray.lifecycle_client import phase_client
+
+        self._inference_manager_handle = inference_manager_handle
+        self._phase_client = phase_client(inference_manager_handle)
+        if self._phase_client is not None:
+            logger.info(f"Inference phase coordination enabled: phases={self._phase_client.phases()}")
+
+    @property
+    def phase_client(self):
+        return getattr(self, "_phase_client", None)
+
+    def coordinated_phases(self) -> tuple[str, ...]:
+        client = self.phase_client
+        return client.phases() if client is not None else ()

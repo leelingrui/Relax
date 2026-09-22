@@ -26,6 +26,8 @@ from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_genrm_managers
+from relax.engine.inference.discovery import new_manager_epoch
+from relax.engine.inference.types import Role
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
 
@@ -132,6 +134,7 @@ class GenRM(Base):
         config: Namespace,
         role: str,
         runtime_env: Optional[dict] = None,
+        inference_manager_handle: Any | None = None,
     ) -> None:
         """Initialize GenRM service.
 
@@ -150,7 +153,11 @@ class GenRM(Base):
 
         # {route_key: GenRMManager handle}. Single-instance configs (the legacy
         # --genrm-model-path path) resolve to exactly {"__default__": manager}.
-        self.genrm_managers = create_genrm_managers(config, pg, runtime_env=runtime_env)
+        self.genrm_managers = create_genrm_managers(
+            config, pg, runtime_env=runtime_env, inference_manager_handle=inference_manager_handle
+        )
+        self._role_manager = next(iter(self.genrm_managers.values()))
+        self._manager_epoch = new_manager_epoch()
         self.instance_specs = config._genrm_instances_resolved
 
         self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
@@ -170,6 +177,53 @@ class GenRM(Base):
             key: load_tokenizer(spec["model_path"], trust_remote_code=True)
             for key, spec in self.instance_specs.items()
         }
+
+    @app.get("/engines")
+    async def get_engines(self, schema_version: int | None = None, status_filter: str | None = None) -> dict:
+        """Return v2 discovery, while retaining the legacy route surface."""
+        if schema_version != 2:
+            return {
+                "models": {
+                    key: {"router_ip": None, "router_port": None, "engine_groups": [], "total_engines": 0}
+                    for key in self.genrm_managers
+                },
+                "total_engines": 0,
+            }
+        if getattr(self, "_role_manager", None) is not None:
+            snapshot = await asyncio.to_thread(ray.get, self._role_manager.get_role_snapshot.remote())
+            return snapshot.to_dict(status_filter)
+        refs = [
+            manager.get_discovery_snapshot.remote(
+                role=Role.GENRM, model_id=key, allow_defer=True, status_filter=status_filter
+            )
+            for key, manager in self.genrm_managers.items()
+        ]
+        snapshots = await asyncio.to_thread(ray.get, refs)
+        if not snapshots:
+            return {
+                "schema_version": 2,
+                "role": Role.GENRM.value,
+                "manager_epoch": self._manager_epoch,
+                "topology_revision": 0,
+                "models": {},
+            }
+        return {
+            "schema_version": 2,
+            "role": Role.GENRM.value,
+            "manager_epoch": self._manager_epoch,
+            "topology_revision": max(snapshot.topology_revision for snapshot in snapshots),
+            "phase": None,
+            "routing": {
+                "default_model": next(iter(self.genrm_managers)) if len(self.genrm_managers) == 1 else None,
+                "route_key_to_model": {key: key for key in self.genrm_managers},
+                "config_version": 0,
+            },
+            "models": {model.model_id: model.to_dict() for snapshot in snapshots for model in snapshot.models},
+        }
+
+    async def get_role_snapshot(self) -> Any:
+        """Expose the shared role snapshot to the task inference owner."""
+        return await asyncio.to_thread(ray.get, self._role_manager.get_role_snapshot.remote())
 
     def run(self):
         """GenRM is a passive HTTP service, no background loop needed.
@@ -235,23 +289,13 @@ class GenRM(Base):
         host, port = hosts_ports[idx]
         return key, idx, host, port
 
-    async def _call_engine(
+    async def prepare_generate_payload(
         self, route_key: Optional[str], messages: list, sampling_params: Optional[dict] = None
     ) -> dict:
-        """Call an SGLang engine for text generation.
-
-        Uses the engine addresses obtained from the selected instance's
-        GenRMManager to send HTTP requests to the underlying SGLang server.
-
-        Args:
-            route_key: Selects which genRM instance to use.
-            messages: List of chat messages in OpenAI format.
-            sampling_params: Optional per-request sampling params that override defaults.
-
-        Returns:
-            Dict containing at least {"text": str} from the SGLang server.
-        """
-        key, idx, host, port = self._pick_engine(route_key)
+        """Adapt messages on CPU using the selected instance's existing
+        tokenizer."""
+        key = self._resolve_instance_key(route_key)
+        messages = [message.model_dump() if isinstance(message, Message) else message for message in messages]
         spec = self.instance_specs[key]
         # ensure plain list — some tokenizers return BatchEncoding which is not JSON-serializable
         # Tokenization (chat-template render + encode) is synchronous CPU work; run it in a
@@ -290,10 +334,18 @@ class GenRM(Base):
         if sampling_params:
             default_sampling.update(sampling_params)
 
-        payload = {
+        return {
             "input_ids": input_ids,
             "sampling_params": default_sampling,
         }
+
+    async def _call_engine(
+        self, route_key: Optional[str], messages: list, sampling_params: Optional[dict] = None
+    ) -> dict:
+        """Adapt messages once and call a live engine, retrying transient
+        failures."""
+        key, idx, host, port = self._pick_engine(route_key)
+        payload = await self.prepare_generate_payload(key, messages, sampling_params)
 
         # Retry transient resets (transport-level or 5xx) with short backoff so
         # bursty colocate contention doesn't surface as a 500; 4xx is a client bug
