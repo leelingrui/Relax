@@ -51,6 +51,9 @@ from relax.utils.scale_utils import PrecheckProbeCategory
 
 logger = get_logger(__name__)
 
+# Bound on waiting for the Router to finish a queued worker addition.
+_ROUTER_JOIN_TIMEOUT_S = 30.0
+
 
 # GenRM colocate offload drain: bound every HTTP round-trip and the whole drain
 # by a wall-clock deadline so a wedged SGLang scheduler surfaces as a
@@ -371,6 +374,9 @@ class SGLangEngine(RayActor):
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
         self._router_registered = False
+        # Memory types released and not yet resumed. A generation probe while
+        # any of them is missing (e.g. weights back, KV cache not) crashes SGLang.
+        self._released_memory: set[str] = set()
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -891,6 +897,14 @@ class SGLangEngine(RayActor):
                     timeout=30,
                 )
             else:
+                if self._router_lists_worker(worker_url):
+                    # An addition queued by an earlier attempt has completed.
+                    self._router_unregister_submitted = False
+                    self._router_registered = True
+                    logger.info(
+                        f"Engine {worker_url} is already registered to router {self.router_ip}:{self.router_port}"
+                    )
+                    return True
                 payload = {
                     "url": worker_url,
                     "worker_type": self.worker_type,
@@ -926,6 +940,10 @@ class SGLangEngine(RayActor):
                         self._router_worker_id = worker_id
                 if self._router_worker_id is None:
                     logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
+                # The Router only queues the addition; the worker serves once it
+                # is listed, which fails silently if the Router cannot reach it.
+                if not self._wait_for_router_membership(worker_url, _ROUTER_JOIN_TIMEOUT_S, present=True):
+                    return False
             self._router_unregister_submitted = False
             self._router_registered = True
             logger.info(f"Registered engine {worker_url} to router {self.router_ip}:{self.router_port}")
@@ -934,21 +952,24 @@ class SGLangEngine(RayActor):
             logger.warning(f"Failed to register engine to router: {e}")
             return False
 
-    def _wait_for_router_removal(self, worker_url: str, timeout: float) -> bool:
+    def _router_lists_worker(self, worker_url: str, timeout: float = 5.0) -> bool:
+        response = requests.get(f"http://{self.router_ip}:{self.router_port}/workers", timeout=timeout)
+        response.raise_for_status()
+        workers = response.json().get("workers", [])
+        return any(
+            isinstance(worker, dict) and router_worker_base_url(worker.get("url", "")) == worker_url
+            for worker in workers
+        )
+
+    def _wait_for_router_membership(self, worker_url: str, timeout: float, *, present: bool) -> bool:
         deadline = time.monotonic() + timeout
         last_error = None
         while True:
             try:
-                response = requests.get(
-                    f"http://{self.router_ip}:{self.router_port}/workers",
-                    timeout=min(5.0, max(1.0, deadline - time.monotonic())),
-                )
-                response.raise_for_status()
-                workers = response.json().get("workers", [])
-                if not any(
-                    isinstance(worker, dict) and router_worker_base_url(worker.get("url", "")) == worker_url
-                    for worker in workers
-                ):
+                if self._router_lists_worker(worker_url, timeout=min(5.0, max(1.0, deadline - time.monotonic()))):
+                    if present:
+                        return True
+                elif not present:
                     return True
                 last_error = None
             except Exception as e:
@@ -956,9 +977,13 @@ class SGLangEngine(RayActor):
 
             if time.monotonic() >= deadline:
                 error_suffix = f": {last_error}" if last_error is not None else ""
-                logger.warning(f"Timed out waiting for worker {worker_url} to leave the router{error_suffix}")
+                action = "join" if present else "leave"
+                logger.warning(f"Timed out waiting for worker {worker_url} to {action} the router{error_suffix}")
                 return False
             time.sleep(0.5)
+
+    def _wait_for_router_removal(self, worker_url: str, timeout: float) -> bool:
+        return self._wait_for_router_membership(worker_url, timeout, present=False)
 
     def unregister_from_router(self, wait_for_removal: bool = False, timeout: float = 30.0) -> bool:
         self._router_registered = False
@@ -1054,8 +1079,12 @@ class SGLangEngine(RayActor):
         return response.json()["weight_version"]
 
     def get_inference_observation(self, ensure_router: bool = False) -> dict:
-        """Return bounded runtime evidence for Manager topology publication."""
-        healthy = self.health_generate(timeout=5.0)
+        """Return bounded runtime evidence for Manager topology publication.
+
+        A partially resumed engine is reported unhealthy without a generation
+        probe; it is checked once all its memory is back.
+        """
+        healthy = not getattr(self, "_released_memory", None) and self.health_generate(timeout=5.0)
         version = None
         if healthy and self.node_rank == 0 and self.weight_source == WeightSource.DCS:
             response = requests.get(f"http://{self.server_host}:{self.server_port}/get_weight_version", timeout=5.0)
@@ -1077,6 +1106,11 @@ class SGLangEngine(RayActor):
         }
 
     def release_memory_occupation(self):
+        # Marked before the request: a release that fails half-way leaves the
+        # memory state unknown, so the engine must not be probed either.
+        from sglang.srt.constants import GPU_MEMORY_ALL_TYPES
+
+        self._released_memory = set(GPU_MEMORY_ALL_TYPES)
         if self.role == Role.GENRM:
             return self._release_genrm_memory_occupation()
         self.flush_cache()
@@ -1088,6 +1122,7 @@ class SGLangEngine(RayActor):
             "resume_memory_occupation",
             {"tags": tags},
         )
+        self._released_memory = set() if tags is None else getattr(self, "_released_memory", set()) - set(tags)
         # Re-open admission that the GenRM release closed via
         # /pause_generation. Only after a full resume (weights + KV cache back):
         # GenRM always full-resumes, but the ``not tags`` guard prevents

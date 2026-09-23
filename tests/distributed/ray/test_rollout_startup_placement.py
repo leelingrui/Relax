@@ -15,7 +15,9 @@ import pytest
 
 try:
     from relax.distributed.ray import rollout as module
+    from relax.engine.inference.config import EngineGroupConfig, ModelConfig
     from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementPlanner
+    from relax.engine.inference.types import Role, WeightSource
 
     HAS_DEPS = True
 except ImportError:
@@ -37,6 +39,7 @@ def _args():
         hf_checkpoint="/tmp/checkpoint",
         sglang_router_ip=None,
         sglang_router_port=None,
+        debug_rollout_only=False,
     )
 
 
@@ -50,6 +53,7 @@ def startup(monkeypatch):
         group = MagicMock()
         group.placement = kwargs["placement"]
         group.pg_owner = kwargs["pg_owner"]
+        group.kwargs = kwargs
         if state.fail:
             group.start_engines.side_effect = RuntimeError("engine bring-up failed")
         else:
@@ -61,8 +65,8 @@ def startup(monkeypatch):
     return state
 
 
-def _pg():
-    return (MagicMock(), [0, 1, 2, 3], [0, 1, 2, 3])
+def _pg(num_gpus=4):
+    return (MagicMock(), list(range(num_gpus)), list(range(num_gpus)))
 
 
 def _view(pg):
@@ -80,7 +84,7 @@ def test_rollout_startup_records_its_layout_in_the_supplied_ledger(startup):
     )
 
     (recorded,) = ledger.allocations(_view(pg))
-    assert recorded.group_id == "default/group-0"
+    assert recorded.group_id == "rollout/default/group-0"
     assert recorded.reserved_offset == 0
     assert recorded.referenced_offsets == (0, 2)
     assert startup.groups[0].placement == recorded
@@ -115,3 +119,53 @@ def test_rollout_startup_failure_keeps_the_controller_owned_group(startup):
 
     # Releasing a borrowed group never authorizes destroying it.
     assert ledger.release(_view(pg)).remove_placement_group is False
+
+
+def _start_teacher(args, pg, ledger, *, bundle_offset, phase):
+    teacher = ModelConfig(
+        "default",
+        "/tmp/teacher",
+        engine_groups=[EngineGroupConfig("regular", 4, 2, {})],
+        weight_source=WeightSource.STATIC,
+    ).resolved(args)
+    return module.start_servers(
+        args, [teacher], planner=ledger, role=Role.TEACHER, pg=pg, bundle_offset=bundle_offset, phase=phase
+    )
+
+
+def test_rollout_startup_split_teacher_keeps_rollout_at_the_front(startup):
+    args = _args()
+    ledger = PlacementPlanner()
+    pg = _pg(8)
+
+    # A split teacher sits behind the rollout region and is recorded first.
+    _start_teacher(args, pg, ledger, bundle_offset=4, phase=module.PHASE_GENERATE)
+    module.start_rollout_servers(args, pg, planner=ledger)
+
+    offsets = {item.group_id: item.reserved_offset for item in ledger.allocations(_view(pg))}
+    assert offsets == {"teacher/default/group-0": 4, "rollout/default/group-0": 0}
+
+
+def test_rollout_startup_shared_teacher_with_same_model_name_does_not_conflict(startup):
+    args = _args()
+    ledger = PlacementPlanner()
+    pg = _pg(4)
+
+    _start_teacher(args, pg, ledger, bundle_offset=0, phase="teacher")
+    module.start_rollout_servers(args, pg, planner=ledger)
+
+    assert {item.group_id for item in ledger.allocations(_view(pg))} == {
+        "teacher/default/group-0",
+        "rollout/default/group-0",
+    }
+
+
+def test_rollout_startup_debug_rollout_only_registers_engines_at_start(startup):
+    args = _args()
+    args.debug_rollout_only = True
+
+    (server,) = module.start_rollout_servers(args, _pg(), planner=PlacementPlanner()).values()
+
+    # No weight sync ever runs, so the engines must not wait for one.
+    assert startup.groups[0].kwargs["skip_router_registration"] is False
+    assert server.model_spec.needs_weight_update is False

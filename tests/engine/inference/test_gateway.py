@@ -310,3 +310,24 @@ async def test_gateway_completes_admitted_requests_and_aborts_failed_ones() -> N
         assert owner.inflight == set()
     finally:
         await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_deployment_routes_reach_the_serving_replica(monkeypatch) -> None:
+    from ray import serve
+
+    from relax.components.inference_gateway import InferenceGatewayDeployment
+
+    # Build the replica the way Serve does; its routes are served from the copy
+    # of the app that ``serve.ingress`` made, not from the module-level one.
+    cls = InferenceGatewayDeployment.func_or_class
+    replica = cls.__new__(cls)
+    await replica.__init__(Role.ROLLOUT, manager_handle=_owner(_snapshot))
+    monkeypatch.setattr(serve, "get_replica_context", lambda: SimpleNamespace(servable_object=replica))
+
+    transport = httpx.ASGITransport(app=replica._asgi_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+        assert (await client.get("/health")).status_code == 200
+        assert (await client.get("/engines")).json()["models"]
+        assert (await client.get("/v1/models")).json()["data"][0]["id"] == "model-a"
+    await replica.close()

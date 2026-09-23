@@ -114,9 +114,11 @@ class _RouterRequests:
         self.posts: list[str] = []
         self.deletes: list[str] = []
         self.gets: list[str] = []
+        self.registered: list[dict] = []
 
     def post(self, url, json=None, timeout=None):
         self.posts.append(url)
+        self.registered.append({"url": json["url"]})
         headers = {"Location": self.location} if self.location is not None else {}
         payload = {"worker_id": self.worker_id}
         if self.body_location is not None:
@@ -128,11 +130,24 @@ class _RouterRequests:
         return _Response(self.delete_status)
 
     def get(self, url, timeout=None):
-        if self.worker_lists is None:
-            raise AssertionError("registration-level worker_id should avoid listing DP rank workers")
         self.gets.append(url)
+        if self.worker_lists is None:
+            # Registration confirms membership; unregistering by worker_id never lists.
+            return _Response(200, {"workers": list(self.registered)})
         workers = self.worker_lists[0] if len(self.worker_lists) == 1 else self.worker_lists.pop(0)
         return _Response(200, {"workers": workers})
+
+
+def _router_get(post, weight_version=None):
+    """A ``requests.get`` for one worker: its weight version, and the Router
+    listing it once ``post`` registered it."""
+
+    def get(url, timeout=None):
+        if url.endswith("/get_weight_version"):
+            return _Response(200, {"weight_version": weight_version})
+        return _Response(200, {"workers": [{"url": "http://worker:8000"}] if post.called else []})
+
+    return get
 
 
 class _Clock:
@@ -215,7 +230,8 @@ def test_registration_falls_back_to_location_worker_id(
     assert engine.unregister_from_router()
 
     assert requests.deletes == [f"http://router:30000/workers/{expected_worker_id}"]
-    assert requests.gets == []
+    # Only registration lists: once before posting, once to confirm the join.
+    assert requests.gets == ["http://router:30000/workers"] * 2
 
 
 def test_unregister_falls_back_to_exact_non_dp_worker(monkeypatch, sglang_engine_module):
@@ -469,6 +485,7 @@ def test_router_registration_preserves_pd_bootstrap_payload(monkeypatch, sglang_
     engine.worker_type = worker_type
     post = MagicMock(return_value=_Response(200, {"worker_id": "worker-id"}))
     monkeypatch.setattr(sglang_engine_module.requests, "post", post)
+    monkeypatch.setattr(sglang_engine_module.requests, "get", _router_get(post))
 
     assert engine.register_to_router(bootstrap_port=9000)
 
@@ -510,8 +527,8 @@ def test_inference_observation_policy_valid_version_registers_when_requested(
 
     engine = _make_engine(sglang_engine_module)
     engine.health_generate = MagicMock(return_value=True)
-    get = MagicMock(return_value=_Response(200, {"weight_version": "v1"}))
     post = MagicMock(return_value=_Response(200, {"worker_id": "worker-id"}))
+    get = MagicMock(side_effect=_router_get(post, "v1"))
     monkeypatch.setattr(sglang_engine_module.requests, "get", get)
     monkeypatch.setattr(sglang_engine_module.requests, "post", post)
 
@@ -520,7 +537,7 @@ def test_inference_observation_policy_valid_version_registers_when_requested(
     assert observation["healthy"] is True
     assert observation["weight_version"] == "v1"
     assert observation["router_registered"] is ensure_router
-    get.assert_called_once_with("http://worker:8000/get_weight_version", timeout=5.0)
+    assert get.call_args_list[0] == (("http://worker:8000/get_weight_version",), {"timeout": 5.0})
     if ensure_router:
         post.assert_called_once_with(
             "http://router:30000/workers",
@@ -539,8 +556,8 @@ def test_inference_observation_checkpoint_registers_without_weight_version(monke
     engine = _make_engine(sglang_engine_module)
     engine.weight_source = sglang_engine_module.WeightSource.STATIC
     engine.health_generate = MagicMock(return_value=True)
-    get = MagicMock()
     post = MagicMock(return_value=_Response(200, {"worker_id": "worker-id"}))
+    get = MagicMock(side_effect=_router_get(post))
     monkeypatch.setattr(sglang_engine_module.requests, "get", get)
     monkeypatch.setattr(sglang_engine_module.requests, "post", post)
 
@@ -549,7 +566,7 @@ def test_inference_observation_checkpoint_registers_without_weight_version(monke
     assert observation["healthy"] is True
     assert observation["weight_version"] is None
     assert observation["router_registered"] is True
-    get.assert_not_called()
+    assert all(not call.args[0].endswith("/get_weight_version") for call in get.call_args_list)
     post.assert_called_once_with(
         "http://router:30000/workers",
         json={"url": "http://worker:8000", "worker_type": "regular"},
@@ -567,10 +584,10 @@ def test_inference_observation_registration_failure_has_no_ready_evidence(
     engine = _make_engine(sglang_engine_module)
     engine.weight_source = sglang_engine_module.WeightSource(weight_source)
     engine.health_generate = MagicMock(return_value=True)
-    get = MagicMock(return_value=_Response(200, {"weight_version": "v1"}))
     post = MagicMock(return_value=_Response(503))
     if failure == "connection_error":
         post.side_effect = sglang_engine_module.requests.exceptions.ConnectionError("router unavailable")
+    get = MagicMock(side_effect=_router_get(post, "v1"))
     monkeypatch.setattr(sglang_engine_module.requests, "get", get)
     monkeypatch.setattr(sglang_engine_module.requests, "post", post)
 
@@ -597,3 +614,63 @@ def test_engine_shutdown_respects_external_ownership(monkeypatch, sglang_engine_
         assert events == ([] if external else ["router", ("kill", 42)])
     finally:
         del engine.process  # Do not invoke the destructor's process cleanup in this unit test.
+
+
+def test_inference_observation_skips_generation_probe_until_memory_is_resumed(monkeypatch, sglang_engine_module):
+    from unittest.mock import MagicMock
+
+    constants = ModuleType("sglang.srt.constants")
+    constants.GPU_MEMORY_ALL_TYPES = ["kv_cache", "weights", "cuda_graph"]
+    monkeypatch.setitem(sys.modules, "sglang.srt.constants", constants)
+    engine = _make_engine(sglang_engine_module)
+    engine.role = sglang_engine_module.Role.ROLLOUT
+    engine.weight_source = sglang_engine_module.WeightSource.DCS
+    engine.flush_cache = MagicMock()
+    engine._make_request = MagicMock()
+    engine.health_generate = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        sglang_engine_module.requests, "get", MagicMock(return_value=_Response(200, {"weight_version": "v1"}))
+    )
+
+    engine.release_memory_occupation()
+    engine.resume_memory_occupation(tags=["weights"])
+    # Weights are back but the KV cache is not: probing generation crashes SGLang.
+    assert engine.get_inference_observation()["healthy"] is False
+    engine.health_generate.assert_not_called()
+
+    engine.resume_memory_occupation(tags=["kv_cache", "cuda_graph"])
+    assert engine.get_inference_observation()["healthy"] is True
+    engine.health_generate.assert_called_once_with(timeout=5.0)
+
+
+def test_registration_waits_until_router_lists_the_worker(monkeypatch, sglang_engine_module):
+    # The addition is queued; the Router lists the worker only on the third poll.
+    requests = _RouterRequests(worker_lists=[[], [], [], [{"url": "http://worker:8000"}]])
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    monkeypatch.setattr(sglang_engine_module, "time", _Clock())
+    engine = _make_engine(sglang_engine_module)
+
+    assert engine.register_to_router()
+    assert engine._router_registered is True
+    assert requests.posts == ["http://router:30000/workers"]
+
+
+def test_registration_that_never_joins_is_not_registered(monkeypatch, sglang_engine_module):
+    # e.g. the Router cannot reach the engine, so its queued addition fails silently.
+    requests = _RouterRequests(worker_lists=[[]])
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    monkeypatch.setattr(sglang_engine_module, "time", _Clock())
+    engine = _make_engine(sglang_engine_module)
+
+    assert not engine.register_to_router()
+    assert engine._router_registered is False
+
+
+def test_registration_retry_does_not_repost_a_joined_worker(monkeypatch, sglang_engine_module):
+    requests = _RouterRequests(worker_lists=[[{"url": "http://worker:8000"}]])
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    engine = _make_engine(sglang_engine_module)
+
+    assert engine.register_to_router()
+    assert engine._router_registered is True
+    assert requests.posts == []

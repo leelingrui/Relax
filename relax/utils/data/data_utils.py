@@ -305,7 +305,10 @@ def build_messages(
                 )
 
     if system_prompt is not None:
-        final_message = [{"role": "system", "content": [{"type": "text", "text": system_prompt}]}]
+        # Text-only chat templates may concatenate content directly as a string.
+        structured = multimodal_keys or any(isinstance(message.get("content"), list) for message in prompt)
+        content = [{"type": "text", "text": system_prompt}] if structured else system_prompt
+        final_message = [{"role": "system", "content": content}]
         final_message.extend(prompt)
         return final_message
 

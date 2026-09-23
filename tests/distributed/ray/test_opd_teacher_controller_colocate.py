@@ -94,3 +94,32 @@ def test_shared_teacher_layout_starts_at_bundle_zero_and_defers():
     assert placement_phase(shared, PHASE_TEACHER) == PHASE_TEACHER
     assert teacher_region_offset(split) == 4 and not deferred_opd_enabled(split)
     assert placement_phase(split, PHASE_TEACHER) != PHASE_TEACHER
+
+
+def test_shared_teacher_layout_rejects_agentic_rollout():
+    import pytest
+
+    from relax.utils.opd.opd_utils import validate_managed_opd_teacher_colocate_args
+
+    def _args(rollout_gpus, teacher_gpus):
+        return Namespace(
+            use_opd=True,
+            opd_type="sglang",
+            colocate=True,
+            hybrid=False,
+            opd_teacher_routes=None,
+            teacher_hf_checkpoint="/ckpt",
+            use_agentic_rollout=True,
+            use_critic=False,
+            actor_num_gpus_per_node=8,
+            actor_num_nodes=1,
+            offload_train=None,
+            offload_rollout=None,
+            rollout_num_gpus=rollout_gpus,
+            resource={"actor": [1, 8], "rollout": [1, rollout_gpus], "teacher": [1, teacher_gpus]},
+        )
+
+    # The resident Agentic pipeline never runs the deferred stage that wakes a shared teacher.
+    with pytest.raises(ValueError, match="Agentic rollout"):
+        validate_managed_opd_teacher_colocate_args(_args(8, 8))
+    validate_managed_opd_teacher_colocate_args(_args(4, 4))
