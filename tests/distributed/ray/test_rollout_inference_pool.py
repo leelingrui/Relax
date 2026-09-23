@@ -17,6 +17,8 @@ from conftest import (
 
 
 if HAS_DEPS:
+    import ray
+
     from relax.engine.inference.config import ModelConfig
     from relax.engine.inference.types import LifecycleState, Role, WeightSource
 
@@ -103,3 +105,54 @@ def test_static_server_offload_and_onload_are_idempotent(patch_ray_get: Any) -> 
     assert engine.release_memory_occupation.remote.call_count == 1
     assert engine.resume_memory_occupation.remote.call_count == 1
     assert server.observe().state == LifecycleState.READY
+
+
+def test_policy_weights_onload_retires_dead_engine_before_recovery(patch_ray_get: Any, monkeypatch: Any) -> None:
+    dead, healthy, rebuilt = [_observed_engine() for _ in range(3)]
+    dead.resume_memory_occupation.remote.return_value = AwaitableValue(ConnectionError("server exited"))
+    group = make_engine_group(engines=[dead, healthy])
+    group.pg = object()
+    group.args.offload_rollout = True
+    server = make_rollout_server(engine_groups=[group])
+    server.model_spec = ModelConfig("default", "ckpt", fault_tolerance_enabled=True)
+    server.onloaded = False
+    get = ray.get
+
+    def checked_get(ref: Any, **kwargs: Any) -> Any:
+        result = get(ref, **kwargs)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(ray, "get", checked_get)
+    monkeypatch.setattr(ray, "kill", MagicMock())
+
+    def rebuild(cursors: dict) -> tuple:
+        assert group.all_engines == [None, healthy]
+        group.all_engines[0] = rebuilt
+        group.num_new_engines = 1
+        return [], cursors
+
+    group.start_engines = MagicMock(side_effect=rebuild)
+    server.onload(tags=["weights"])
+    assert group.all_engines == [None, healthy]
+    group.start_engines.assert_not_called()
+    assert not server.onloaded
+
+    server.recover()
+    assert server.num_new_engines == 1
+    healthy.resume_memory_occupation.remote.assert_called_once_with(tags=["weights"])
+    rebuilt.release_memory_occupation.remote.assert_called_once_with()
+    rebuilt.resume_memory_occupation.remote.assert_called_once_with(tags=["weights"])
+
+
+@pytest.mark.parametrize("fault_tolerance,tags", [(False, ["weights"]), (True, None), (True, ["kv_cache"])])
+def test_policy_onload_other_paths_still_propagate_failure(
+    patch_ray_get: Any, fault_tolerance: bool, tags: list[str] | None
+) -> None:
+    group = make_engine_group()
+    group.onload = MagicMock(side_effect=ConnectionError("server exited"))
+    server = make_rollout_server(engine_groups=[group])
+    server.model_spec = ModelConfig("default", "ckpt", fault_tolerance_enabled=fault_tolerance)
+    with pytest.raises(ConnectionError, match="server exited"):
+        server.onload(tags=tags)

@@ -785,6 +785,15 @@ class RolloutServer:
                 self._retire(dead)
                 self._rebuild()
             result = []
+        elif (
+            tags == [GPU_MEMORY_TYPE_WEIGHTS]
+            and self.model_spec is not None
+            and self.model_spec.fault_tolerance_enabled
+        ):
+            # Monitoring is paused while asleep. Retire dead handles here so
+            # the following recovery can rebuild and reconnect weight sync.
+            self._retire(self._call_heads("resume_memory_occupation", tags=tags))
+            result = []
         else:
             handles = []
             for g in self.engine_groups:
