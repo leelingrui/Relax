@@ -343,49 +343,41 @@ class InferenceGateway:
 gateway_app = FastAPI()
 
 
-@gateway_app.get("/engines")
-async def _engines(request: Request, schema_version: int | None = None, status_filter: str | None = None):
-    return await request.app.state.gateway.engines(schema_version, status_filter)
-
-
-@gateway_app.get("/health")
-async def _health(request: Request):
-    return await request.app.state.gateway.health()
-
-
-@gateway_app.get("/v1/models")
-async def _models(request: Request):
-    return await request.app.state.gateway.models()
-
-
-@gateway_app.api_route("/generate", methods=["POST"])
-async def _generate(request: Request):
-    return await request.app.state.gateway.proxy(request, "generate")
-
-
-@gateway_app.api_route("/v1/chat/completions", methods=["POST"])
-async def _chat(request: Request):
-    return await request.app.state.gateway.proxy(request, "v1/chat/completions")
-
-
-@gateway_app.api_route("/chat/completions", methods=["POST"])
-async def _chat_legacy(request: Request):
-    return await request.app.state.gateway.proxy(request, "v1/chat/completions")
-
-
-@gateway_app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
-async def _backend(request: Request, path: str):
-    return await request.app.state.gateway.proxy_backend(request, path)
-
-
+# Routes live in the deployment class: ``serve.ingress`` serves a copy of
+# ``gateway_app`` and binds each replica instance to its routes as ``self``, so
+# nothing is looked up through the module-level app's state.
 @serve.deployment(ray_actor_options={"num_gpus": 0}, max_ongoing_requests=128)
 @serve.ingress(gateway_app)
 class InferenceGatewayDeployment(InferenceGateway):
     """Ray Serve deployment form of :class:`InferenceGateway`."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        gateway_app.state.gateway = self
+    @gateway_app.get("/engines")
+    async def _engines(self, schema_version: int | None = None, status_filter: str | None = None):
+        return await self.engines(schema_version, status_filter)
+
+    @gateway_app.get("/health")
+    async def _health(self):
+        return await self.health()
+
+    @gateway_app.get("/v1/models")
+    async def _models(self):
+        return await self.models()
+
+    @gateway_app.api_route("/generate", methods=["POST"])
+    async def _generate(self, request: Request):
+        return await self.proxy(request, "generate")
+
+    @gateway_app.api_route("/v1/chat/completions", methods=["POST"])
+    async def _chat(self, request: Request):
+        return await self.proxy(request, "v1/chat/completions")
+
+    @gateway_app.api_route("/chat/completions", methods=["POST"])
+    async def _chat_legacy(self, request: Request):
+        return await self.proxy(request, "v1/chat/completions")
+
+    @gateway_app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+    async def _backend(self, request: Request, path: str):
+        return await self.proxy_backend(request, path)
 
 
 __all__ = ["InferenceGateway", "InferenceGatewayDeployment", "gateway_app"]

@@ -515,6 +515,14 @@ def validate_managed_opd_teacher_colocate_args(args: Any) -> None:
         actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
 
     check_teacher_colocate_layout(int(args.rollout_num_gpus), int(args.resource["teacher"][1]), actor_total_gpus)
+    # A shared-bundle teacher only wakes in the deferred scoring stage, which the
+    # resident Agentic pipeline does not run; its inline prefill would wait on a
+    # teacher that stays offloaded.
+    if getattr(args, "use_agentic_rollout", False) and deferred_opd_enabled(args):
+        raise ValueError(
+            "Agentic rollout does not support a managed OPD teacher sharing the rollout GPUs (deferred scoring). "
+            "Use the split layout (--rollout-num-gpus + resource['teacher'][1] == actor GPUs)."
+        )
 
 
 def add_opd_arguments(parser: Any) -> Any:

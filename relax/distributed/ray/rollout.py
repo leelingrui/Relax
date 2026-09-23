@@ -40,7 +40,7 @@ from relax.engine.inference.placement import (
     PlacementRequest,
     PlacementSlice,
 )
-from relax.engine.inference.types import LifecycleState, ModelSnapshot, ReplicaSnapshot, Role
+from relax.engine.inference.types import LifecycleState, ModelSnapshot, ReplicaSnapshot, Role, WeightSource
 from relax.engine.rollout.workload import RolloutWorkload
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
@@ -4935,10 +4935,16 @@ def start_rollout_servers(args, pg, *, planner: PlacementPlanner) -> dict[str, R
             model.resolved(args),
             elastic_enabled=not getattr(args, "use_slime_router", False),
             fault_tolerance_enabled=bool(getattr(args, "use_fault_tolerance", False)),
+            # Debug-rollout-only never syncs weights: the checkpoint the engines
+            # load is final, so they join the Router at start and are READY
+            # without a policy weight version.
+            **({"weight_source": WeightSource.STATIC} if getattr(args, "debug_rollout_only", False) else {}),
         )
         for model in config.models
     ]
-    return start_servers(args, models, planner=planner, pg=pg)
+    # Rollout holds the front of a shared placement group; roles placed behind
+    # it (split Teacher/GenRM) may already be recorded when it starts.
+    return start_servers(args, models, planner=planner, pg=pg, bundle_offset=0 if pg is not None else None)
 
 
 def start_servers(
@@ -4978,21 +4984,33 @@ def start_servers(
         )
         pg_owner = PlacementOwner.MANAGER
     pg_view = PlacementGroupView(tuple(pg[1]), tuple(pg[2]), pg_owner, identity=pg[0])
-    placement_requests = tuple(
-        PlacementRequest(
-            group_id=f"{model.name}/group-{group_index}",
-            worker_type=group.worker_type,
-            num_gpus=group.num_gpus,
-            num_gpus_per_engine=group.num_gpus_per_engine,
-            num_gpus_per_node=args.num_gpus_per_node,
-            phase=phase,
-            bundle_offset=bundle_offset if index == 0 else None,
-            active=group.worker_type != "placeholder",
-        )
-        for index, (model, group_index, group) in enumerate(
-            (model, group_index, group) for model in models for group_index, group in enumerate(model.engine_groups)
-        )
-    )
+    # The ledger is shared by every role of the task, so a group id carries its
+    # role: a Teacher and a Rollout model may both be called "default".
+    group_ids = {
+        (model.name, group_index): f"{role.value}/{model.name}/group-{group_index}"
+        for model in models
+        for group_index in range(len(model.engine_groups))
+    }
+    placement_requests = []
+    # An explicit offset lays out every group of this call back to back from it,
+    # instead of appending behind whatever other roles already hold in the phase.
+    next_offset = bundle_offset
+    for model in models:
+        for group_index, group in enumerate(model.engine_groups):
+            placement_requests.append(
+                PlacementRequest(
+                    group_id=group_ids[(model.name, group_index)],
+                    worker_type=group.worker_type,
+                    num_gpus=group.num_gpus,
+                    num_gpus_per_engine=group.num_gpus_per_engine,
+                    num_gpus_per_node=args.num_gpus_per_node,
+                    phase=phase,
+                    bundle_offset=next_offset,
+                    active=group.worker_type != "placeholder",
+                )
+            )
+            if next_offset is not None:
+                next_offset += group.num_gpus
     planned_by_id = {planned.group_id: planned for planned in planner.plan(placement_requests, pg_view)}
 
     servers: dict[str, RolloutServer] = {}
@@ -5021,7 +5039,7 @@ def start_servers(
                 gpus_per_engine = group_cfg.num_gpus_per_engine
                 num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
                 num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
-                planned = planned_by_id[f"{model_cfg.name}/group-{group_index}"]
+                planned = planned_by_id[group_ids[(model_cfg.name, group_index)]]
                 # The topology resolved with the model is what the engines are
                 # created from; a mismatch means the two were derived from
                 # different configurations and the identities would not line up.
