@@ -122,24 +122,22 @@ def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkey
     assert captured["options"]["scheduling_strategy"].node_id == node_id
 
 
-def test_task_inference_owner_keeps_head_affinity_and_requests_stable_cpu(monkeypatch, tmp_path):
-    """The task owner is the only control-plane actor the inference roles use.
-
-    GenRM and Teacher pools live inside it, so it is the one that has to carry
-    the stable-CPU marker and stay on the head node that runs the routers.
-    """
-    from relax.distributed.ray import inference_role
+def test_task_inference_manager_keeps_head_affinity_and_requests_stable_cpu(monkeypatch, tmp_path):
+    """GenRM and Teacher engines live in the task InferenceManager, so it
+    carries the stable-CPU marker and stays on the head node with the
+    routers."""
+    from relax.distributed.ray import inference_manager
 
     captured = {}
     node_id = "b" * 56
 
-    class FakeOwnerActor(_FakeActorClass):
+    class FakeManagerActor(_FakeActorClass):
         @classmethod
         def options(cls, **options):
             captured["options"] = options
             return cls
 
-    monkeypatch.setattr(inference_role, "TaskInferenceManagerActor", FakeOwnerActor)
+    monkeypatch.setattr(inference_manager, "InferenceManagerActor", FakeManagerActor)
     monkeypatch.setattr(placement_group_module, "_get_head_node_id", lambda: node_id)
     monkeypatch.setattr(
         placement_group_module.ray,
@@ -147,7 +145,7 @@ def test_task_inference_owner_keeps_head_affinity_and_requests_stable_cpu(monkey
         lambda: [{"NodeID": node_id, "Alive": True, "Resources": {"stable_cpu": 8}}],
     )
 
-    inference_role.create_task_inference_manager(_elastic_args(tmp_path), runtime_env={"env_vars": {"A": "B"}})
+    inference_manager.create_inference_manager(_elastic_args(tmp_path), runtime_env={"env_vars": {"A": "B"}})
 
     assert captured["options"]["resources"] == {"stable_cpu": 1}
     assert captured["options"]["num_gpus"] == 0
@@ -155,22 +153,20 @@ def test_task_inference_owner_keeps_head_affinity_and_requests_stable_cpu(monkey
     assert captured["options"]["scheduling_strategy"].node_id == node_id
 
 
-def _owner_handle():
+def _manager_handle():
     calls = []
 
     def record(name):
         def remote(*args, **kwargs):
             calls.append((name, args, kwargs))
-            return tuple(args[2]) if name == "create_role" else None
+            return tuple(config.name for config, _, _ in args[1]) if name == "create_role" else None
 
         return SimpleNamespace(remote=remote)
 
-    return SimpleNamespace(**{name: record(name) for name in ("plan_placement", "create_role", "lifecycle")}), calls
+    return SimpleNamespace(create_role=record("create_role"), call=record("call")), calls
 
 
-def test_genrm_instances_become_models_on_the_task_owner(monkeypatch, tmp_path):
-    """No GenRM actor is created: every instance is one model of the owner, and
-    no well-known actor name is registered for user code to look up."""
+def test_genrm_instances_become_models_of_one_role(monkeypatch, tmp_path):
     spec = {
         "model_path": "/model",
         "num_gpus": 1,
@@ -183,51 +179,22 @@ def test_genrm_instances_become_models_on_the_task_owner(monkeypatch, tmp_path):
         offload_rollout=True,
         fully_async=True,
         rollout_num_gpus=0,
+        rollout_num_gpus_per_engine=1,
         num_gpus_per_node=8,
         _genrm_instances_resolved={"quality": dict(spec), "safety": dict(spec)},
     )
-    owner, calls = _owner_handle()
+    manager, calls = _manager_handle()
     monkeypatch.setattr(placement_group_module.ray, "get", lambda refs, **kwargs: refs)
 
-    assert placement_group_module.create_genrm_role(args, ("pg", [0, 1], [0, 1]), owner) == ("quality", "safety")
+    assert placement_group_module.create_genrm_role(args, ("pg", [0, 1], [0, 1]), manager) == ("quality", "safety")
 
-    assert [name for name, _, _ in calls] == ["plan_placement", "create_role", "lifecycle", "lifecycle"]
-    _, create_args, _ = calls[1]
-    pool_configs = create_args[2]
-    assert create_args[1] == "genrm"
-    assert [config["kwargs"]["port_window_index"] for config in pool_configs.values()] == [0, 1]
-    assert [config["kwargs"]["bundle_offset"] for config in pool_configs.values()] == [0, 1]
-    assert pool_configs["quality"]["args"][0].genrm_model_path == "/model"
-    assert [call[1] for call in calls[2:]] == [("genrm", "quality", "offload"), ("genrm", "safety", "offload")]
-
-
-def test_single_genrm_instance_keeps_its_own_args(monkeypatch, tmp_path):
-    spec = {
-        "model_path": "/model",
-        "num_gpus": 1,
-        "num_gpus_per_engine": 1,
-        "engine_config": {},
-        "sampling_config": {},
-    }
-    args = _elastic_args(
-        tmp_path,
-        offload_rollout=False,
-        fully_async=True,
-        rollout_num_gpus=0,
-        num_gpus_per_node=8,
-        _genrm_instances_resolved={"__default__": spec},
-    )
-    owner, calls = _owner_handle()
-    monkeypatch.setattr(placement_group_module.ray, "get", lambda refs, **kwargs: refs)
-
-    assert placement_group_module.create_genrm_role(args, ("pg", [0], [0]), owner) == ("__default__",)
-    _, create_args, _ = calls[1]
-    assert create_args[2]["__default__"]["args"][0] is args
-
-
-def test_genrm_role_requires_the_task_owner(tmp_path):
-    with pytest.raises(ValueError, match="task inference manager"):
-        placement_group_module.create_genrm_role(_elastic_args(tmp_path), ("pg", [0], [0]), None)
+    assert [name for name, _, _ in calls] == ["create_role", "call", "call"]
+    _, (role, models), _ = calls[0]
+    assert role == "genrm"
+    assert [placement["bundle_offset"] for _, _, placement in models] == [0, 1]
+    assert len({placement["base_port"] for _, _, placement in models}) == 2
+    assert models[0][1].genrm_model_path == "/model"
+    assert [call[1] for call in calls[1:]] == [("genrm", "quality", "offload"), ("genrm", "safety", "offload")]
 
 
 def test_dcs_proxy_requests_stable_cpu(monkeypatch, tmp_path):

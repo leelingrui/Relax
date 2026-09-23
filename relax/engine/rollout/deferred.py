@@ -27,7 +27,6 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Sequence
 
-from relax.engine.inference.lifecycle import ErrorCode, OperationError
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import Sample
 
@@ -118,7 +117,7 @@ class DeferredSnapshot:
     scored: int = 0
     published: int = 0
     missing: tuple[Any, ...] = ()
-    error: OperationError | None = None
+    error: str | None = None
 
     @property
     def terminal(self) -> bool:
@@ -349,10 +348,8 @@ class DeferredExecutor:
     def _advance(self, record: _Record, state: DeferredState, **changes: Any) -> None:
         record.snapshot = replace(record.snapshot, state=state, last_confirmed_step=state, **changes)
 
-    def _fail(self, record: _Record, code: ErrorCode, message: str, **changes: Any) -> None:
-        record.snapshot = replace(
-            record.snapshot, state=DeferredState.FAILED, error=OperationError(code, message), **changes
-        )
+    def _fail(self, record: _Record, message: str, **changes: Any) -> None:
+        record.snapshot = replace(record.snapshot, state=DeferredState.FAILED, error=message, **changes)
 
     async def _run(
         self,
@@ -369,7 +366,7 @@ class DeferredExecutor:
                 self._advance(record, DeferredState.SCORING)
                 failures = await score(record.samples)
             except Exception as exc:
-                self._fail(record, ErrorCode.UNAVAILABLE, f"{type(exc).__name__}: {exc}")
+                self._fail(record, f"{type(exc).__name__}: {exc}")
                 logger.exception(f"Deferred scoring failed for batch {record.batch_ref.batch_id}")
                 return record.snapshot
             if record.cancelled:
@@ -386,7 +383,6 @@ class DeferredExecutor:
                 detail = "; ".join(problems[:5]) if problems else f"{len(unscored)} sample(s) were not scored"
                 self._fail(
                     record,
-                    ErrorCode.UNKNOWN_COMPLETION,
                     f"Deferred scoring is incomplete: {detail}",
                     scored=record.batch_ref.eligible_count - len(unscored),
                     missing=unscored,
@@ -402,7 +398,7 @@ class DeferredExecutor:
             try:
                 await publish(record.payload, record.is_last)
             except Exception as exc:
-                self._fail(record, ErrorCode.UNAVAILABLE, f"publication failed: {type(exc).__name__}: {exc}")
+                self._fail(record, f"publication failed: {type(exc).__name__}: {exc}")
                 return record.snapshot
             self._advance(record, DeferredState.PRODUCTION_COMPLETE, published=len(record.samples))
             self._advance(record, DeferredState.COMPLETED, published=len(record.samples))

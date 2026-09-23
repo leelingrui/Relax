@@ -373,12 +373,11 @@ def test_engine_startup_precedes_dcs_registration(monkeypatch, sglang_engine_mod
     assert engine._skip_router_registration is True
 
 
-@pytest.mark.parametrize("source", ["checkpoint", "external"])
-def test_static_engine_rejects_policy_mutations(sglang_engine_module, source):
+def test_static_engine_rejects_policy_mutations(sglang_engine_module):
     from unittest.mock import MagicMock
 
     module = sglang_engine_module
-    engine = module.SGLangEngine(SimpleNamespace(), rank=0, weight_source=source)
+    engine = module.SGLangEngine(SimpleNamespace(), rank=0, weight_source="static")
     engine._make_request = MagicMock()
     operations = [
         lambda: engine.register_dcs(),
@@ -406,11 +405,11 @@ def test_static_engine_uses_common_startup_without_policy_load_plan(
     from unittest.mock import MagicMock
 
     module = sglang_engine_module
-    cls = module.GenRMEngine if genrm else module.SGLangEngine
-    engine = cls(
+    engine = module.SGLangEngine(
         SimpleNamespace(rollout_external=external, sglang_router_ip="", sglang_router_port=0),
         rank=0,
-        weight_source="checkpoint",
+        weight_source="static",
+        role="genrm" if genrm else "teacher",
     )
     compute = MagicMock(return_value=({"node_rank": 0, "host": "[::1]", "port": 8000}, ["model_path"]))
     monkeypatch.setattr(module, "_compute_genrm_server_args" if genrm else "_compute_server_args", compute)
@@ -432,21 +431,22 @@ def test_static_engine_uses_common_startup_without_policy_load_plan(
     else:
         engine._init_normal.assert_called_once_with(compute.return_value[0], apply_policy_load_plan=False)
         engine._init_external.assert_not_called()
-    # Both classes take the same startup path; what a static role skips is
-    # decided by its adapter's init kwargs, not by the engine class.
+    # Every role takes the same startup path; what a static role skips is
+    # decided by its adapter's init kwargs, not by the engine.
     assert engine._skip_router_registration is False
 
 
-def test_genrm_engine_defaults_to_checkpoint_weights(sglang_engine_module):
-    engine = sglang_engine_module.GenRMEngine(SimpleNamespace(), rank=0)
-    assert engine.weight_source == sglang_engine_module.WeightSource.CHECKPOINT
+def test_engine_defaults_to_rollout_role_with_dcs_weights(sglang_engine_module):
+    engine = sglang_engine_module.SGLangEngine(SimpleNamespace(), rank=0)
+    assert engine.weight_source == sglang_engine_module.WeightSource.DCS
+    assert engine.role == sglang_engine_module.Role.ROLLOUT
 
 
 def test_genrm_engine_registers_its_model_router_without_dcs(monkeypatch, sglang_engine_module):
     from unittest.mock import MagicMock
 
     module = sglang_engine_module
-    engine = module.GenRMEngine(SimpleNamespace(rollout_external=False), rank=0)
+    engine = module.SGLangEngine(SimpleNamespace(rollout_external=False), rank=0, weight_source="static", role="genrm")
     monkeypatch.setattr(
         module,
         "_compute_genrm_server_args",
@@ -537,7 +537,7 @@ def test_inference_observation_checkpoint_registers_without_weight_version(monke
     from unittest.mock import MagicMock
 
     engine = _make_engine(sglang_engine_module)
-    engine.weight_source = sglang_engine_module.WeightSource.CHECKPOINT
+    engine.weight_source = sglang_engine_module.WeightSource.STATIC
     engine.health_generate = MagicMock(return_value=True)
     get = MagicMock()
     post = MagicMock(return_value=_Response(200, {"worker_id": "worker-id"}))
@@ -557,7 +557,7 @@ def test_inference_observation_checkpoint_registers_without_weight_version(monke
     )
 
 
-@pytest.mark.parametrize("weight_source", ["policy", "checkpoint"])
+@pytest.mark.parametrize("weight_source", ["dcs", "static"])
 @pytest.mark.parametrize("failure", ["http_error", "connection_error"])
 def test_inference_observation_registration_failure_has_no_ready_evidence(
     monkeypatch, sglang_engine_module, weight_source, failure
@@ -577,7 +577,7 @@ def test_inference_observation_registration_failure_has_no_ready_evidence(
     observation = engine.get_inference_observation(ensure_router=True)
 
     assert observation["healthy"] is True
-    assert observation["weight_version"] == ("v1" if weight_source == "policy" else None)
+    assert observation["weight_version"] == ("v1" if weight_source == "dcs" else None)
     assert observation["router_registered"] is False
     assert engine._router_registered is False
     post.assert_called_once()

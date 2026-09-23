@@ -31,7 +31,7 @@ except ImportError:
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
-from relax.engine.inference.capabilities import WeightSource
+from relax.engine.inference.types import Role, WeightSource
 from relax.utils import device as device_utils
 from relax.utils import scale_utils
 from relax.utils.async_utils import run
@@ -337,7 +337,15 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
 
 
 class SGLangEngine(RayActor):
-    weight_source = WeightSource.POLICY
+    """One SGLang server process group for any inference role.
+
+    ``role`` selects the only role-specific behaviour left in the engine: how
+    GenRM builds its server arguments and how it drains before releasing GPU
+    memory. Everything else is shared by Rollout, GenRM and Teacher.
+    """
+
+    weight_source = WeightSource.DCS
+    role = Role.ROLLOUT
 
     def __init__(
         self,
@@ -348,10 +356,12 @@ class SGLangEngine(RayActor):
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
         register_sigterm_handler: bool = False,
-        weight_source: WeightSource | str | None = None,
+        weight_source: WeightSource | str = WeightSource.DCS,
+        role: Role | str = Role.ROLLOUT,
     ):
         self.args = args
-        self.weight_source = WeightSource(weight_source) if weight_source is not None else type(self).weight_source
+        self.weight_source = WeightSource(weight_source)
+        self.role = Role(role)
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
@@ -452,7 +462,7 @@ class SGLangEngine(RayActor):
                 init_external_kwargs = {"external_engine_need_check_fields": external_engine_need_check_fields}
             self._init_external(server_args_dict, **init_external_kwargs)
         else:
-            if self.weight_source == WeightSource.POLICY:
+            if self.weight_source == WeightSource.DCS:
                 self._init_normal(server_args_dict)
             else:
                 self._init_normal(server_args_dict, apply_policy_load_plan=False)
@@ -460,14 +470,18 @@ class SGLangEngine(RayActor):
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
         # Scaled-out engines use direct weight sync from seed engine instead of DCS.
         # Done after engine startup so the coordinator can immediately reach the server.
-        if not skip_dcs_registration and self.weight_source == WeightSource.POLICY:
+        if not skip_dcs_registration and self.weight_source == WeightSource.DCS:
             self.register_dcs()
 
     def _compute_engine_server_args(self, *args, **kwargs) -> tuple[dict, list]:
+        if self.role == Role.GENRM:
+            kwargs.pop("sglang_overrides", None)
+            kwargs.pop("num_gpus_per_engine", None)
+            return _compute_genrm_server_args(*args, **kwargs)
         return _compute_server_args(*args, **kwargs)
 
     def _require_policy_weights(self) -> None:
-        if self.weight_source != WeightSource.POLICY:
+        if self.weight_source != WeightSource.DCS:
             raise RuntimeError(f"Policy weight updates are forbidden for {self.weight_source.value} engines")
 
     def register_dcs(self):
@@ -1043,7 +1057,7 @@ class SGLangEngine(RayActor):
         """Return bounded runtime evidence for Manager topology publication."""
         healthy = self.health_generate(timeout=5.0)
         version = None
-        if healthy and self.node_rank == 0 and self.weight_source == WeightSource.POLICY:
+        if healthy and self.node_rank == 0 and self.weight_source == WeightSource.DCS:
             response = requests.get(f"http://{self.server_host}:{self.server_port}/get_weight_version", timeout=5.0)
             response.raise_for_status()
             version = response.json().get("weight_version")
@@ -1051,7 +1065,7 @@ class SGLangEngine(RayActor):
             ensure_router
             and healthy
             and self.node_rank == 0
-            and (self.weight_source != WeightSource.POLICY or version not in (None, "", "default"))
+            and (self.weight_source != WeightSource.DCS or version not in (None, "", "default"))
             and not getattr(self, "_router_registered", False)
         ):
             self.register_to_router(bootstrap_port=getattr(self, "_disaggregation_bootstrap_port", None))
@@ -1063,15 +1077,26 @@ class SGLangEngine(RayActor):
         }
 
     def release_memory_occupation(self):
+        if self.role == Role.GENRM:
+            return self._release_genrm_memory_occupation()
         self.flush_cache()
         return self._make_request("release_memory_occupation")
 
     def resume_memory_occupation(self, tags: list[str] = None):
         """Available tags for multi-stage resume: weights, kv_cache."""
-        return self._make_request(
+        result = self._make_request(
             "resume_memory_occupation",
             {"tags": tags},
         )
+        # Re-open admission that the GenRM release closed via
+        # /pause_generation. Only after a full resume (weights + KV cache back):
+        # GenRM always full-resumes, but the ``not tags`` guard prevents
+        # re-enabling generation before KV cache exists if a partial
+        # (weights-only) resume is ever introduced. Not swallowed — if the
+        # engine stays paused, GenRM silently stops serving, so fail loudly.
+        if self.role == Role.GENRM and self.node_rank == 0 and not tags:
+            self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+        return result
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
@@ -1451,22 +1476,7 @@ class SGLangEngine(RayActor):
             logger.info(f"Unregistering checkpoint engine client for engine {self.server_host}:{self.server_port}...")
             run(self.checkpoint_engine_client.unregister())
 
-
-class GenRMEngine(SGLangEngine):
-    """GenRM Engine for Generative Reward Model.
-
-    Inherits from SGLangEngine and overrides initialization to use genrm-
-    specific arguments (model path, GPU count, sampling parameters, etc.).
-    """
-
-    weight_source = WeightSource.CHECKPOINT
-
-    def _compute_engine_server_args(self, *args, **kwargs) -> tuple[dict, list]:
-        kwargs.pop("sglang_overrides", None)
-        kwargs.pop("num_gpus_per_engine", None)
-        return _compute_genrm_server_args(*args, **kwargs)
-
-    def release_memory_occupation(self):
+    def _release_genrm_memory_occupation(self):
         # GenRM is colocated on the training GPUs, so it must offload at the
         # rollout->train transition. Two failure modes are defended against here:
         #
@@ -1524,18 +1534,6 @@ class GenRMEngine(SGLangEngine):
                     logger.info(f"Error flushing GenRM cache: {e}")
                 time.sleep(1)
         return self._make_request("release_memory_occupation", timeout=_GENRM_OFFLOAD_RELEASE_TIMEOUT_S)
-
-    def resume_memory_occupation(self, tags: list[str] = None):
-        result = super().resume_memory_occupation(tags=tags)
-        # Re-open admission that release_memory_occupation closed via
-        # /pause_generation. Only after a full resume (weights + KV cache back):
-        # GenRM always full-resumes, but the ``not tags`` guard prevents
-        # re-enabling generation before KV cache exists if a partial
-        # (weights-only) resume is ever introduced. Not swallowed — if the
-        # engine stays paused, GenRM silently stops serving, so fail loudly.
-        if self.node_rank == 0 and not tags:
-            self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
-        return result
 
     def _pause_generation_for_offload(self, deadline: float) -> None:
         """Best-effort /pause_generation (abort mode) before draining for

@@ -11,8 +11,6 @@ from typing import Dict, List, Optional
 
 import httpx
 
-from relax.engine.inference.discovery import role_snapshot_from_dict
-from relax.engine.inference.types import RoleSnapshot
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_serve_url
 
@@ -165,20 +163,6 @@ class GenRMClient:
         except Exception as e:
             logger.error(f"GenRM metrics request failed: {e}")
             return {}
-
-    def get_discovery(self, status_filter: Optional[str] = None) -> RoleSnapshot:
-        """Fetch the GenRM v2 discovery snapshot without changing generation.
-
-        Args:
-            status_filter: Optional replica liveness filter (``active`` or
-                ``dead``).
-        """
-        params: dict[str, int | str] = {"schema_version": 2}
-        if status_filter is not None:
-            params["status_filter"] = status_filter
-        response = self._sync_client.get(f"{self.service_url}/engines", params=params)
-        response.raise_for_status()
-        return role_snapshot_from_dict(response.json())
 
     def close(self):
         """Close both HTTP clients."""

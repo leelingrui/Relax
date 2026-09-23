@@ -59,13 +59,6 @@ class TrainRayActor(RayActor):
         set_memory_role(role)
         self.with_ref = with_ref
         self.with_opd_teacher = with_opd_teacher
-        # Set by set_inference_manager once the control plane exists.
-        self._inference_manager_handle = None
-        self._phase_client = None
-        # Colocated static models this actor offloads/onloads in lock-step
-        # with training, through the inference owner.
-        self.genrm_models = ()
-        self.teacher_models = ()
 
         torch.serialization.add_safe_globals([relax.utils.training.eval_config.EvalDatasetConfig])
 
@@ -123,37 +116,16 @@ class TrainRayActor(RayActor):
         # P2P direct sync (_sync_weights_from_seed_engine on RolloutManager).
         self._weight_sync_lock = ray.get(self.rollout_manager.get_weight_sync_lock.remote())
 
-    def set_genrm_models(self, genrm_models):
-        """Set the GenRM models to offload/onload around training.
+    def set_genrm_manager(self, genrm_manager):
+        """Set the genRM manager for coordinated offload/onload.
 
-        In colocated mode the GenRM engines share GPUs with training, so they
-        are offloaded before training and onloaded before rollout.
+        In colocated mode, the genRM manager is used to offload genRM engines
+        before training and onload them before rollout, since they share GPU
+        resources.
         """
-        self.genrm_models = tuple(genrm_models)
+        self.genrm_manager = genrm_manager
 
-    def set_teacher_models(self, teacher_models):
-        """Set the managed OPD teacher models to offload/onload around
-        training."""
-        self.teacher_models = tuple(teacher_models)
-
-    def set_inference_manager(self, inference_manager_handle):
-        """Attach the task's inference control plane for phase coordination.
-
-        A layout whose roles have their own GPUs has no coordinator, and the
-        client then reports no sequenced phases so the existing direct
-        offload/onload path stays in use.
-        """
-        from relax.distributed.ray.lifecycle_client import phase_client
-
-        self._inference_manager_handle = inference_manager_handle
-        self._phase_client = phase_client(inference_manager_handle)
-        if self._phase_client is not None:
-            logger.info(f"Inference phase coordination enabled: phases={self._phase_client.phases()}")
-
-    @property
-    def phase_client(self):
-        return getattr(self, "_phase_client", None)
-
-    def coordinated_phases(self) -> tuple[str, ...]:
-        client = self.phase_client
-        return client.phases() if client is not None else ()
+    def set_teacher_manager(self, teacher_manager):
+        """Set the managed OPD teacher manager for coordinated
+        offload/onload."""
+        self.teacher_manager = teacher_manager

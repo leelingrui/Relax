@@ -9,12 +9,6 @@ from relax.core.node_group_affinity import (
     require_control_plane_resource_on_node,
     with_control_plane_affinity,
 )
-from relax.distributed.ray.placement_ledger import plan_placement
-from relax.engine.inference.placement import (
-    PlacementGroupView,
-    PlacementOwner,
-    PlacementRequest,
-)
 from relax.utils.device import ray_get_device_ids
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
@@ -24,9 +18,6 @@ from .actor_group import RayTrainGroup
 
 
 logger = get_logger(__name__)
-
-# The route key the single-instance --genrm-model-path config resolves to.
-_GENRM_DEFAULT_INSTANCE_KEY = "__default__"
 
 
 def _get_head_node_id():
@@ -162,65 +153,18 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None, inferen
 
 
 def create_genrm_role(args, pg, inference_manager_handle) -> tuple[str, ...]:
-    """Create the GenRM model pools declared by
-    ``args._genrm_instances_resolved`` on the task inference owner.
-
-    Every instance, including the single-instance ``__default__`` config, is
-    one model of the GenRM role in the owner's process; callers address it by
-    ``(Role.GENRM, route_key)`` through the owner.
+    """Start every GenRM instance declared by
+    ``args._genrm_instances_resolved`` as one model of the GenRM role on the
+    task's inference manager.
 
     Returns:
         The GenRM model IDs (route keys), in configuration order.
     """
-    import copy
+    from relax.distributed.ray.genrm import genrm_role_models
+    from relax.engine.inference.types import Role
 
-    if inference_manager_handle is None:
-        raise ValueError("GenRM requires the task inference manager handle")
-    instance_specs = args._genrm_instances_resolved
-    pool_configs = {}
-    bundle_offset = 0
-    requests = []
-    # The adapters place their engines behind the rollout region under sync
-    # colocate, so the pre-flight check has to validate that same region.
-    region_offset = (
-        0 if args.fully_async or getattr(args, "_genrm_colocate_with_rollout", False) else args.rollout_num_gpus
-    )
-    for index, (key, spec) in enumerate(instance_specs.items()):
-        instance_args = args
-        if key != _GENRM_DEFAULT_INSTANCE_KEY:
-            instance_args = copy.copy(args)
-            instance_args.genrm_model_path = spec["model_path"]
-            instance_args.genrm_num_gpus = spec["num_gpus"]
-            instance_args.genrm_num_gpus_per_engine = spec["num_gpus_per_engine"]
-            instance_args.genrm_engine_config = spec["engine_config"]
-            instance_args.genrm_sampling_config = spec["sampling_config"]
-        pool_configs[key] = {
-            "args": (instance_args,),
-            "kwargs": {"pg": pg, "bundle_offset": bundle_offset, "port_window_index": index},
-        }
-        requests.append(
-            PlacementRequest(
-                group_id=f"genrm/{key}",
-                worker_type="regular",
-                num_gpus=spec["num_gpus"],
-                num_gpus_per_engine=spec["num_gpus_per_engine"],
-                num_gpus_per_node=args.num_gpus_per_node,
-                phase="genrm",
-                bundle_offset=region_offset + bundle_offset,
-            )
-        )
-        bundle_offset += spec["num_gpus"]
-    # Validate the whole layout before anything is spawned. The adapters record
-    # the authoritative slices per replica, so this pre-flight check must not
-    # reserve anything itself.
-    plan_placement(
-        inference_manager_handle,
-        tuple(requests),
-        PlacementGroupView(tuple(pg[1]), tuple(pg[2]), PlacementOwner.CONTROLLER, identity=pg[0]),
-        dry_run=True,
-    )
-    model_ids = tuple(ray.get(inference_manager_handle.create_role.remote(args, "genrm", pool_configs)))
+    model_ids = tuple(ray.get(inference_manager_handle.create_role.remote(Role.GENRM, genrm_role_models(args, pg))))
     if getattr(args, "offload_rollout", False):
-        ray.get([inference_manager_handle.lifecycle.remote("genrm", key, "offload") for key in model_ids])
+        ray.get([inference_manager_handle.call.remote(Role.GENRM, key, "offload") for key in model_ids])
     logger.info(f"GenRM models initialized successfully: instances={list(model_ids)}")
     return model_ids

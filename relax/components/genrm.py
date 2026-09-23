@@ -25,6 +25,7 @@ from ray import serve
 from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
+from relax.distributed.ray.inference_manager import ModelHandle
 from relax.distributed.ray.placement_group import create_genrm_role
 from relax.engine.inference.types import Role
 from relax.utils.data.processing_utils import load_tokenizer
@@ -144,23 +145,30 @@ class GenRM(Base):
             config: Runtime configuration namespace.
             role: Role name (should be "genrm").
             runtime_env: Optional Ray runtime environment dict.
-            inference_manager_handle: Task inference owner that holds every
-                GenRM model's engines, state and lifecycle.
+            inference_manager_handle: The task's inference manager, which holds
+                every GenRM model's engines, state and lifecycle.
         """
         super().__init__()
         self.config = config
         self.healthy = healthy
         self.role = role
 
-        # Every instance is one GenRM model on the task owner, addressed by its
-        # route key. The single-instance --genrm-model-path config resolves to
-        # exactly ("__default__",).
-        self._owner = inference_manager_handle
-        self.model_ids = create_genrm_role(config, pg, inference_manager_handle)
+        # {route_key: handle}. Every instance is one GenRM model on the inference
+        # manager; single-instance configs (the legacy --genrm-model-path path)
+        # resolve to exactly {"__default__": handle}.
+        self.genrm_managers = {
+            key: ModelHandle(inference_manager_handle, Role.GENRM, key)
+            for key in create_genrm_role(config, pg, inference_manager_handle)
+        }
         self.instance_specs = config._genrm_instances_resolved
+        # Request defaults and template arguments are part of each model's
+        # registered configuration on the manager.
+        self.model_configs = {
+            key: ray.get(inference_manager_handle.model_config.remote(Role.GENRM, key)) for key in self.genrm_managers
+        }
 
-        self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.model_ids}
-        self._logger.info(f"GenRM service initialized successfully: instances={list(self.model_ids)}")
+        self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
+        self._logger.info(f"GenRM service initialized successfully: instances={list(self.genrm_managers)}")
         # Shared HTTP client for engine calls (avoids per-request connection overhead).
         # Raise pool limits well above httpx's default 100 so one replica can fan out
         # many concurrent engine requests; keepalive_expiry >> the default 5s so
@@ -176,20 +184,6 @@ class GenRM(Base):
             key: load_tokenizer(spec["model_path"], trust_remote_code=True)
             for key, spec in self.instance_specs.items()
         }
-
-    @app.get("/engines")
-    async def get_engines(self, schema_version: int | None = None, status_filter: str | None = None) -> dict:
-        """Return v2 discovery, while retaining the legacy route surface."""
-        if schema_version != 2:
-            return {
-                "models": {
-                    key: {"router_ip": None, "router_port": None, "engine_groups": [], "total_engines": 0}
-                    for key in self.model_ids
-                },
-                "total_engines": 0,
-            }
-        snapshot = await self._owner.snapshot.remote(role=Role.GENRM)
-        return snapshot.to_dict(status_filter)
 
     def run(self):
         """GenRM is a passive HTTP service, no background loop needed.
@@ -226,11 +220,13 @@ class GenRM(Base):
             raise
 
     def _resolve_instance_key(self, route_key: Optional[str]) -> str:
-        if route_key is None and len(self.model_ids) == 1:
-            return self.model_ids[0]
+        if route_key is None and len(self.genrm_managers) == 1:
+            return next(iter(self.genrm_managers))
         key = route_key or _DEFAULT_INSTANCE_KEY
-        if key not in self.model_ids:
-            raise RuntimeError(f"No GenRM instance registered for route_key={key!r}; available={list(self.model_ids)}")
+        if key not in self.genrm_managers:
+            raise RuntimeError(
+                f"No GenRM instance registered for route_key={key!r}; available={list(self.genrm_managers)}"
+            )
         return key
 
     def _pick_engine(self, route_key: Optional[str]) -> tuple[str, int, str, int]:
@@ -239,7 +235,7 @@ class GenRM(Base):
         key = self._resolve_instance_key(route_key)
         cache = self._engine_caches[key]
         if cache.needs_refresh():
-            hosts_ports = ray.get(self._owner.call.remote(Role.GENRM, key, "get_engine_hosts_ports"))
+            hosts_ports = ray.get(self.genrm_managers[key].get_engine_hosts_ports.remote())
             cache.refresh(hosts_ports)
 
         hosts_ports = cache.hosts_ports
@@ -260,24 +256,22 @@ class GenRM(Base):
         tokenizer."""
         key = self._resolve_instance_key(route_key)
         messages = [message.model_dump() if isinstance(message, Message) else message for message in messages]
-        spec = self.instance_specs[key]
+        model_config = self.model_configs[key]
         # ensure plain list — some tokenizers return BatchEncoding which is not JSON-serializable
         # Tokenization (chat-template render + encode) is synchronous CPU work; run it in a
         # worker thread so it does not block this replica's event loop. Fast (Rust) tokenizers
         # release the GIL during encode, so concurrent requests tokenize in parallel instead of
         # serializing — without this a single replica throttles dispatch and starves the engines.
-        # Forward chat_template_kwargs from the instance's sampling_config through to
-        # the jinja template — e.g. `{"enable_thinking": false}` for Qwen3+ to
-        # suppress the default <think> block. Keys unused by the template are
-        # silently dropped by transformers, so this is safe across model families.
-        sampling_config = spec["sampling_config"]
-        chat_template_kwargs = sampling_config.get("chat_template_kwargs", {}) or {}
+        # Forward the model's chat_template_kwargs through to the jinja template
+        # — e.g. `{"enable_thinking": false}` for Qwen3+ to suppress the default
+        # <think> block. Keys unused by the template are silently dropped by
+        # transformers, so this is safe across model families.
         input_ids = await asyncio.to_thread(
             self.tokenizers[key].apply_chat_template,
             messages,
             tokenize=True,
             add_generation_prompt=True,
-            **chat_template_kwargs,
+            **model_config.chat_template_kwargs,
         )
 
         if not isinstance(input_ids, list):
@@ -287,14 +281,8 @@ class GenRM(Base):
                 else list(input_ids)
             )
 
-        # Merge per-request sampling params with default config
-        default_sampling = {
-            "temperature": sampling_config.get("temperature", 0.2),
-            "top_p": sampling_config.get("top_p", 1.0),
-            "top_k": sampling_config.get("top_k", -1),
-            "max_new_tokens": sampling_config.get("max_response_len", 1024),
-        }
-        # Override defaults with per-request params
+        # Per-request sampling params override the model's defaults
+        default_sampling = dict(model_config.sampling_defaults)
         if sampling_params:
             default_sampling.update(sampling_params)
 
@@ -343,9 +331,9 @@ class GenRM(Base):
     async def health(self) -> dict:
         """Health check endpoint; reports per-instance status."""
         instances = {}
-        for key in self.model_ids:
+        for key, manager in self.genrm_managers.items():
             try:
-                is_healthy = ray.get(self._owner.lifecycle.remote(Role.GENRM, key, "health_check"))
+                is_healthy = ray.get(manager.health_check.remote())
                 instances[key] = {"status": "healthy" if is_healthy else "unhealthy"}
             except Exception as e:
                 self._logger.error(f"GenRM health check failed for instance '{key}': {e}")
@@ -373,12 +361,20 @@ class GenRM(Base):
             return {"service": "genrm", **instances[_DEFAULT_INSTANCE_KEY]}
         return {"service": "genrm", "instances": instances}
 
+    def get_genrm_manager(self, route_key: Optional[str] = None) -> Any:
+        """Get one GenRM model handle by route key.
+
+        Omitting ``route_key`` remains supported when exactly one instance is
+        configured.
+        """
+        return self.genrm_managers[self._resolve_instance_key(route_key)]
+
     def onload(self) -> None:
         """Load genRM model weights to GPU, for every instance."""
         self._logger.info("GenRM onload requested")
-        ray.get([self._owner.lifecycle.remote(Role.GENRM, key, "onload") for key in self.model_ids])
+        ray.get([m.onload.remote() for m in self.genrm_managers.values()])
 
     def offload(self) -> None:
         """Offload genRM model weights from GPU, for every instance."""
         self._logger.info("GenRM offload requested")
-        ray.get([self._owner.lifecycle.remote(Role.GENRM, key, "offload") for key in self.model_ids])
+        ray.get([m.offload.remote() for m in self.genrm_managers.values()])

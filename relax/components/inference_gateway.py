@@ -4,6 +4,7 @@
 
 import asyncio
 import inspect
+import itertools
 import json
 from collections.abc import Mapping
 from typing import Any
@@ -32,40 +33,7 @@ _HOP_BY_HOP_HEADERS = {
 }
 GATEWAY_REQUEST_HEADER = "x-relax-inference-gateway"
 
-# Errors that prove the request never reached an engine. Anything else that
-# fails after the request was sent leaves its fate unknown, which is not the
-# same thing and must not clear the registration.
-_NOT_DISPATCHED_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.UnsupportedProtocol)
-
 _ABORT_TIMEOUT_S = 10.0
-
-
-class _UpstreamAttempt:
-    """What we actually know about one upstream request.
-
-    ``dispatched`` means bytes reached an engine, so its fate is unknown until
-    something terminal is observed. ``terminal`` means a complete upstream
-    response was received, which is the only completion evidence a gateway has.
-    """
-
-    __slots__ = ("dispatched", "terminal")
-
-    def __init__(self) -> None:
-        self.dispatched = False
-        self.terminal = False
-
-
-def _permit_request_id(permit: Any) -> str | None:
-    """Read the request identity from a permit, whatever shape it arrives
-    in."""
-    if permit is None:
-        return None
-    if isinstance(permit, str):
-        return permit
-    value = getattr(permit, "request_id", None)
-    if value is None and isinstance(permit, Mapping):
-        value = permit.get("request_id")
-    return str(value) if value else None
 
 
 def _json_error(status_code: int, message: str, *, code: str) -> JSONResponse:
@@ -102,15 +70,12 @@ class InferenceGateway:
         self.upstream_url = upstream_url.rstrip("/") if upstream_url else None
         self.genrm_backend_handle = genrm_backend_handle
         self._client = httpx.AsyncClient(timeout=timeout, limits=httpx.Limits(max_connections=2048))
+        # Rotates across direct-eligible replicas; a Router target ignores it.
+        self._cursor = itertools.count()
         self._logger = get_logger(__name__)
 
     async def _snapshot(self) -> RoleSnapshot:
-        value = self.manager_handle.snapshot.remote(role=self.role)
-        if inspect.isawaitable(value):
-            return await value
-        if isinstance(value, RoleSnapshot):
-            return value
-        return await asyncio.to_thread(ray.get, value)
+        return await self._manager_call("snapshot", self.role)
 
     async def _target(self, payload: Mapping[str, Any] | None = None) -> str:
         target, _ = await self._resolve_target(payload)
@@ -125,10 +90,7 @@ class InferenceGateway:
                 model=payload.get("model"),
                 route_key=payload.get("route_key"),
             )
-            try:
-                return select_target(model).base_url.rstrip("/"), model.model_id
-            except RoutingError:
-                raise
+            return select_target(model, cursor=next(self._cursor)).base_url.rstrip("/"), model.model_id
         except RoutingError as exc:
             raise HTTPException(
                 status_code=exc.status_code,
@@ -137,10 +99,14 @@ class InferenceGateway:
             ) from exc
 
     async def engines(self, schema_version: int | None = None, status_filter: str | None = None) -> Any:
+        """Serve the common discovery schema; ``schema_version=1`` keeps the
+        legacy engine-group projection for older clients."""
+        if schema_version not in (None, 1, 2):
+            raise HTTPException(status_code=400, detail=f"Unsupported discovery schema_version {schema_version}")
         snapshot = await self._snapshot()
-        if schema_version == 2:
-            return snapshot.to_dict(status_filter)
-        return snapshot.to_legacy_dict(status_filter)
+        if schema_version == 1:
+            return snapshot.to_legacy_dict(status_filter)
+        return snapshot.to_dict(status_filter)
 
     async def health(self) -> JSONResponse:
         """Report gateway liveness separately from model readiness."""
@@ -196,18 +162,12 @@ class InferenceGateway:
                 exc.status_code, str(exc.detail), code="unavailable" if exc.status_code == 503 else "routing_error"
             )
 
-        permit = await self._admit(request, model_id, target)
-        attempt = _UpstreamAttempt()
-
+        request_id = await self._admit(request, model_id)
+        rid = request_id
+        response: Response | None = None
+        finished = False
         try:
             payload.pop("route_key", None)
-            if path == "generate":
-                payload.pop("model", None)
-                # Give the engine the permit identity as its own request id, so a
-                # cancel has something to abort. Without an addressable rid the
-                # only abort available is "abort everything".
-                if permit is not None and not payload.get("rid"):
-                    payload["rid"] = _permit_request_id(permit)
             wrap_response = False
             if messages_request:
                 if self.genrm_backend_handle is None:
@@ -216,65 +176,40 @@ class InferenceGateway:
                     model_id, payload["messages"], payload.get("sampling_params")
                 )
                 wrap_response = True
-            response = await self._forward(
+            if path == "generate":
+                payload.pop("model", None)
+                # The engine rid is the admission id, so an abort can address it.
+                rid = payload.setdefault("rid", request_id)
+            response, finished = await self._forward(
                 request,
                 path,
                 target,
                 json.dumps(payload).encode(),
                 wrap_response=wrap_response,
-                permit=permit,
-                attempt=attempt,
+                request_id=rid,
+                admission_id=request_id,
             )
-            if permit is not None and not isinstance(response, StreamingResponse):
-                if attempt.terminal:
-                    await self._complete(permit)
-                else:
-                    # A 502 from a failed upstream call is not a completion.
-                    await self._cancel(permit, target, dispatched=attempt.dispatched)
             return response
-        except Exception:
-            if permit is not None:
-                await self._cancel(permit, target, dispatched=attempt.dispatched)
-            raise
+        finally:
+            # A stream completes its own request when it ends.
+            if not isinstance(response, StreamingResponse):
+                if not finished:
+                    await self._abort_upstream(target, rid)
+                await self._manager_call("complete_request", request_id)
 
-    async def _manager_call(self, method: str, **kwargs: Any) -> Any:
-        remote_method = getattr(self.manager_handle, method, None)
-        if remote_method is None:
-            return None
-        value = remote_method.remote(**kwargs)
+    async def _manager_call(self, method: str, *args: Any) -> Any:
+        value = getattr(self.manager_handle, method).remote(*args)
         if inspect.isawaitable(value):
             return await value
         return await asyncio.to_thread(ray.get, value)
 
-    async def _admit(self, request: Request, model_id: str, target: str) -> Any:
+    async def _admit(self, request: Request, model_id: str) -> str:
         request_id = request.headers.get("x-relax-request-id") or uuid4().hex
         try:
-            return await self._manager_call(
-                "admit_request",
-                model_id=model_id,
-                request_id=request_id,
-                role=self.role,
-                target=target,
-            )
+            return await self._manager_call("admit_request", self.role, model_id, request_id)
         except Exception as exc:
             self._logger.warning("Inference request admission failed: %s", exc)
             raise HTTPException(status_code=503, detail="Inference request is not admitted") from exc
-
-    async def _complete(self, permit: Any) -> None:
-        await self._manager_call("complete_request", permit=permit)
-
-    async def _cancel(self, permit: Any, target: str | None, *, dispatched: bool = True) -> None:
-        """Abort the upstream request first, then record the cancel.
-
-        Order matters: the registration stays in flight until something
-        confirms the request ended, so sending the abort is the only thing that
-        can make that happen. A failed abort is logged and still recorded,
-        because a request nobody could abort is exactly the one that must keep
-        blocking a drain.
-        """
-        if dispatched and target is not None:
-            await self._abort_upstream(target, _permit_request_id(permit))
-        await self._manager_call("cancel_request", permit=permit, dispatched=dispatched)
 
     async def _abort_upstream(self, target: str, request_id: str | None) -> None:
         """Send an abort for ``request_id`` to the workers behind ``target``.
@@ -320,7 +255,8 @@ class InferenceGateway:
         """Forward role control-plane endpoints to the internal service."""
         if self.upstream_url is None:
             return _json_error(404, "Gateway backend is not configured", code="backend_unavailable")
-        return await self._forward(request, path, self.upstream_url, await request.body())
+        response, _ = await self._forward(request, path, self.upstream_url, await request.body())
+        return response
 
     async def _forward(
         self,
@@ -330,9 +266,14 @@ class InferenceGateway:
         body: bytes,
         *,
         wrap_response: bool = False,
-        permit: Any = None,
-        attempt: _UpstreamAttempt | None = None,
-    ) -> Response:
+        request_id: str | None = None,
+        admission_id: str | None = None,
+    ) -> tuple[Response, bool]:
+        """Forward one request; also report whether the upstream finished it.
+
+        A streamed response hands ``request_id`` to the stream, which completes
+        or aborts it when the stream ends.
+        """
         headers = {
             key: value
             for key, value in request.headers.items()
@@ -346,17 +287,11 @@ class InferenceGateway:
         response: httpx.Response | None = None
         try:
             response = await self._client.send(upstream, stream=True)
-            if attempt is not None:
-                # Response headers are back, so the engine has the request.
-                attempt.dispatched = True
             if response.headers.get("content-type", "").startswith("text/event-stream"):
-                stream_response = self._stream_response(response, permit, target)
-                permit = None
+                stream_response = self._stream_response(response, request_id, admission_id, target)
                 response = None
-                return stream_response
+                return stream_response, True
             content = await response.aread()
-            if attempt is not None:
-                attempt.terminal = True
             response_headers = {
                 key: value for key, value in response.headers.items() if key.lower() not in _HOP_BY_HOP_HEADERS
             }
@@ -365,37 +300,36 @@ class InferenceGateway:
                 data = {"response": data.get("text", "").strip()}
                 response_headers.pop("content-length", None)
                 response_headers.pop("content-encoding", None)
-                return JSONResponse(data, status_code=response.status_code, headers=response_headers)
-            return Response(
-                content=content, status_code=response.status_code, headers=response_headers, media_type=None
+                return JSONResponse(data, status_code=response.status_code, headers=response_headers), True
+            return (
+                Response(content=content, status_code=response.status_code, headers=response_headers, media_type=None),
+                True,
             )
         except httpx.RequestError as exc:
-            if attempt is not None and not isinstance(exc, _NOT_DISPATCHED_ERRORS):
-                attempt.dispatched = True
-            return _json_error(502, f"Failed to connect to inference router: {exc}", code="upstream_unavailable")
+            return (
+                _json_error(502, f"Failed to connect to inference router: {exc}", code="upstream_unavailable"),
+                False,
+            )
         finally:
             if response is not None and not response.is_closed:
                 await response.aclose()
 
     def _stream_response(
-        self, response: httpx.Response, permit: Any = None, target: str | None = None
+        self, response: httpx.Response, request_id: str | None, admission_id: str | None, target: str
     ) -> StreamingResponse:
         async def body():
+            completed = False
             try:
                 async for chunk in response.aiter_raw():
                     yield chunk
-            except BaseException:
-                # The stream broke or the client went away. The engine is still
-                # generating until the abort takes effect, so the registration
-                # stays in flight.
-                if permit is not None:
-                    await self._cancel(permit, target, dispatched=True)
-                raise
-            else:
-                if permit is not None:
-                    await self._complete(permit)
+                completed = True
             finally:
                 await response.aclose()
+                if admission_id is not None:
+                    # A broken stream leaves the engine generating until aborted.
+                    if not completed:
+                        await self._abort_upstream(target, request_id)
+                    await self._manager_call("complete_request", admission_id)
 
         headers = {key: value for key, value in response.headers.items() if key.lower() not in _HOP_BY_HOP_HEADERS}
         return StreamingResponse(

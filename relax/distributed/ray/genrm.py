@@ -1,314 +1,97 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""GenRM engine adapter for the Generative Reward Model service.
+"""GenRM models for the Generative Reward Model service.
 
-The adapter supplies GenRM-specific placement, ports and engine wiring to the
-shared ``MultiEngineManager`` (parallel bring-up, health check, dead-engine
-recovery, onload/offload); the task inference owner holds its state.
+Every configured instance, including the single-instance ``__default__``
+config, is one static-weight model of the GenRM role. Its engines start through
+the shared :func:`~relax.distributed.ray.rollout.start_servers` path inside
+the task's inference manager.
 """
 
 import copy
-import logging
 from typing import Any
 
-import ray
-
-from relax.backends.sglang.sglang_engine import GenRMEngine
-from relax.distributed.ray.multi_engine_manager import MultiEngineManager, _is_engine_dead  # noqa: F401
-from relax.distributed.ray.placement_ledger import plan_placement, release_placement
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
-from relax.engine.inference.capabilities import WeightSource
-from relax.engine.inference.manager import InferenceManager
-from relax.engine.inference.placement import (
-    PlacementGroupView,
-    PlacementOwner,
-    PlacementRelease,
-    PlacementRequest,
-    PlacementSlice,
-)
-from relax.engine.inference.types import Role
-from relax.utils.http_utils import init_http_client
-from relax.utils.logging_utils import get_logger
+from relax.engine.inference.config import EngineGroupConfig, ModelConfig
+from relax.engine.inference.phase_plans import PHASE_GENRM, placement_phase
+from relax.engine.inference.types import WeightSource
 
 
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-logger = get_logger(__name__)
-
+# Each instance probes ports from its own window, so instances starting side
+# by side never race for the same free port (probe-then-bind).
 _GENRM_PORT_BASE = 16000
 _GENRM_PORT_WINDOW_SIZE = 1000
-_MAX_PORT = 65535
 
 
-class GenRMEngineAdapter:
-    """GenRM placement, ports and engine environment configuration."""
-
-    inference_role = Role.GENRM
-    inference_weight_source = WeightSource.CHECKPOINT
-
-    def __init__(
-        self,
-        args,
-        pg,
-        bundle_offset: int = 0,
-        port_window_index: int = 0,
-        *,
-        inference_manager: InferenceManager,
-        placement_manager_handle: Any,
-        model_id: str = "default",
-        defer_init: bool = False,
-    ):
-        args = copy.copy(args)
-        args.use_slime_router = False
-        self.args = args
-        init_http_client(args)
-
-        num_gpu_per_engine = min(args.genrm_num_gpus_per_engine, args.num_gpus_per_node)
-        num_slots = 0 if args.debug_train_only else args.genrm_num_gpus // num_gpu_per_engine
-        nodes_per_engine = max(1, args.genrm_num_gpus_per_engine // args.num_gpus_per_node)
-        self.nodes_per_engine = nodes_per_engine
-
-        self.pg = pg
-        self.num_replicas = num_slots // nodes_per_engine
-        self.num_gpu_per_engine = num_gpu_per_engine
-        self.bundle_offset = bundle_offset
-        self.placement_owner = PlacementOwner.CONTROLLER
-        # The task owner's planner is the one ledger every role records in.
-        self._placement_ledger = placement_manager_handle
-        # Instances of a multi-instance role share one placement group, so the
-        # allocation identity has to carry the model, not just the replica.
-        self._placement_model_id = model_id
-        self.port_window_index = port_window_index
-        self.inference_model_path = args.genrm_model_path
-        self.inference_num_gpus_per_engine = args.genrm_num_gpus_per_engine
-        self.inference_overrides = getattr(args, "genrm_engine_config", None) or {}
-
-        from relax.distributed.ray.rollout import _start_router
-
-        self.router_url = None
-        self.router_ip, self.router_port = "", 0
-        if not args.debug_train_only:
-            router_args = copy.copy(args)
-            router_args.use_slime_router = False
-            self.router_ip, self.router_port = _start_router(router_args, force_new=True)
-            self.router_url = f"http://{self.router_ip}:{self.router_port}"
-        try:
-            self.backend = MultiEngineManager(
-                args,
-                num_slots=num_slots,
-                nodes_per_engine=nodes_per_engine,
-                engine_actor_cls=GenRMEngine,
-                skip_init=True,
-                log_prefix="GenRM",
-                inference_manager=inference_manager,
-                model_id=model_id,
-                adapter=self,
-            )
-            if not args.debug_train_only and not defer_init:
-                self.backend.initialize()
-        except Exception:
-            if hasattr(self, "backend"):
-                self.backend.shutdown()
-            raise
-
-    def __getattr__(self, name):
-        backend = self.__dict__.get("backend")
-        if backend is None:
-            raise AttributeError(name)
-        return getattr(backend, name)
-
-    def _build_engine_init_kwargs(self, rank: int, addr_and_ports: dict) -> dict:
-        # The judge's weights are static, so it never joins DCS; it registers
-        # at its own Router as soon as it has one, like the teacher does.
-        return {
-            **addr_and_ports,
-            "router_ip": self.router_ip,
-            "router_port": self.router_port,
-            "skip_dcs_registration": True,
-            "skip_router_registration": not bool(self.router_ip and self.router_port),
-        }
-
-    def shutdown(self) -> None:
-        # The owner's manager stops the routers once every model has closed.
-        self.backend.shutdown()
-
-    def get_engine_hosts_ports(self):
-        """Return a list of (host, port) tuples for each live genRM engine.
-
-        This is used by the GenRM service to send HTTP generation requests
-        directly to the underlying SGLang servers.
-
-        The host/port information is captured during engine initialization
-        from the addr_and_ports dict passed to ``_allocate_engine_addr_and_ports``.
-
-        ``all_engines`` holds one entry per *node*, so a multi-node engine
-        (genrm_num_gpus_per_engine > num_gpus_per_node) occupies
-        ``nodes_per_engine`` consecutive ranks. Only node_rank 0 of each group
-        runs the SGLang HTTP server -- the followers are compute-only workers
-        and answer /generate with 404 -- so stride the same way the
-        ``engines`` property does and return head nodes only.
-
-        The list is also compacted over dead engines, so callers must swap it
-        and any derived round-robin state together.
-        """
-        results = []
-        for rank in range(0, len(self.all_engines), self.nodes_per_engine):
-            engine = self.all_engines[rank]
-            if engine is not None and rank in self._engine_addr_and_ports:
-                info = self._engine_addr_and_ports[rank]
-                results.append((info["host"], info["port"]))
-        return results
-
-    # ------------------------------------------------------------------
-    # MultiEngineManager hooks.
-    # ------------------------------------------------------------------
-
-    def _placement_requests(self) -> tuple[PlacementRequest, ...]:
-        shared_with_rollout = getattr(self.args, "_genrm_colocate_with_rollout", False)
-        rollout_offset = 0 if self.args.fully_async or shared_with_rollout else self.args.rollout_num_gpus
-        return tuple(
-            PlacementRequest(
-                group_id=f"genrm/{self._placement_model_id}/replica-{index}",
-                worker_type="regular",
-                num_gpus=self.args.genrm_num_gpus_per_engine,
-                # The true engine width, not the per-node slot width: the
-                # planner needs it to validate a multi-node engine.
-                num_gpus_per_engine=self.args.genrm_num_gpus_per_engine,
-                num_gpus_per_node=self.args.num_gpus_per_node,
-                phase="genrm",
-                bundle_offset=rollout_offset + self.bundle_offset + index * self.args.genrm_num_gpus_per_engine,
-            )
-            for index in range(self.args.genrm_num_gpus // self.args.genrm_num_gpus_per_engine)
-        )
-
-    def _placement_group_view(self) -> PlacementGroupView:
-        return PlacementGroupView(tuple(self.pg[1]), tuple(self.pg[2]), self.placement_owner, identity=self.pg[0])
-
-    def _resolve_planned_placement(self, rank):
-        replica, node_rank = divmod(rank, self.nodes_per_engine)
-        planned = plan_placement(self._placement_ledger, self._placement_requests(), self._placement_group_view())[
-            replica
-        ]
-        bundle_index = tuple(self.pg[1]).index(planned.bundle_indices[node_rank])
-        return self.pg, False, bundle_index, planned
-
-    def _release_placement(self, placement: PlacementSlice) -> PlacementRelease:
-        return release_placement(self._placement_ledger, placement)
-
-    def _ray_resource_kwargs(self, rank):
-        # Lower default fractional-GPU footprint when sharing bundles with
-        # rollout (rollout uses 0.2 per actor; 0.2 + 0.2 risks Ray scheduler
-        # rejection).
-        shared_with_rollout = getattr(self.args, "_genrm_colocate_with_rollout", False)
-        default_ray_num_gpus = 0.1 if shared_with_rollout else 0.2
-        num_gpus = getattr(self.args, "genrm_ray_num_gpus", default_ray_num_gpus)
-        return {"num_cpus": num_gpus, "num_gpus": num_gpus}
-
-    def _build_engine_env_vars(self):
-        env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
-            "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
-            "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
-            # See rollout.py: recent SGLang reads SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK
-            # (default True) and the deprecation shim value-copies SGL_DISABLE_* into it,
-            # so the old DISABLE vars re-enable the check. Set ENABLE=false directly.
-            "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
-            "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
-            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
-            "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
-            "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
-            # NOTE: disable custom all-reduce-v2, same as rollout.py — avoids
-            # custom_all_reduce.cuh:37: CUDA error: invalid argument during CUDA graph capture.
-            "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
-        }
-        if getattr(self.args, "fp16", False):
-            env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
-        return env_vars
-
-    def _allocate_engine_addr_and_ports(self, *, new_engines):
-        return _allocate_genrm_engine_addr_and_ports(
-            args=self.args,
-            new_engines=new_engines,
-            port_window_index=self.port_window_index,
-        )
+def genrm_engine_env(args: Any) -> dict[str, str]:
+    env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
+        "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
+        "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+        # See rollout.py: recent SGLang reads SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK
+        # (default True) and the deprecation shim value-copies SGL_DISABLE_* into it,
+        # so the old DISABLE vars re-enable the check. Set ENABLE=false directly.
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
+        "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
+        "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
+        "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
+        "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+        # NOTE: disable custom all-reduce-v2, same as rollout.py — avoids
+        # custom_all_reduce.cuh:37: CUDA error: invalid argument during CUDA graph capture.
+        "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
+    }
+    if getattr(args, "fp16", False):
+        env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
+    return env_vars
 
 
-def _allocate_genrm_engine_addr_and_ports(*, args, new_engines, port_window_index=0):
-    """Allocate network addresses and ports for genRM engines.
+def genrm_role_models(args: Any, pg: Any) -> list[tuple[ModelConfig, Any, dict[str, Any]]]:
+    """Describe every GenRM instance for ``InferenceManager.create_role``.
 
-    Similar to _allocate_rollout_engine_addr_and_ports_normal but for genRM.
-
-    ``port_window_index`` selects a disjoint range per GenRM instance (multi-instance
-    --genrm-instances): every instance is a separate model pool that probes
-    for free ports independently, so two instances starting from the same base port can both
-    see a given port as free (probe-then-bind race) and then collide when
-    their SGLang servers actually bind it.
+    Under sync colocate the instances sit behind the rollout region of the
+    shared placement group, one after another; a GenRM that shares the rollout
+    bundles starts at bundle 0 and is only legal when it defers.
     """
-    window_start = _GENRM_PORT_BASE + port_window_index * _GENRM_PORT_WINDOW_SIZE
-    window_end = window_start + _GENRM_PORT_WINDOW_SIZE - 1
-    if port_window_index < 0 or window_end > _MAX_PORT:
-        raise ValueError(
-            f"GenRM port window index {port_window_index} is out of range; "
-            f"at most {(_MAX_PORT - _GENRM_PORT_BASE + 1) // _GENRM_PORT_WINDOW_SIZE} instances are supported."
-        )
-
-    num_engines_per_node = max(1, min(args.num_gpus_per_node, args.genrm_num_gpus) // args.genrm_num_gpus_per_engine)
-    addr_and_ports = {}
-
-    visited_nodes = set()
-    for rank, engine in new_engines:
-        if rank // num_engines_per_node in visited_nodes:
-            continue
-        visited_nodes.add(rank // num_engines_per_node)
-        num_engines_on_this_node = num_engines_per_node - (rank % num_engines_per_node)
-
-        def get_addr_and_ports(engine):
-            # Use a different, bounded port range from rollout (15000).
-            start_port = window_start
-
-            def port(consecutive=1):
-                nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
-                        consecutive=consecutive,
-                        max_port=window_end,
-                    )
+    region_offset = (
+        0 if args.fully_async or getattr(args, "_genrm_colocate_with_rollout", False) else args.rollout_num_gpus
+    )
+    models = []
+    bundle_offset = 0
+    for index, (key, spec) in enumerate(args._genrm_instances_resolved.items()):
+        engine_args = copy.copy(args)
+        engine_args.genrm_model_path = spec["model_path"]
+        engine_args.genrm_num_gpus = spec["num_gpus"]
+        engine_args.genrm_num_gpus_per_engine = spec["num_gpus_per_engine"]
+        engine_args.genrm_engine_config = spec["engine_config"]
+        engine_args.genrm_sampling_config = spec["sampling_config"]
+        sampling_config = spec["sampling_config"] or {}
+        config = ModelConfig(
+            key,
+            spec["model_path"],
+            engine_groups=[
+                EngineGroupConfig(
+                    "regular", spec["num_gpus"], spec["num_gpus_per_engine"], dict(spec["engine_config"] or {})
                 )
-                start_port = port + consecutive
-                return port
-
-            def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
-                return addr
-
-            return addr, port
-
-        get_addr, get_port = get_addr_and_ports(engine)
-
-        for i in range(num_engines_on_this_node):
-            current_rank = rank + i
-            addr_and_ports.setdefault(current_rank, {})
-            addr_and_ports[current_rank]["host"] = get_addr()
-            addr_and_ports[current_rank]["port"] = get_port()
-            addr_and_ports[current_rank]["nccl_port"] = get_port()
-
-        if args.genrm_num_gpus_per_engine > args.num_gpus_per_node:
-            num_node_per_engine = args.genrm_num_gpus_per_engine // args.num_gpus_per_node
-            if rank % num_node_per_engine == 0:
-                # First node in the engine, allocate dist_init_addr port
-                dist_init_addr = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-                for i in range(num_node_per_engine):
-                    addr_and_ports.setdefault(rank + i, {})
-                    addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
-        else:
-            for i in range(num_engines_on_this_node):
-                addr_and_ports.setdefault(rank + i, {})
-                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-
-    for rank, _ in new_engines:
-        for key in ["port", "nccl_port", "dist_init_addr"]:
-            assert key in addr_and_ports[rank], f"GenRM engine rank={rank} {key} is not set."
-        logger.info(f"Ports for genRM engine rank={rank}: {addr_and_ports[rank]}")
-
-    return addr_and_ports
+            ],
+            weight_source=WeightSource.STATIC,
+            # The judge's request defaults live on its model, so the GenRM
+            # service reads them from the manager instead of global arguments.
+            sampling_defaults={
+                "temperature": sampling_config.get("temperature", 0.2),
+                "top_p": sampling_config.get("top_p", 1.0),
+                "top_k": sampling_config.get("top_k", -1),
+                "max_new_tokens": sampling_config.get("max_response_len", 1024),
+            },
+            chat_template_kwargs=dict(sampling_config.get("chat_template_kwargs") or {}),
+            env_vars=genrm_engine_env(args),
+            fault_tolerance_enabled=True,
+        ).resolved(engine_args)
+        placement = {
+            "pg": pg,
+            "bundle_offset": region_offset + bundle_offset,
+            "phase": placement_phase(args, PHASE_GENRM),
+            "base_port": _GENRM_PORT_BASE + index * _GENRM_PORT_WINDOW_SIZE,
+            "ray_num_gpus": getattr(args, "genrm_ray_num_gpus", 0.2),
+        }
+        models.append((config, engine_args, placement))
+        bundle_offset += spec["num_gpus"]
+    return models

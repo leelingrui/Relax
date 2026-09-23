@@ -168,15 +168,7 @@ class RayTrainGroup:
 
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
-        manager = getattr(self, "_rollout_manager", None)
-        if manager is not None:
-            if not ray.get(manager.set_weight_updating.remote(True)):
-                raise RuntimeError("Rollout topology is draining; weight update must retry")
-        # On failure keep admission closed until a successful retry/recovery.
         ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
-        if manager is not None:
-            ray.get(manager.set_weight_updating.remote(False))
-            ray.get(manager.refresh_inference_state.remote())
 
     def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:
         """Update weights in fully async mode (sends to rollout and
@@ -204,20 +196,12 @@ class RayTrainGroup:
 
     def set_rollout_manager(self, rollout_manager: Any):
         ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
-        self._rollout_manager = rollout_manager
 
-    def set_inference_manager(self, inference_manager_handle: Any):
-        """Attach the task inference control plane to every training rank.
+    def set_genrm_manager(self, genrm_manager: Any):
+        """Set the genRM manager for coordinated offload/onload.
 
-        All ranks need it: rank 0 drives the phase switch, and the others gate
-        on the same barrier that already guards a colocated static pool.
+        In colocated mode, the genRM manager is used to offload genRM engines
+        before training and onload them before rollout, since they share GPU
+        resources.
         """
-        ray.get([actor.set_inference_manager.remote(inference_manager_handle) for actor in self._actor_handlers])
-
-    def set_genrm_models(self, genrm_models: Any):
-        """Set the GenRM models for coordinated offload/onload.
-
-        In colocated mode the GenRM engines are offloaded before training and
-        onloaded before rollout, since they share GPU resources.
-        """
-        ray.get([actor.set_genrm_models.remote(genrm_models) for actor in self._actor_handlers])
+        ray.get([actor.set_genrm_manager.remote(genrm_manager) for actor in self._actor_handlers])

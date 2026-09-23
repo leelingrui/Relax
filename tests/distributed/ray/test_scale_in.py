@@ -853,7 +853,7 @@ class TestCleanupEngineGroups:
         with patch("ray.util.remove_placement_group") as mock_remove:
             manager._cleanup_engine_groups(srv)
             mock_remove.assert_called_once_with(mock_pg)
-        assert manager._placement_ledger.allocations(view) == ()
+        assert manager._planner.allocations(view) == ()
 
     def test_ledger_ownership_overrides_a_stale_group_owner(self):
         from relax.engine.inference.placement import PlacementGroupView, PlacementRequest
@@ -883,7 +883,7 @@ class TestCleanupEngineGroups:
         with patch("ray.util.remove_placement_group") as mock_remove:
             manager._cleanup_engine_groups(srv)
             mock_remove.assert_not_called()
-        assert manager._placement_ledger.allocations(view) == ()
+        assert manager._planner.allocations(view) == ()
 
 
 # ===================== Scale-in status queries =============================

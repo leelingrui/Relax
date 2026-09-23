@@ -4,131 +4,108 @@ from unittest.mock import Mock
 
 import httpx
 
-from relax.engine.inference.client import InferenceDiscoveryClient
-from relax.engine.inference.discovery import (
-    DiscoveryState,
-    role_snapshot_from_dict,
-    snapshot_from_engine_urls,
-    snapshot_from_legacy_engines,
+from relax.engine.inference.discovery import InferenceDiscoveryClient, role_snapshot_from_dict
+from relax.engine.inference.types import (
+    LifecycleState,
+    ModelSnapshot,
+    ReplicaSnapshot,
+    Role,
+    RoleSnapshot,
+    RoutingSpec,
 )
-from relax.engine.inference.types import LifecycleState, Role
 
 
-def test_legacy_adapter_does_not_turn_active_actor_into_ready() -> None:
-    snapshot = snapshot_from_legacy_engines(
-        {
-            "models": {
-                "student": {
-                    "router_ip": "router",
-                    "router_port": 3000,
-                    "engine_groups": [{"engines": [{"rank": 4, "status": "active", "url": "http://worker"}]}],
-                }
-            }
-        },
-        role=Role.ROLLOUT,
+def _snapshot(*, router_url: str | None = None, topology_revision: int = 0, direct: bool = False) -> RoleSnapshot:
+    replica = ReplicaSnapshot("teacher/replica-0", LifecycleState.READY, "http://teacher-0", direct_eligible=direct)
+    return RoleSnapshot(
+        role=Role.TEACHER,
         manager_epoch="epoch-a",
-        default_model="student",
+        topology_revision=topology_revision,
+        models=(ModelSnapshot("teacher", (replica,), router_url, LifecycleState.READY, True),),
+        routing=RoutingSpec(default_model="teacher"),
     )
-    model = snapshot.models[0]
-    assert model.state is None
-    assert model.admission is False
-    assert model.router_url == "http://router:3000"
-    assert model.replicas[0].engine_id == "student/replica-4"
 
 
-def test_legacy_json_supports_status_filter() -> None:
-    snapshot = snapshot_from_legacy_engines(
-        {
-            "models": {
-                "student": {
-                    "engine_groups": [{"engines": [{"rank": 0, "status": "active"}, {"rank": 1, "status": "dead"}]}]
-                }
-            }
-        },
+def test_discovery_legacy_json_supports_status_filter() -> None:
+    snapshot = RoleSnapshot(
         role=Role.ROLLOUT,
         manager_epoch="epoch-a",
+        models=(
+            ModelSnapshot(
+                "student",
+                (
+                    ReplicaSnapshot("student/replica-0", LifecycleState.READY, "http://w0"),
+                    ReplicaSnapshot("student/replica-1", LifecycleState.DEAD, "http://w1"),
+                ),
+            ),
+        ),
     )
     active = snapshot.to_legacy_dict(status_filter="active")
     assert active["total_engines"] == 1
     assert "worker_type" not in active["models"]["student"]["engine_groups"][0]
 
 
-def test_rollout_capability_fields_are_explicitly_published() -> None:
-    snapshot = snapshot_from_legacy_engines(
-        {"models": {"actor": {"engine_groups": []}}},
-        role=Role.ROLLOUT,
-        manager_epoch="epoch-a",
-        allow_defer={"actor": True},
-        direct_eligible={"actor": False},
-    )
-    model = snapshot.models[0]
-    assert model.allow_defer is True
-    assert model.direct_eligible is False
-
-
-def test_engine_url_adapter_and_state_publisher() -> None:
-    snapshot = snapshot_from_engine_urls(
-        ["http://teacher-0/generate"],
-        role=Role.TEACHER,
-        model_id="teacher",
-        manager_epoch="epoch-a",
-        state=LifecycleState.READY,
-        admission=True,
-    )
-    state = DiscoveryState(snapshot)
-    published = state.update(phase="scoring")
-    assert published.phase == "scoring"
-    assert state.get().manager_epoch == "epoch-a"
-
-
-def test_v2_round_trip() -> None:
-    snapshot = snapshot_from_engine_urls(
-        ["http://teacher-0"],
-        role=Role.TEACHER,
-        model_id="teacher",
-        manager_epoch="epoch-a",
-        topology_revision=7,
-        state=LifecycleState.READY,
-        admission=True,
-    )
-    restored = role_snapshot_from_dict(snapshot.to_dict())
+def test_discovery_v2_round_trip_keeps_replica_direct_eligibility() -> None:
+    snapshot = _snapshot(topology_revision=7, direct=True)
+    payload = snapshot.to_dict()
+    assert payload["models"]["teacher"]["engines"][0]["direct_eligible"] is True
+    assert "direct_eligible" not in payload["models"]["teacher"]
+    restored = role_snapshot_from_dict(payload)
     assert restored == snapshot
     assert restored.topology_revision == 7
+
+
+def test_discovery_v2_round_trip_keeps_pd_workers_out_of_engines() -> None:
+    snapshot = _snapshot(router_url="http://router")
+    worker = ReplicaSnapshot("teacher/replica-1", LifecycleState.READY, "http://prefill")
+    model = snapshot.models[0]
+    snapshot = RoleSnapshot(
+        role=snapshot.role,
+        manager_epoch=snapshot.manager_epoch,
+        models=(
+            ModelSnapshot(
+                model.model_id, model.replicas, model.router_url, model.state, True, pd_workers=(("prefill", worker),)
+            ),
+        ),
+        routing=snapshot.routing,
+    )
+    payload = snapshot.to_dict()
+    assert [engine["engine_id"] for engine in payload["models"]["teacher"]["engines"]] == ["teacher/replica-0"]
+    assert payload["models"]["teacher"]["pd_workers"][0]["worker_type"] == "prefill"
+    assert role_snapshot_from_dict(payload) == snapshot
 
 
 def test_discovery_client_fetches_v2_snapshot() -> None:
     response = httpx.Response(
         200,
-        json=snapshot_from_engine_urls(
-            ["http://router"],
-            role=Role.GENRM,
-            model_id="judge",
-            manager_epoch="epoch-a",
-            router_url="http://router",
-            state=LifecycleState.READY,
-            admission=True,
-        ).to_dict(),
-        request=httpx.Request("GET", "http://service/genrm/engines"),
+        json=_snapshot(router_url="http://router").to_dict(),
+        request=httpx.Request("GET", "http://service/teacher/engines"),
     )
     transport = Mock()
     transport.get.return_value = response
     with InferenceDiscoveryClient("http://service", client=transport) as client:
-        snapshot = client.get_snapshot("genrm")
-        target = client.select_target(client.resolve_model(snapshot, model="judge"))
-    transport.get.assert_called_once_with("http://service/genrm/engines", params={"schema_version": 2})
+        snapshot = client.get_snapshot("teacher")
+        target = client.select_target(client.resolve_model(snapshot, model="teacher"))
+    transport.get.assert_called_once_with("http://service/teacher/engines", params={"schema_version": 2})
     assert target.base_url == "http://router"
 
 
-def test_role_snapshot_defaults_topology_revision_for_legacy_payload() -> None:
-    snapshot = role_snapshot_from_dict(
-        snapshot_from_engine_urls(
-            ["http://teacher-0"],
-            role=Role.TEACHER,
-            model_id="teacher",
-            manager_epoch="epoch-a",
-        ).to_dict()
+def test_discovery_client_selects_direct_replica_without_router() -> None:
+    response = httpx.Response(
+        200,
+        json=_snapshot(direct=True).to_dict(),
+        request=httpx.Request("GET", "http://service/teacher/engines"),
     )
-    payload = snapshot.to_dict()
+    transport = Mock()
+    transport.get.return_value = response
+    with InferenceDiscoveryClient("http://service", client=transport) as client:
+        snapshot = client.get_snapshot("teacher")
+        target = client.select_target(client.resolve_model(snapshot))
+    assert target.base_url == "http://teacher-0"
+
+
+def test_discovery_defaults_topology_revision_for_payload_without_it() -> None:
+    payload = _snapshot().to_dict()
     payload.pop("topology_revision")
 
     assert role_snapshot_from_dict(payload).topology_revision == 0

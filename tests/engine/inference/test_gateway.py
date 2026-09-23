@@ -10,25 +10,48 @@ import pytest
 from starlette.requests import Request
 
 from relax.components.inference_gateway import InferenceGateway
-from relax.engine.inference.discovery import snapshot_from_engine_urls
-from relax.engine.inference.types import LifecycleState, Role
+from relax.engine.inference.types import LifecycleState, ModelSnapshot, ReplicaSnapshot, Role, RoleSnapshot
 
 
 def _snapshot(*, role: Role = Role.ROLLOUT, state: LifecycleState = LifecycleState.READY, admission: bool = True):
-    return snapshot_from_engine_urls(
-        ["http://engine/generate"],
+    return RoleSnapshot(
         role=role,
-        model_id="model-a",
         manager_epoch="epoch-a",
-        router_url="http://router",
-        state=state,
-        admission=admission,
+        models=(
+            ModelSnapshot(
+                "model-a",
+                (ReplicaSnapshot("model-a/replica-0", LifecycleState.STARTING, "http://engine/generate"),),
+                router_url="http://router",
+                state=state,
+                admission=admission,
+            ),
+        ),
     )
 
 
+class _Owner:
+    """A task manager handle whose snapshot comes from ``provider``."""
+
+    def __init__(self, provider) -> None:
+        self.inflight: set[str] = set()
+
+        async def snapshot(role):
+            return provider()
+
+        async def admit_request(role, model_id, request_id):
+            self.inflight.add(request_id)
+            return request_id
+
+        async def complete_request(request_id):
+            self.inflight.discard(request_id)
+
+        self.snapshot = SimpleNamespace(remote=snapshot)
+        self.admit_request = SimpleNamespace(remote=admit_request)
+        self.complete_request = SimpleNamespace(remote=complete_request)
+
+
 def _owner(provider):
-    """A task owner handle whose snapshot comes from ``provider``."""
-    return SimpleNamespace(snapshot=SimpleNamespace(remote=lambda **kwargs: provider()))
+    return _Owner(provider)
 
 
 def test_gateway_requires_the_task_owner_handle() -> None:
@@ -69,27 +92,37 @@ async def test_gateway_reuses_discovery_routing_and_rejects_unavailable_models()
 @pytest.mark.asyncio
 async def test_gateway_never_uses_replica_url_when_router_is_missing() -> None:
     snapshot = _snapshot()
-    model = snapshot.models[0]
-    snapshot = type(snapshot)(
-        role=snapshot.role,
-        manager_epoch=snapshot.manager_epoch,
-        models=(
-            type(model)(
-                model_id=model.model_id,
-                replicas=model.replicas,
-                router_url=None,
-                state=model.state,
-                admission=model.admission,
-                direct_eligible=True,
-            ),
-        ),
-        routing=snapshot.routing,
+    model = replace(
+        snapshot.models[0],
+        router_url=None,
+        replicas=(replace(snapshot.models[0].replicas[0], state=LifecycleState.READY),),
     )
-    gateway = InferenceGateway(Role.ROLLOUT, manager_handle=_owner(lambda: snapshot))
+    gateway = InferenceGateway(Role.ROLLOUT, manager_handle=_owner(lambda: replace(snapshot, models=(model,))))
     try:
         with pytest.raises(Exception) as error:
             await gateway._target({"model": "model-a"})
         assert error.value.status_code == 503
+    finally:
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_rotates_across_direct_eligible_replicas() -> None:
+    snapshot = _snapshot()
+    model = replace(
+        snapshot.models[0],
+        router_url=None,
+        replicas=tuple(
+            ReplicaSnapshot(
+                f"model-a/replica-{index}", LifecycleState.READY, f"http://engine-{index}", direct_eligible=True
+            )
+            for index in range(2)
+        ),
+    )
+    gateway = InferenceGateway(Role.TEACHER, manager_handle=_owner(lambda: replace(snapshot, models=(model,))))
+    try:
+        targets = [await gateway._target({"model": "model-a"}) for _ in range(3)]
+        assert targets == ["http://engine-0", "http://engine-1", "http://engine-0"]
     finally:
         await gateway.close()
 
@@ -124,7 +157,9 @@ async def test_gateway_genrm_router_adapts_only_messages(native: bool) -> None:
     sent = []
 
     def upstream(request):
-        sent.append(json.loads(request.content))
+        body = json.loads(request.content)
+        assert body.pop("rid")
+        sent.append(body)
         assert request.url == "http://router/generate"
         assert int(request.headers["content-length"]) == len(request.content)
         return httpx.Response(200, json={"text": " score \n", "meta_info": {"id": "result"}})
@@ -144,7 +179,7 @@ async def test_gateway_genrm_router_adapts_only_messages(native: bool) -> None:
             assert json.loads(response.body) == {"text": " score \n", "meta_info": {"id": "result"}}
         else:
             adapt.assert_awaited_once_with("model-a", content["messages"], {"temperature": 0.3})
-            assert sent[0] == adapt.return_value
+            assert sent[0] == {"input_ids": [11, 12], "sampling_params": {"temperature": 0.3}}
             assert json.loads(response.body) == {"response": "score"}
     finally:
         await gateway.close()
@@ -190,7 +225,7 @@ async def test_gateway_genrm_rejects_missing_router_without_backend_fallback() -
 @pytest.mark.asyncio
 async def test_gateway_reads_one_task_manager_snapshot() -> None:
     snapshot = _snapshot(role=Role.TEACHER)
-    manager = SimpleNamespace(snapshot=SimpleNamespace(remote=lambda **kwargs: snapshot))
+    manager = _owner(lambda: snapshot)
     gateway = InferenceGateway(Role.TEACHER, manager_handle=manager)
     try:
         first = await gateway._snapshot()
@@ -204,7 +239,9 @@ async def test_gateway_teacher_native_strips_routing_metadata() -> None:
     gateway = InferenceGateway(Role.TEACHER, manager_handle=_owner(lambda: _snapshot(role=Role.TEACHER)))
 
     def upstream(request):
-        assert json.loads(request.content) == {"input_ids": [1, 2], "return_logprob": True}
+        body = json.loads(request.content)
+        assert body.pop("rid")
+        assert body == {"input_ids": [1, 2], "return_logprob": True}
         return httpx.Response(200, json={"text": "", "meta_info": {"input_token_logprobs": []}})
 
     await gateway._client.aclose()
@@ -221,13 +258,17 @@ async def test_gateway_teacher_native_strips_routing_metadata() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gateway_preserves_legacy_engines_and_genrm_response_shape() -> None:
+async def test_gateway_engines_defaults_to_common_schema_and_keeps_legacy_opt_in() -> None:
     gateway = InferenceGateway(Role.GENRM, manager_handle=_owner(lambda: _snapshot(role=Role.GENRM)))
     try:
-        legacy = await gateway.engines()
-        v2 = await gateway.engines(schema_version=2)
+        default = await gateway.engines()
+        assert default == await gateway.engines(schema_version=2)
+        assert default["schema_version"] == 2 and default["role"] == "genrm"
+        legacy = await gateway.engines(schema_version=1)
         assert legacy["models"]["model-a"]["total_engines"] == 1
-        assert v2["role"] == "genrm"
+        with pytest.raises(Exception) as error:
+            await gateway.engines(schema_version=3)
+        assert error.value.status_code == 400
         assert json.loads((await gateway.health()).body)["status"] == "healthy"
     finally:
         await gateway.close()
@@ -242,5 +283,30 @@ async def test_gateway_health_reports_manager_unavailable() -> None:
         response = await gateway.health()
         assert response.status_code == 503
         assert json.loads(response.body)["status"] == "unavailable"
+    finally:
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_completes_admitted_requests_and_aborts_failed_ones() -> None:
+    owner = _owner(lambda: _snapshot())
+    gateway = InferenceGateway(Role.ROLLOUT, manager_handle=owner)
+    aborted = []
+
+    def upstream(request):
+        if request.url.path == "/generate" and request.url.host == "router":
+            raise httpx.ReadTimeout("lost", request=request)
+        if request.url.path == "/workers":
+            return httpx.Response(200, json={"workers": [{"url": "http://engine"}]})
+        aborted.append(json.loads(request.content)["rid"])
+        return httpx.Response(200, json={})
+
+    await gateway._client.aclose()
+    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    try:
+        response = await gateway.proxy(_request({"model": "model-a", "input_ids": [1]}), "generate")
+        assert response.status_code == 502
+        assert len(aborted) == 1
+        assert owner.inflight == set()
     finally:
         await gateway.close()

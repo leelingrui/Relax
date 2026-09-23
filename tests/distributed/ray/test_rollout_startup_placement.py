@@ -15,9 +15,7 @@ import pytest
 
 try:
     from relax.distributed.ray import rollout as module
-    from relax.engine.inference.manager import InferenceManager
     from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementPlanner
-    from relax.engine.inference.types import Role
 
     HAS_DEPS = True
 except ImportError:
@@ -78,8 +76,7 @@ def test_rollout_startup_records_its_layout_in_the_supplied_ledger(startup):
     module.start_rollout_servers(
         _args(),
         pg,
-        inference_manager=InferenceManager(Role.ROLLOUT),
-        placement_manager_handle=ledger,
+        planner=ledger,
     )
 
     (recorded,) = ledger.allocations(_view(pg))
@@ -98,8 +95,7 @@ def test_rollout_startup_failure_releases_the_reserved_slices(startup):
         module.start_rollout_servers(
             _args(),
             pg,
-            inference_manager=InferenceManager(Role.ROLLOUT),
-            placement_manager_handle=ledger,
+            planner=ledger,
         )
 
     assert ledger.allocations(_view(pg)) == ()
@@ -114,28 +110,8 @@ def test_rollout_startup_failure_keeps_the_controller_owned_group(startup):
         module.start_rollout_servers(
             _args(),
             pg,
-            inference_manager=InferenceManager(Role.ROLLOUT),
-            placement_manager_handle=ledger,
+            planner=ledger,
         )
 
     # Releasing a borrowed group never authorizes destroying it.
     assert ledger.release(_view(pg)).remove_placement_group is False
-
-
-def test_rollout_pool_uses_the_injected_ledger_for_every_call():
-    """The task owner's ledger is the only one; the pool has no fallback."""
-    from conftest import create_test_manager
-
-    manager = create_test_manager()
-    owner_ledger = object()
-    manager._placement_ledger = owner_ledger
-
-    assert manager._placement_ledger is owner_ledger
-
-
-def test_rollout_pool_construction_requires_the_owner_ledger():
-    import inspect
-
-    parameters = inspect.signature(module.RolloutEnginePool.__init__).parameters
-    for name in ("inference_manager", "placement_ledger"):
-        assert parameters[name].default is inspect.Parameter.empty, f"{name} must stay required"

@@ -26,7 +26,6 @@ try:
         RolloutEnginePool,
         RolloutServer,
     )
-    from relax.engine.inference.placement import PlacementPlanner
 
     HAS_DEPS = True
 except ImportError:
@@ -57,7 +56,7 @@ class FakeOwnerHandle:
     def _answer(self, name: str, args: tuple, kwargs: dict):
         self.calls.append((name, args, kwargs))
         if name == "create_role":
-            return tuple(args[2])
+            return tuple(getattr(config, "name", config) for config, _, _ in args[1])
         if name == "call" and args[2] == "get_urls":
             return self.urls.get(args[1], [])
         return None
@@ -253,9 +252,6 @@ def create_test_manager(args=None, servers=None):
 
     manager = object.__new__(RolloutEnginePool)
     manager.args = args
-    # Production injects the task owner's single ledger; the pool has no
-    # fallback of its own, so the factory has to supply one.
-    manager._placement_ledger = PlacementPlanner()
     manager.servers = servers if servers is not None else {}
     manager._scale_out_requests = {}
     manager._scale_in_requests = {}
@@ -282,30 +278,20 @@ def create_test_manager(args=None, servers=None):
     manager._port_cursors = {}
     manager._eviction_monitor_stop = None
     manager._eviction_monitor_thread = None
-    from relax.distributed.ray.inference_role import UnifiedServiceManager
-    from relax.distributed.ray.model_pool import ModelPool
-    from relax.distributed.ray.rollout import _RolloutPoolRuntime
-    from relax.engine.inference.capabilities import WeightSource
-    from relax.engine.inference.manager import InferenceManager
-    from relax.engine.inference.specs import ModelSpec
-    from relax.engine.inference.types import Role, RoutingSpec
+    from relax.distributed.ray.inference_manager import InferenceManager
+    from relax.engine.inference.config import ModelConfig
+    from relax.engine.inference.types import Role
 
     manager.status = None
-    manager.inference_manager = InferenceManager(Role.ROLLOUT)
-    pools = {}
+    manager._inference_sync_pending = False
+    manager.inference_manager = InferenceManager()
+    manager._planner = manager.inference_manager.placement
     for name, server in manager.servers.items():
-        manager.inference_manager.register_model(
-            ModelSpec(name, "test-checkpoint", weight_source=WeightSource.POLICY, allow_defer=True),
-            operation_id=f"register:{name}",
-        )
-        pools[name] = ModelPool.from_runtime(manager.inference_manager, name, _RolloutPoolRuntime(server))
-    manager.inference_manager.configure_routes(
-        RoutingSpec(default_model=next(iter(manager.servers)) if len(manager.servers) == 1 else None),
-        operation_id="routes",
-    )
-    manager.service_manager = UnifiedServiceManager(
-        Role.ROLLOUT, inference_manager=manager.inference_manager, pools=pools
-    )
+        server.model_name = name
+        server.model_spec = server.model_spec or ModelConfig(name, "test-checkpoint", elastic_enabled=True)
+        server.ready_gate = manager._serving
+    if manager.servers:
+        manager.inference_manager.register(Role.ROLLOUT, manager.servers)
     return manager
 
 

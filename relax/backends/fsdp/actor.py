@@ -1822,13 +1822,14 @@ class FSDPTrainRayActor(TrainRayActor):
             _collect_weight_sync_errors(local_error),
         )
         assert engine_state is not None
-        engines = engine_state.engines
+        engines, _lock, *_rest = engine_state
         if not engines:
             raise WeightSyncError(version, "no rollout engines available")
         if self.args.weight_sync_mode == "adapter":
             self._run_adapter_transaction(manifest, engines)
             return
-        gpu_counts = engine_state.engine_gpu_counts
+        # _rest = [num_new_engines, engine_gpu_counts, engine_gpu_offsets].
+        gpu_counts = _rest[1] if len(_rest) >= 2 else [1] * len(engines)
         world = dist.get_world_size(self._device_group())
         total_engine_gpus = sum(int(c) for c in gpu_counts)
         if total_engine_gpus != world:

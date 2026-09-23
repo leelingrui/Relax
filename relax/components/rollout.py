@@ -837,15 +837,7 @@ class Rollout(Base):
         )
 
     @app.get("/engines")
-    async def get_engines(
-        self,
-        model_name: Optional[str] = None,
-        schema_version: Optional[int] = None,
-        status_filter: Optional[str] = None,
-    ):
-        if schema_version == 2:
-            snapshot = await self.rollout_manager.get_discovery_snapshot.remote(model_name, status_filter)
-            return snapshot.to_dict(status_filter)
+    async def get_engines(self, model_name: Optional[str] = None, status_filter: Optional[str] = None):
         result = await self.rollout_manager.get_engines_info.remote(model_name, status_filter)
         return result
 

@@ -106,35 +106,30 @@ class Service:
             {"runtime_env": self.runtime_env},
         )
         if self.data_source is not None:
-            bind_kwargs = {"data_source": self.data_source, "runtime_env": self.runtime_env}
-            if self.role == "rollout" and getattr(self, "inference_manager_handle", None) is not None:
-                bind_kwargs["inference_manager_handle"] = self.inference_manager_handle
             self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
-                self.healthy, pgs, self.config, **bind_kwargs
+                self.healthy,
+                pgs,
+                self.config,
+                data_source=self.data_source,
+                runtime_env=self.runtime_env,
+                inference_manager_handle=self.inference_manager_handle,
             )
         else:
-            bind_kwargs = {"runtime_env": self.runtime_env}
-            if self.role == "genrm" and getattr(self, "inference_manager_handle", None) is not None:
-                bind_kwargs["inference_manager_handle"] = self.inference_manager_handle
+            role_kwargs = {"inference_manager_handle": self.inference_manager_handle} if self.role == "genrm" else {}
             self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
-                self.healthy, pgs, self.num_gpus, self.config, self.role, **bind_kwargs
+                self.healthy, pgs, self.num_gpus, self.config, self.role, runtime_env=self.runtime_env, **role_kwargs
             )
         logger.info(f"[{self.role}] Deploying service...")
-        gateway_enabled = getattr(self, "_gateway_enabled", self.role in {"rollout", "genrm"})
-        backend_name = getattr(self, "_backend_name", f"{self.role}_backend" if gateway_enabled else self.role)
-        gateway_name = getattr(self, "_gateway_name", f"{self.role}_gateway" if gateway_enabled else None)
-        manager_handle = getattr(self, "inference_manager_handle", None)
-        backend_prefix = f"/{self.role}/backend" if gateway_enabled else f"/{self.role}"
-        self.handle = serve.run(self.service, name=backend_name, route_prefix=backend_prefix)
-        if gateway_enabled:
-            backend_url = get_serve_url(backend_prefix)
+        backend_prefix = f"/{self.role}/backend" if self._gateway_enabled else f"/{self.role}"
+        self.handle = serve.run(self.service, name=self._backend_name, route_prefix=backend_prefix)
+        if self._gateway_enabled:
             gateway = InferenceGatewayDeployment.bind(
                 self.role,
-                manager_handle=manager_handle,
-                upstream_url=backend_url,
+                manager_handle=self.inference_manager_handle,
+                upstream_url=get_serve_url(backend_prefix),
                 genrm_backend_handle=self.handle if self.role == "genrm" else None,
             )
-            self.gateway_handle = serve.run(gateway, name=gateway_name, route_prefix=f"/{self.role}")
+            serve.run(gateway, name=self._gateway_name, route_prefix=f"/{self.role}")
             logger.info(f"[{self.role}] CPU InferenceGateway deployed at /{self.role}; backend={backend_prefix}")
 
     def _start_heartbeat(self) -> None:
@@ -213,11 +208,12 @@ class Service:
     async def set_barriers(self, *, rollout: Any = None, peers: Any = None) -> None:
         await self.handle.set_barriers.remote(rollout=rollout, peers=peers)
 
-    async def set_genrm_models(self, genrm_models: Any) -> None:
-        await self.handle.set_genrm_models.remote(genrm_models)
+    async def set_genrm_manager(self, genrm_manager: Any) -> None:
+        await self.handle.set_genrm_manager.remote(genrm_manager)
 
-    async def set_inference_manager(self, inference_manager_handle: Any) -> None:
-        await self.handle.set_inference_manager.remote(inference_manager_handle)
+    async def get_genrm_manager(self, route_key: Optional[str] = None) -> Any:
+        """Get the GenRM manager selected by ``route_key``."""
+        return await self.handle.get_genrm_manager.remote(route_key)
 
     async def set_step(self, set_step: int) -> None:
         await self.handle.set_step.remote(set_step)

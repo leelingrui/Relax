@@ -714,6 +714,8 @@ class TestLegacyDiscoveryContract:
         assert manager.get_engines_info("missing") == {"models": {}, "total_engines": 0}
 
     def test_rollout_discovery_topology_revision_increments_on_slot_change(self, patch_ray_get):
+        from relax.engine.inference.types import Role
+
         # The revision tracks the addressable endpoint set, so the recovered
         # slot has to report an observation -- a bare handle publishes no
         # address and is not a topology change.
@@ -730,12 +732,15 @@ class TestLegacyDiscoveryContract:
         group = make_engine_group(engines=[_observed_engine("http://node-a:30000"), None])
         manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
 
+        def snapshot():
+            return manager.inference_manager.snapshot(Role.ROLLOUT)
+
         manager.refresh_inference_state()
-        initial = manager.get_discovery_snapshot()
+        initial = snapshot()
         group.all_engines[1] = _observed_engine("http://node-b:30000")
-        assert manager.get_discovery_snapshot() == initial
+        assert snapshot() == initial
         manager.refresh_inference_state()
-        updated = manager.get_discovery_snapshot()
+        updated = snapshot()
 
         assert updated.topology_revision > initial.topology_revision
 

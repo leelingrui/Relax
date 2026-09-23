@@ -58,3 +58,39 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
     }
     assert config.opd_teacher_url == "http://gateway/teacher/generate"
     assert config.opd_teacher_engine_urls == ["http://teacher/generate"]
+
+
+def test_teacher_colocate_layout_accepts_split_and_shared_only():
+    import pytest
+
+    from relax.utils.opd.opd_utils import check_teacher_colocate_layout
+
+    check_teacher_colocate_layout(4, 4, 8)  # split: teachers after rollout
+    check_teacher_colocate_layout(8, 8, 8)  # shared: teachers reuse the rollout bundles
+    check_teacher_colocate_layout(8, 4, 8)
+    for rollout, teacher in ((4, 2), (6, 4), (8, 9)):
+        with pytest.raises(ValueError, match="split bundles"):
+            check_teacher_colocate_layout(rollout, teacher, 8)
+
+
+def test_shared_teacher_layout_starts_at_bundle_zero_and_defers():
+    from relax.engine.inference.phase_plans import PHASE_TEACHER, deferred_opd_enabled, placement_phase
+    from relax.utils.opd.opd_utils import teacher_region_offset
+
+    base = dict(use_opd=True, opd_type="sglang", colocate=True, hybrid=False, opd_teacher_routes=None)
+    shared = Namespace(
+        **base,
+        teacher_hf_checkpoint="/ckpt",
+        rollout_num_gpus=8,
+        resource={"actor": [1, 8], "rollout": [1, 8], "teacher": [1, 8]},
+    )
+    split = Namespace(
+        **base,
+        teacher_hf_checkpoint="/ckpt",
+        rollout_num_gpus=4,
+        resource={"actor": [1, 8], "rollout": [1, 4], "teacher": [1, 4]},
+    )
+    assert teacher_region_offset(shared) == 0 and deferred_opd_enabled(shared)
+    assert placement_phase(shared, PHASE_TEACHER) == PHASE_TEACHER
+    assert teacher_region_offset(split) == 4 and not deferred_opd_enabled(split)
+    assert placement_phase(split, PHASE_TEACHER) != PHASE_TEACHER

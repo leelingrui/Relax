@@ -6,13 +6,63 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from relax.engine.inference.capabilities import WeightSource
+from relax.engine.inference.types import RouteMode, RoutingSpec, WeightSource
 
 
-if TYPE_CHECKING:
-    from relax.engine.inference.specs import EngineGroupSpec
+@dataclass(frozen=True)
+class ReplicaSpec:
+    replica_id: str
+    node_ranks: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.replica_id or not self.node_ranks:
+            raise ValueError("Replica identity and node ranks are required")
+        if min(self.node_ranks) < 0 or len(set(self.node_ranks)) != len(self.node_ranks):
+            raise ValueError("Node ranks must be unique and non-negative")
+
+
+def replicas_from_slots(
+    prefix: str, num_slots: int, nodes_per_engine: int, *, first_slot: int = 0
+) -> tuple[ReplicaSpec, ...]:
+    """Name the replicas of one engine group.
+
+    ``first_slot`` offsets the identity, not the node ranks: a group that
+    starts at engine slot N names its replicas from N while its ranks stay
+    local to the group. That keeps an identity stable for the life of the
+    replica even when another group is added or removed around it.
+    """
+    if num_slots < 0 or nodes_per_engine < 1 or num_slots % nodes_per_engine:
+        raise ValueError("Engine slots must contain complete logical replicas")
+    return tuple(
+        ReplicaSpec(f"{prefix}/replica-{first_slot + head}", tuple(range(head, head + nodes_per_engine)))
+        for head in range(0, num_slots, nodes_per_engine)
+    )
+
+
+@dataclass(frozen=True)
+class EngineGroupSpec:
+    """Runtime topology only; deployment parameters live in
+    EngineGroupConfig."""
+
+    group_id: str
+    replicas: tuple[ReplicaSpec, ...]
+
+    def __post_init__(self) -> None:
+        if not self.group_id:
+            raise ValueError("Engine group identity is required")
+        ranks = [rank for replica in self.replicas for rank in replica.node_ranks]
+        if len(set(ranks)) != len(ranks):
+            raise ValueError("Replicas cannot share node actor ranks within an engine group")
+
+
+def validate_routes(routing: RoutingSpec, model_names: set[str]) -> None:
+    targets = {model for _, model in routing.route_key_to_model}
+    if routing.default_model is not None:
+        targets.add(routing.default_model)
+    if not targets <= model_names:
+        raise ValueError(f"Routing references unregistered models: {sorted(targets - model_names)}")
 
 
 @dataclass
@@ -42,14 +92,25 @@ class ModelConfig:
     model_path: str | None = None
     num_gpus_per_engine: int | None = None
     engine_groups: list[EngineGroupConfig] = field(default_factory=list)
-    weight_source: WeightSource = WeightSource.POLICY
-    allow_defer: bool = False
-    direct_eligible: bool = False
+    weight_source: WeightSource = WeightSource.DCS
+    route_mode: RouteMode = RouteMode.SGLANG_ROUTER
+    # Request defaults a role applies when it builds an engine payload itself
+    # (GenRM); a caller's own sampling parameters still win.
+    sampling_defaults: dict[str, Any] = field(default_factory=dict)
+    chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
+    # Environment of every engine process of this model, so a static model never
+    # inherits rollout-only settings from the global process environment.
+    env_vars: dict[str, str] = field(default_factory=dict)
+    # Whether the pool accepts scale-out/scale-in, and whether dead engines are
+    # detected and rebuilt.
+    elastic_enabled: bool = False
+    fault_tolerance_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("Model identity is required")
         self.weight_source = WeightSource(self.weight_source)
+        self.route_mode = RouteMode(self.route_mode)
         topologies = [group.topology for group in self.engine_groups if group.topology is not None]
         groups = [group.group_id for group in topologies]
         replicas = [replica.replica_id for group in topologies for replica in group.replicas]
@@ -59,6 +120,18 @@ class ModelConfig:
     @property
     def model_id(self) -> str:
         return self.name
+
+    @property
+    def needs_weight_update(self) -> bool:
+        return self.weight_source != WeightSource.STATIC
+
+    @property
+    def needs_dcs(self) -> bool:
+        return self.weight_source == WeightSource.DCS
+
+    @property
+    def needs_router(self) -> bool:
+        return self.route_mode == RouteMode.SGLANG_ROUTER
 
     def resolve(self, args: Any) -> None:
         """Resolve launch defaults in place (legacy API)."""
@@ -74,8 +147,6 @@ class ModelConfig:
     def resolved(self, args: Any) -> ModelConfig:
         """Resolve once, then attach topology without a second configuration
         representation."""
-        from relax.engine.inference.specs import EngineGroupSpec, replicas_from_slots
-
         model = deepcopy(self)
         model.resolve(args)
         if args.num_gpus_per_node < 1:

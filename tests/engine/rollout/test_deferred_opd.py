@@ -238,7 +238,7 @@ def test_executor_fails_the_batch_when_scoring_raises():
 
     result = run(main())
     assert result.state is DeferredState.FAILED
-    assert "teacher unreachable" in result.error.message
+    assert "teacher unreachable" in result.error
     assert published == []
 
 

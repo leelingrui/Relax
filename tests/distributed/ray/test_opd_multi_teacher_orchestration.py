@@ -40,7 +40,7 @@ def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monke
     import ray
 
     from relax.core.service import create_placement_group as _real_create_pg  # noqa: F401
-    from relax.engine.inference.types import ModelRef, Role
+    from relax.engine.inference.types import Role
     from relax.utils.opd import opd_utils
 
     _install_fake_gateway(monkeypatch)
@@ -52,6 +52,13 @@ def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monke
     )
     owner = FakeOwnerHandle(urls={"math": ["http://math"], "code": ["http://code/generate"]})
     monkeypatch.setattr(ray, "get", lambda ref, **kwargs: ref)
+    from relax.distributed.ray import teacher_manager
+
+    monkeypatch.setattr(
+        teacher_manager,
+        "teacher_role_model",
+        lambda args, **kwargs: (Namespace(name=kwargs["model_id"], path=args.teacher_hf_checkpoint), None, kwargs),
+    )
 
     args = _base_args()
     routes_json = json.dumps({"math": "/ckpt/math", "code": "/ckpt/code"})
@@ -59,26 +66,17 @@ def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monke
     shared_pg, models = opd_utils._start_managed_multi_teacher(args, routes_json, inference_manager_handle=owner)
 
     assert shared_pg == full_pg
-    assert models == (ModelRef(Role.TEACHER, "math"), ModelRef(Role.TEACHER, "code"))
-
-    # The whole layout is validated on the owner's ledger before any teacher
-    # starts, and reserves nothing.
-    ((plan_args, plan_kwargs),) = owner.named("plan_placement")
-    assert plan_kwargs == {"dry_run": True}
-    assert [request.bundle_offset for request in plan_args[0]] == [8, 12]
+    assert [(handle.role, handle.model_id) for handle in models] == [(Role.TEACHER, "math"), (Role.TEACHER, "code")]
 
     ((create_args, _),) = owner.named("create_role")
-    assert create_args[1] == "teacher"
-    ctor = {model_id: config["kwargs"] for model_id, config in create_args[2].items()}
-    assert create_args[2]["math"]["args"][0].teacher_hf_checkpoint == "/ckpt/math"
-    # The adapter adds rollout_num_gpus itself, so these offsets are relative
-    # to the teacher region: math at 0, code at 0+4=4.
-    assert ctor["math"]["bundle_offset"] == 0
-    assert ctor["code"]["bundle_offset"] == 4
-    assert ctor["math"]["num_replicas"] == 1
-    assert ctor["math"]["gpus_per_replica"] == 4
-    assert ctor["math"]["shared_pg"] is True
-    assert ctor["math"]["pg"] == full_pg
+    assert create_args[0] == Role.TEACHER
+    configs = {config.name: (config, kwargs) for config, _, kwargs in create_args[1]}
+    # Offsets are a prefix sum within the teacher region, which starts after
+    # the rollout bundles.
+    assert configs["math"][1]["bundle_offset"] == 0
+    assert configs["code"][1]["bundle_offset"] == 4
+    assert configs["math"][0].path == "/ckpt/math"
+    assert configs["math"][1]["pg"] == full_pg
 
     assert args.opd_teacher_routes_map == {
         "math": ["http://math/generate"],
