@@ -1211,8 +1211,7 @@ class Controller:
 
         # Save the old HealthChecker's stop event. Since _global_restart is
         # called FROM the old HealthChecker thread (via on_unhealthy callback),
-        # _health_manager.stop() cannot actually stop the thread (join times
-        # out because the thread is running this very function). We must
+        # _health_manager.stop() cannot join the calling checker thread. We must
         # explicitly set the stop event so that when control returns to the
         # old _check_loop after _global_restart finishes, the loop exits
         # immediately instead of trying to use stale Ray actor handles from
@@ -1247,11 +1246,18 @@ class Controller:
             except Exception as e:
                 logger.warning(f"[Global Restart] Failed to stop heartbeat for '{svc_role}': {e}")
 
-            try:
-                serve.delete(svc_role)
-                logger.info(f"[Global Restart] Deleted Ray Serve deployment '{svc_role}'")
-            except Exception as e:
-                logger.warning(f"[Global Restart] Failed to delete deployment '{svc_role}': {e}")
+            for app_name in (service._gateway_name, service._backend_name):
+                if app_name is None:
+                    continue
+                try:
+                    serve.delete(app_name)
+                    logger.info(f"[Global Restart] Deleted Ray Serve application '{app_name}'")
+                except Exception as e:
+                    logger.warning(f"[Global Restart] Failed to delete application '{app_name}': {e}")
+
+        if self._inference_manager_handle is not None:
+            ray.get(self._inference_manager_handle.shutdown_all.remote())
+            logger.info("[Global Restart] Inference engines and owned routers shut down")
 
         self.serve_dict.clear()
         logger.info("[Global Restart] All service references cleared")
