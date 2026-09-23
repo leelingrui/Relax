@@ -772,6 +772,7 @@ async def manager_remove_engine(g, idx):
 # ===================== _cleanup_engine_groups ==============================
 
 
+@pytest.mark.usefixtures("patch_ray_get")
 class TestCleanupEngineGroups:
     def test_removes_empty_groups(self):
         g_live = make_engine_group(engines=[make_mock_engine()])

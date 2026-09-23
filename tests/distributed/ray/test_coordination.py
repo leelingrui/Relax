@@ -34,6 +34,13 @@ from conftest import (
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
 
 
+@pytest.fixture(autouse=True)
+def mock_placement_group_removal():
+    # All placement groups in this module are mocks, not live Ray resources.
+    with patch("ray.util.remove_placement_group"):
+        yield
+
+
 # ==================== _find_active_scale_request ===========================
 
 

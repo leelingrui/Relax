@@ -354,7 +354,7 @@ class MegatronTrainRayActor(TrainRayActor):
         monkey_patch_torch_dist(args)
         from relax.utils.checkpoint_write_patch import patch_checkpoint_write
 
-        patch_checkpoint_write()
+        patch_checkpoint_write(blocking_staging=args.offload_train and not getattr(args, "async_save", False))
         if role == "reference" or role == "actor_fwd":
             process_args(args, role)
         super().init(args, role, with_ref, with_opd_teacher)

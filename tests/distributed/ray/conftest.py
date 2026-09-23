@@ -291,7 +291,8 @@ def create_test_manager(args=None, servers=None):
         server.model_spec = server.model_spec or ModelConfig(name, "test-checkpoint", elastic_enabled=True)
         server.ready_gate = manager._serving
     if manager.servers:
-        manager.inference_manager.register(Role.ROLLOUT, manager.servers)
+        with patch.object(ray, "get", mock_ray_get):
+            manager.inference_manager.register(Role.ROLLOUT, manager.servers)
     return manager
 
 
