@@ -483,8 +483,21 @@ class SGLangEngine(RayActor):
         if self.role == Role.GENRM:
             kwargs.pop("sglang_overrides", None)
             kwargs.pop("num_gpus_per_engine", None)
-            return _compute_genrm_server_args(*args, **kwargs)
-        return _compute_server_args(*args, **kwargs)
+            server_args, check_fields = _compute_genrm_server_args(*args, **kwargs)
+        else:
+            server_args, check_fields = _compute_server_args(*args, **kwargs)
+        from relax.engine.inference.phase_plans import deferred_opd_enabled
+
+        preserve_weights = self.weight_source == WeightSource.STATIC or (
+            self.role == Role.ROLLOUT and deferred_opd_enabled(self.args)
+        )
+        if preserve_weights and server_args.get("enable_memory_saver"):
+            # Static models and deferred OPD's student second pass resume without
+            # a weight sync after offload discards GPU pages.
+            server_args["enable_weights_cpu_backup"] = True
+            if "enable_weights_cpu_backup" not in check_fields:
+                check_fields.append("enable_weights_cpu_backup")
+        return server_args, check_fields
 
     def _require_policy_weights(self) -> None:
         if self.weight_source != WeightSource.DCS:

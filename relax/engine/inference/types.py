@@ -151,8 +151,6 @@ class RoleSnapshot:
             "models": {model.model_id: model.to_dict(status_filter) for model in self.models},
         }
 
-    to_v2_dict = to_dict
-
     def to_legacy_dict(self, status_filter: str | None = None) -> dict[str, Any]:
         """Project discovery to the legacy rollout ``/engines`` shape.
 
@@ -190,8 +188,6 @@ class RoleSnapshot:
             }
             total_engines += len(engines)
         return {"models": models, "total_engines": total_engines}
-
-    to_legacy_engines = to_legacy_dict
 
 
 @dataclass(frozen=True)

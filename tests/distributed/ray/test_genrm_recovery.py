@@ -23,7 +23,7 @@ import requests
 try:
     import ray
 
-    from relax.distributed.ray.genrm import _is_engine_dead
+    from relax.distributed.ray.rollout import _is_engine_dead
 
     HAS_DEPS = True
 except ImportError:

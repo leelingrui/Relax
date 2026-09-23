@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import itertools
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 from uuid import uuid4
 
@@ -15,6 +15,7 @@ import ray
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from ray import serve
+from starlette.types import Receive, Scope, Send
 
 from relax.engine.inference.routing import RoutingError, resolve_model, select_target
 from relax.engine.inference.types import Role, RoleSnapshot
@@ -34,6 +35,19 @@ _HOP_BY_HOP_HEADERS = {
 GATEWAY_REQUEST_HEADER = "x-relax-inference-gateway"
 
 _ABORT_TIMEOUT_S = 10.0
+
+
+class _GatewayStreamingResponse(StreamingResponse):
+    def __init__(self, content: Any, *, cleanup: Callable[[], Awaitable[None]], **kwargs: Any) -> None:
+        super().__init__(content, **kwargs)
+        self._cleanup = cleanup
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Disconnect can happen before the body iterator is even entered.
+            await self._cleanup()
 
 
 def _json_error(status_code: int, message: str, *, code: str) -> JSONResponse:
@@ -73,6 +87,7 @@ class InferenceGateway:
         # Rotates across direct-eligible replicas; a Router target ignores it.
         self._cursor = itertools.count()
         self._logger = get_logger(__name__)
+        self._stream_cleanups: set[asyncio.Task] = set()
 
     async def _snapshot(self) -> RoleSnapshot:
         return await self._manager_call("snapshot", self.role)
@@ -178,8 +193,8 @@ class InferenceGateway:
                 wrap_response = True
             if path == "generate":
                 payload.pop("model", None)
-                # The engine rid is the admission id, so an abort can address it.
-                rid = payload.setdefault("rid", request_id)
+            # Both native and OpenAI requests must carry the ID used by abort.
+            rid = payload["rid"] = payload.get("rid") or request_id
             response, finished = await self._forward(
                 request,
                 path,
@@ -317,27 +332,43 @@ class InferenceGateway:
     def _stream_response(
         self, response: httpx.Response, request_id: str | None, admission_id: str | None, target: str
     ) -> StreamingResponse:
-        async def body():
-            completed = False
+        completed = False
+
+        async def finish() -> None:
             try:
-                async for chunk in response.aiter_raw():
-                    yield chunk
-                completed = True
-            finally:
                 await response.aclose()
+            finally:
                 if admission_id is not None:
-                    # A broken stream leaves the engine generating until aborted.
-                    if not completed:
-                        await self._abort_upstream(target, request_id)
-                    await self._manager_call("complete_request", admission_id)
+                    try:
+                        if not completed:
+                            await self._abort_upstream(target, request_id)
+                    finally:
+                        await self._manager_call("complete_request", admission_id)
+
+        async def body():
+            nonlocal completed
+            async for chunk in response.aiter_raw():
+                yield chunk
+            completed = True
+
+        async def cleanup() -> None:
+            # ASGI disconnect cancels awaits in the response's scope.
+            task = asyncio.create_task(finish())
+            self._stream_cleanups.add(task)
+            task.add_done_callback(self._stream_cleanups.discard)
+            await asyncio.shield(task)
 
         headers = {key: value for key, value in response.headers.items() if key.lower() not in _HOP_BY_HOP_HEADERS}
-        return StreamingResponse(
-            body(), status_code=response.status_code, headers=headers, media_type="text/event-stream"
+        return _GatewayStreamingResponse(
+            body(), cleanup=cleanup, status_code=response.status_code, headers=headers, media_type="text/event-stream"
         )
 
     async def close(self) -> None:
-        await self._client.aclose()
+        try:
+            if self._stream_cleanups:
+                await asyncio.gather(*self._stream_cleanups)
+        finally:
+            await self._client.aclose()
 
 
 gateway_app = FastAPI()

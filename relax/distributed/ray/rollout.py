@@ -1032,7 +1032,6 @@ class RolloutEnginePool:
         self.rollout_engine_lock = Lock.options(
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
-        self._engine_lifecycle_lock = threading.RLock()
         existing_groups = [group for srv in self.servers.values() for group in srv.engine_groups]
         self._next_engine_rank = max(
             (group.rank_offset + len(group.all_engines) for group in existing_groups),

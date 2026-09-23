@@ -294,7 +294,6 @@ def maybe_start_managed_opd_teacher(args: Any, *, inference_manager_handle: Any)
         pg=shared_pg,
         shared_pg=shared_pg_enabled,
     )
-    args.opd_teacher_engine_urls = list(urls)
     try:
         args.opd_teacher_gateway_url = _deploy_teacher_gateway(inference_manager_handle)
     except Exception:

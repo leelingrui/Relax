@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -331,3 +332,86 @@ async def test_gateway_deployment_routes_reach_the_serving_replica(monkeypatch) 
         assert (await client.get("/engines")).json()["models"]
         assert (await client.get("/v1/models")).json()["data"][0]["id"] == "model-a"
     await replica.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disconnect", ["before_first", "after_first", "send_failure"])
+async def test_gateway_stream_disconnect_completes_admission(disconnect: str) -> None:
+    owner = _owner(_snapshot)
+    owner.inflight.add("disconnected")
+    finished = asyncio.Event()
+    sent = asyncio.Event()
+
+    async def complete(request_id):
+        owner.inflight.remove(request_id)
+        finished.set()
+
+    owner.complete_request.remote = complete
+    gateway = InferenceGateway(Role.ROLLOUT, manager_handle=owner)
+    gateway._abort_upstream = AsyncMock()
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"data: first\n\n"
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            await asyncio.sleep(0)
+
+    upstream = httpx.Response(200, stream=Stream())
+    response = gateway._stream_response(upstream, "engine-rid", "disconnected", "http://router")
+
+    async def send(message):
+        if disconnect == "send_failure":
+            raise OSError("client disconnected")
+        await asyncio.sleep(0)
+        if message["type"] == "http.response.body":
+            sent.set()
+
+    async def receive():
+        if disconnect == "after_first":
+            await sent.wait()
+        return {"type": "http.disconnect"}
+
+    try:
+        if disconnect == "send_failure":
+            from starlette.requests import ClientDisconnect
+
+            with pytest.raises(ClientDisconnect):
+                await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+        else:
+            await response({"type": "http", "asgi": {"spec_version": "2.0"}}, receive, send)
+        await asyncio.wait_for(finished.wait(), timeout=1)
+        assert owner.inflight == set()
+        gateway._abort_upstream.assert_awaited_once_with("http://router", "engine-rid")
+        assert upstream.is_closed
+    finally:
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rid", [None, "caller-rid"])
+async def test_gateway_chat_abort_uses_forwarded_request_id(rid: str | None) -> None:
+    owner = _owner(_snapshot)
+    gateway = InferenceGateway(Role.ROLLOUT, manager_handle=owner)
+    gateway._abort_upstream = AsyncMock()
+    forwarded = []
+
+    def upstream(request):
+        forwarded.append(json.loads(request.content)["rid"])
+        raise httpx.ReadTimeout("lost", request=request)
+
+    await gateway._client.aclose()
+    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    try:
+        response = await gateway.proxy(
+            _request({"model": "model-a", "messages": [], "rid": rid}), "v1/chat/completions"
+        )
+        assert response.status_code == 502
+        assert forwarded[0]
+        if rid:
+            assert forwarded == [rid]
+        gateway._abort_upstream.assert_awaited_once_with("http://router", forwarded[0])
+        assert not owner.inflight
+    finally:
+        await gateway.close()

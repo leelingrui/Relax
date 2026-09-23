@@ -57,7 +57,6 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
         "owner": "owner",
     }
     assert config.opd_teacher_url == "http://gateway/teacher/generate"
-    assert config.opd_teacher_engine_urls == ["http://teacher/generate"]
 
 
 def test_teacher_colocate_layout_accepts_split_and_shared_only():

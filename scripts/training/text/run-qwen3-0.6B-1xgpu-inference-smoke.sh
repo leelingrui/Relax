@@ -9,16 +9,52 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 source "${SCRIPT_DIR}/../../models/qwen3-0.6B.sh"
 MODEL_DIR="${MODEL_DIR:-${PROJECT_ROOT}/model}"
 DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/data}"
-RUN_NAME="${RUN_NAME:-qwen3-0.6b-inference-smoke-$(date +%Y%m%d-%H%M%S)}"
+SMOKE_MODE="${SMOKE_MODE:-grpo}"
+RUN_NAME="${RUN_NAME:-qwen3-0.6b-${SMOKE_MODE}-smoke-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "${PROJECT_ROOT}/log"
 
+RESOURCE='{"actor": [1, 1], "rollout": [1, 1]}'
+SCORING_ARGS=()
+case "${SMOKE_MODE}" in
+    grpo) ;;
+    defer-genrm)
+        RESOURCE='{"actor": [1, 1], "rollout": [1, 1], "genrm": [1, 1]}'
+        SCORING_ARGS=(
+            --rm-type dummy --defer-reward-to-post-process
+            --custom-reward-post-process-path examples.generate_reward_model.post_process_genrm_swap.custom_reward_post_process
+            --genrm-model-path "${MODEL_DIR}/Qwen3-0.6B"
+            --genrm-num-gpus 1 --genrm-num-gpus-per-engine 1
+            --genrm-engine-config '{"context_length":2048,"mem_fraction_static":0.5}'
+            --genrm-sampling-config '{"temperature":0,"max_response_len":32,"chat_template_kwargs":{"enable_thinking":false}}'
+        )
+        ;;
+    defer-opd|defer-opd-union)
+        RESOURCE='{"actor": [1, 1], "rollout": [1, 1], "teacher": [1, 1]}'
+        SCORING_ARGS=(
+            --use-opd --opd-type sglang
+            --teacher-hf-checkpoint "${MODEL_DIR}/Qwen3-0.6B"
+            --teacher-num-gpus-per-engine 1
+            --teacher-sglang-mem-fraction-static 0.5
+            --teacher-sglang-context-length 2048
+            --opd-kl-coef 0.1 --opd-loss-coef 0
+        )
+        if [[ "${SMOKE_MODE}" == defer-opd-union ]]; then
+            SCORING_ARGS+=(--opd-token-selection union --opd-log-prob-top-k 4)
+        fi
+        ;;
+    *) echo "Unknown SMOKE_MODE: ${SMOKE_MODE}" >&2; exit 1 ;;
+esac
+
 # All service traffic in this local smoke run must bypass inherited proxies.
-SMOKE_RUNTIME_ENV="$(python - <<'PY'
+SMOKE_RUNTIME_ENV="$(python - "${SMOKE_MODE}" <<'PY'
 import json
 import os
+import sys
 
 runtime = json.loads(os.environ["RUNTIME_ENV_JSON"])
 runtime.setdefault("env_vars", {}).update({"NO_PROXY": "*", "no_proxy": "*"})
+if sys.argv[1] == "defer-opd-union":
+    runtime["env_vars"].update({"RELAX_OPD_PER_POS_TOKEN_IDS": "1", "RELAX_OPD_TOKEN_IDS_LOGPROB_K": "4"})
 print(json.dumps(runtime))
 PY
 )"
@@ -27,7 +63,7 @@ ray job submit --no-wait --address="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:82
     --submission-id "${RUN_NAME}" \
     --runtime-env-json="${SMOKE_RUNTIME_ENV}" \
     -- python3 -m relax.entrypoints.train \
-    --resource '{"actor": [1, 1], "rollout": [1, 1]}' \
+    --resource "${RESOURCE}" --rollout-num-gpus 1 \
     --num-gpus-per-node 1 --actor-num-gpus-per-node 1 \
     --no-enable-affinity --colocate --offload \
     --num-data-storage-units 1 --max-staleness 0 \
@@ -56,4 +92,4 @@ ray job submit --no-wait --address="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:82
     --attention-dropout 0 --hidden-dropout 0 \
     --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 \
     --tb-project-name Relax/dev/inference-smoke --tb-experiment-name "${RUN_NAME}" \
-    "${MODEL_ARGS[@]}" "$@" 2>&1 | tee "${PROJECT_ROOT}/log/${RUN_NAME}-submit.log"
+    "${MODEL_ARGS[@]}" "${SCORING_ARGS[@]}" "$@" 2>&1 | tee "${PROJECT_ROOT}/log/${RUN_NAME}-submit.log"

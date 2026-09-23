@@ -59,10 +59,8 @@ def genrm_role_models(args: Any, pg: Any) -> list[tuple[ModelConfig, Any, dict[s
     for index, (key, spec) in enumerate(args._genrm_instances_resolved.items()):
         engine_args = copy.copy(args)
         engine_args.genrm_model_path = spec["model_path"]
-        engine_args.genrm_num_gpus = spec["num_gpus"]
         engine_args.genrm_num_gpus_per_engine = spec["num_gpus_per_engine"]
         engine_args.genrm_engine_config = spec["engine_config"]
-        engine_args.genrm_sampling_config = spec["sampling_config"]
         sampling_config = spec["sampling_config"] or {}
         config = ModelConfig(
             key,

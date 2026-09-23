@@ -80,11 +80,6 @@ class EngineGroupConfig:
         )
         assert self.num_gpus > 0, f"num_gpus must be > 0, got {self.num_gpus}"
 
-    @property
-    def replicas(self) -> tuple:
-        """Compatibility view for consumers of the former ModelSpec."""
-        return self.topology.replicas if self.topology is not None else ()
-
 
 @dataclass
 class ModelConfig:
@@ -124,10 +119,6 @@ class ModelConfig:
     @property
     def needs_weight_update(self) -> bool:
         return self.weight_source != WeightSource.STATIC
-
-    @property
-    def needs_dcs(self) -> bool:
-        return self.weight_source == WeightSource.DCS
 
     @property
     def needs_router(self) -> bool:
