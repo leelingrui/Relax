@@ -15,7 +15,6 @@ import numpy as np
 import pytest
 
 from relax.engine.rollout.deferred import (
-    DEFERRED_ORDER,
     DeferredExecutor,
     DeferredState,
     seal_batch,
@@ -174,11 +173,11 @@ def test_executor_publishes_only_after_the_full_fixed_sequence():
     published: list[tuple] = []
 
     async def score(batch):
-        states.append(executor.get_deferred("op-1").state)
+        states.append(executor._records["op-1"].snapshot.state)
         return ()
 
     async def publish(payload, is_last):
-        states.append(executor.get_deferred("op-1").state)
+        states.append(executor._records["op-1"].snapshot.state)
         published.append((payload, is_last))
 
     async def main():
@@ -190,8 +189,6 @@ def test_executor_publishes_only_after_the_full_fixed_sequence():
     assert states == [DeferredState.SCORING, DeferredState.PUBLISHING]
     assert published and published[0][1] is False
     assert result.scored == 2 and result.published == 2
-    # The recorded order is the fixed one.
-    assert DEFERRED_ORDER[0] is DeferredState.STAGED and DEFERRED_ORDER[-1] is DeferredState.COMPLETED
 
 
 def test_executor_does_not_publish_a_partially_scored_batch():
@@ -254,45 +251,6 @@ def test_executor_submit_is_idempotent_and_conflicts_on_other_inputs():
         executor.submit_deferred(seal(args, other), None, operation_id="op-1", samples=other)
 
 
-def test_cancelling_a_staged_batch_is_confirmed_immediately():
-    args = build_args()
-    samples = [build_sample(0)]
-    executor = DeferredExecutor(args)
-    executor.submit_deferred(seal(args, samples), None, operation_id="op-1", samples=samples)
-    assert executor.cancel_deferred("op-1").state is DeferredState.CANCELLED
-    assert executor.get_deferred("op-1").state is DeferredState.CANCELLED
-
-
-def test_cancelling_mid_scoring_waits_for_the_sent_requests():
-    args = build_args()
-    samples = [build_sample(0)]
-    executor = DeferredExecutor(args)
-    handle = executor.submit_deferred(seal(args, samples), None, operation_id="op-1", samples=samples)
-    published: list = []
-    scoring = asyncio.Event()
-    release = asyncio.Event()
-
-    async def score(batch):
-        scoring.set()
-        await release.wait()
-        return ()
-
-    async def publish(payload, is_last):
-        published.append(payload)
-
-    async def main():
-        executor.start(handle, score=score, publish=publish)
-        await scoring.wait()
-        pending = executor.cancel_deferred("op-1")
-        assert pending.state is DeferredState.CANCEL_PENDING
-        release.set()
-        return await executor.wait_deferred(handle)
-
-    result = run(main())
-    assert result.state is DeferredState.CANCELLED
-    assert published == []
-
-
 def test_wait_timeout_ends_the_wait_not_the_batch():
     args = build_args()
     samples = [build_sample(0)]
@@ -312,8 +270,7 @@ def test_wait_timeout_ends_the_wait_not_the_batch():
         timed_out = await executor.wait_deferred(handle, timeout_s=0.05)
         assert not timed_out.terminal
         release.set()
-        await task
-        return executor.get_deferred("op-1")
+        return await task
 
     assert run(main()).state is DeferredState.COMPLETED
 
@@ -352,12 +309,4 @@ def test_batches_are_scored_one_at_a_time():
 
     run(main())
     assert peak == 1
-    assert all(executor.get_deferred(f"op-{index}").state is DeferredState.COMPLETED for index in range(2))
-
-
-def test_get_deferred_rejects_an_unknown_operation():
-    executor = DeferredExecutor(build_args())
-    with pytest.raises(KeyError, match="Unknown deferred operation"):
-        executor.get_deferred("missing")
-    with pytest.raises(KeyError):
-        executor.cancel_deferred("missing")
+    assert all(executor._records[f"op-{index}"].snapshot.state is DeferredState.COMPLETED for index in range(2))

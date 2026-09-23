@@ -169,3 +169,86 @@ def test_rollout_startup_debug_rollout_only_registers_engines_at_start(startup):
     # No weight sync ever runs, so the engines must not wait for one.
     assert startup.groups[0].kwargs["skip_router_registration"] is False
     assert server.model_spec.needs_weight_update is False
+
+
+def test_rollout_startup_planning_failure_removes_the_group_it_created(startup, monkeypatch):
+    import importlib
+
+    import relax.core.service as service
+
+    # ``ray.util.placement_group`` the attribute is the function, not the module.
+    ray_pg = importlib.import_module("ray.util.placement_group")
+
+    pg = _pg()
+    removed = []
+    monkeypatch.setattr(service, "create_placement_group", lambda **kwargs: pg)
+    monkeypatch.setattr(ray_pg, "remove_placement_group", removed.append)
+    ledger = MagicMock()
+    ledger.plan.side_effect = ValueError("bad layout")
+
+    with pytest.raises(ValueError, match="bad layout"):
+        _start_teacher(_args(), None, ledger, bundle_offset=0, phase="teacher")
+
+    assert removed == [pg[0]] and startup.groups == []
+
+
+def test_manager_create_role_checks_every_model_before_starting_any(monkeypatch):
+    from relax.distributed.ray.inference_manager import InferenceManager
+
+    started = []
+    monkeypatch.setattr(module, "start_servers", lambda *a, **k: started.append(a) or {})
+    args = _args()
+    pg = _pg()
+
+    def teacher(name, offset):
+        config = ModelConfig(
+            name,
+            "/tmp/teacher",
+            engine_groups=[EngineGroupConfig("regular", 2, 2, {})],
+            weight_source=WeightSource.STATIC,
+        ).resolved(args)
+        return config, args, {"pg": pg, "bundle_offset": offset, "phase": "teacher", "base_port": 26000}
+
+    manager = InferenceManager()
+    # The second teacher overlaps the first one in the same phase.
+    with pytest.raises(ValueError, match="overlap"):
+        manager.create_role(Role.TEACHER, [teacher("a", 0), teacher("b", 1)])
+
+    assert started == [] and manager.allocations() == ()
+
+
+def _task_args(*, rollout_gpus, genrm_gpus, actor_gpus=4, **overrides):
+    spec = {
+        "model_path": "/tmp/judge",
+        "num_gpus": genrm_gpus,
+        "num_gpus_per_engine": 1,
+        "engine_config": None,
+        "sampling_config": None,
+    }
+    args = _args()
+    args.__dict__.update(
+        rollout_num_gpus=rollout_gpus,
+        rollout_num_gpus_per_engine=1,
+        colocate=True,
+        hybrid=False,
+        fully_async=False,
+        resource={"actor": [1, actor_gpus], "rollout": [1, rollout_gpus], "genrm": [1, genrm_gpus]},
+        _genrm_instances_resolved={"judge": spec},
+        **overrides,
+    )
+    return args
+
+
+def test_task_layout_accepts_split_rollout_and_genrm():
+    from relax.distributed.ray.inference_manager import validate_task_layout
+
+    validate_task_layout(_task_args(rollout_gpus=2, genrm_gpus=2))
+
+
+def test_task_layout_rejects_a_later_role_before_any_engine_starts(monkeypatch):
+    from relax.distributed.ray.inference_manager import validate_task_layout
+
+    monkeypatch.setattr(module, "start_servers", MagicMock(side_effect=AssertionError("started an engine")))
+    # GenRM sits behind four rollout bundles of a four-GPU actor group.
+    with pytest.raises(ValueError, match="Invalid genrm placement"):
+        validate_task_layout(_task_args(rollout_gpus=4, genrm_gpus=2))

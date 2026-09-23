@@ -155,3 +155,106 @@ def test_model_handle_forwards_calls_through_manager() -> None:
     manager = SimpleNamespace(call=SimpleNamespace(remote=lambda *args, **kwargs: calls.append((args, kwargs))))
     ModelHandle(manager, Role.TEACHER, "default").onload.remote(tags=["kv_cache"])
     assert calls == [((Role.TEACHER, "default", "onload"), {"tags": ["kv_cache"]})]
+
+
+def test_manager_switch_keeps_scorers_mutually_exclusive() -> None:
+    import threading
+
+    judge, teacher = FakePool("judge"), FakePool("teacher")
+    manager = _manager(genrm={"judge": judge}, teacher={"teacher": teacher})
+    manager.switch([Role.GENRM, Role.TEACHER], [], timeout=0.01)
+    both_ready = []
+
+    def onload(pool, tags=None):
+        pool.onloaded = True
+        both_ready.append(judge.onloaded and teacher.onloaded)
+
+    judge.onload = lambda tags=None: onload(judge)
+    teacher.onload = lambda tags=None: onload(teacher)
+
+    manager.switch([], [Role.GENRM], timeout=0.01)
+    assert manager.snapshot(Role.TEACHER).phase == "genrm"
+    waiter = threading.Thread(target=manager.switch, args=([], [Role.TEACHER], 5.0))
+    waiter.start()
+    waiter.join(0.1)
+    # The teacher waits while GenRM holds the shared GPUs.
+    assert waiter.is_alive() and not teacher.onloaded
+    manager.switch([Role.GENRM], [], timeout=0.01)
+    waiter.join(5.0)
+
+    assert not waiter.is_alive() and teacher.onloaded and not judge.onloaded
+    assert both_ready == [False, False]
+    assert manager.snapshot(Role.GENRM).phase == "teacher"
+
+
+def test_manager_switch_times_out_while_another_scorer_holds_the_gpus() -> None:
+    manager = _manager(genrm={"judge": FakePool("judge")}, teacher={"teacher": FakePool("teacher")})
+    manager.switch([Role.TEACHER], [Role.GENRM], timeout=0.01)
+    with pytest.raises(TimeoutError, match="genrm"):
+        manager.switch([], [Role.TEACHER], timeout=0.01)
+    manager.switch([Role.GENRM], [Role.TEACHER], timeout=0.01)
+    assert manager.snapshot(Role.TEACHER).models[0].state == LifecycleState.READY
+
+
+def test_manager_switch_releases_the_gpus_when_a_scorer_fails_to_load() -> None:
+    judge, teacher = FakePool("judge"), FakePool("teacher")
+    manager = _manager(genrm={"judge": judge}, teacher={"teacher": teacher})
+    manager.switch([Role.GENRM, Role.TEACHER], [], timeout=0.01)
+    judge.onload = lambda tags=None: (_ for _ in ()).throw(RuntimeError("OOM"))
+
+    with pytest.raises(RuntimeError, match="OOM"):
+        manager.switch([], [Role.GENRM], timeout=0.01)
+
+    manager.switch([], [Role.TEACHER], timeout=0.01)
+    assert teacher.onloaded
+
+
+def test_manager_snapshot_reports_the_generation_phase_without_a_scorer() -> None:
+    manager = _manager(genrm={"judge": FakePool("judge")})
+    assert manager.snapshot(Role.GENRM).phase == "inference"
+    assert manager.snapshot(Role.GENRM).to_dict()["phase"] == "inference"
+
+
+def test_manager_topology_revision_bumps_when_a_replica_restarts_in_place() -> None:
+    pool = FakePool("judge")
+    pool.recover = lambda: None
+    manager = _manager(genrm={"judge": pool})
+    revision = manager.snapshot(Role.GENRM).topology_revision
+
+    manager.recover(Role.GENRM, "judge")
+
+    snapshot = manager.snapshot(Role.GENRM)
+    assert snapshot.models[0].replicas[0].base_url == "http://engine-0"
+    assert snapshot.topology_revision == revision + 1
+    # Waking a sleeping replica is not a restart.
+    manager.offload(Role.GENRM, "judge")
+    manager.onload(Role.GENRM, "judge")
+    assert manager.snapshot(Role.GENRM).topology_revision == revision + 1
+
+
+def test_manager_onload_outside_a_switch_waits_for_the_scorer() -> None:
+    import threading
+
+    judge, teacher, policy = FakePool("judge"), FakePool("teacher"), FakePool("policy", version="1")
+    manager = _manager(genrm={"judge": judge}, teacher={"teacher": teacher}, rollout={"policy": policy})
+    manager.switch([Role.ROLLOUT, Role.TEACHER], [Role.GENRM], timeout=0.01)
+    # The scorer that holds the GPUs may still reload itself.
+    manager.onload(Role.GENRM, "judge")
+
+    waiters = [
+        threading.Thread(target=manager.onload, args=(Role.ROLLOUT, "policy")),
+        threading.Thread(target=manager.onload, args=(Role.TEACHER, "teacher")),
+    ]
+    for waiter in waiters:
+        waiter.start()
+    for waiter in waiters:
+        waiter.join(0.1)
+    # A weight sync or a teacher following training waits for the release.
+    assert all(waiter.is_alive() for waiter in waiters)
+    assert not policy.onloaded and not teacher.onloaded
+
+    manager.switch([Role.GENRM], [], timeout=0.01)
+    for waiter in waiters:
+        waiter.join(5.0)
+    assert not any(waiter.is_alive() for waiter in waiters)
+    assert policy.onloaded and teacher.onloaded and not judge.onloaded

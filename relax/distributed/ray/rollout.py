@@ -4934,11 +4934,11 @@ def _wait_engine_init_with_progress(
     logger.info(f"[engine-init-barrier:{model_name}] all {total} engines ready")
 
 
-def start_rollout_servers(args, pg, *, planner: PlacementPlanner) -> dict[str, RolloutServer]:
-    """Start the rollout models declared by the SGLang config."""
+def rollout_role_models(args) -> list[ModelConfig]:
+    """The rollout models declared by the SGLang config, resolved."""
     config = _resolve_sglang_config(args)
     # Rollout is the only elastic role, unless its Router is a fixed pool.
-    models = [
+    return [
         dataclasses.replace(
             model.resolved(args),
             elastic_enabled=not getattr(args, "use_slime_router", False),
@@ -4950,9 +4950,72 @@ def start_rollout_servers(args, pg, *, planner: PlacementPlanner) -> dict[str, R
         )
         for model in config.models
     ]
+
+
+def start_rollout_servers(args, pg, *, planner: PlacementPlanner) -> dict[str, RolloutServer]:
+    """Start the rollout models declared by the SGLang config."""
     # Rollout holds the front of a shared placement group; roles placed behind
     # it (split Teacher/GenRM) may already be recorded when it starts.
-    return start_servers(args, models, planner=planner, pg=pg, bundle_offset=0 if pg is not None else None)
+    return start_servers(
+        args, rollout_role_models(args), planner=planner, pg=pg, bundle_offset=0 if pg is not None else None
+    )
+
+
+def _group_id(role: Role, model_name: str, group_index: int) -> str:
+    # The ledger is shared by every role of the task, so a group id carries its
+    # role: a Teacher and a Rollout model may both be called "default".
+    return f"{role.value}/{model_name}/group-{group_index}"
+
+
+def _placement_requests(
+    args, models: list[ModelConfig], *, role: Role, bundle_offset: int | None, phase: str
+) -> list[PlacementRequest]:
+    requests = []
+    # An explicit offset lays out every group of this call back to back from it,
+    # instead of appending behind whatever other roles already hold in the phase.
+    next_offset = bundle_offset
+    for model in models:
+        for group_index, group in enumerate(model.engine_groups):
+            requests.append(
+                PlacementRequest(
+                    group_id=_group_id(role, model.name, group_index),
+                    worker_type=group.worker_type,
+                    num_gpus=group.num_gpus,
+                    num_gpus_per_engine=group.num_gpus_per_engine,
+                    num_gpus_per_node=args.num_gpus_per_node,
+                    phase=phase,
+                    bundle_offset=next_offset,
+                    active=group.worker_type != "placeholder",
+                )
+            )
+            if next_offset is not None:
+                next_offset += group.num_gpus
+    return requests
+
+
+def placement_preview(
+    args,
+    models: list[ModelConfig],
+    *,
+    role: Role,
+    pg: Any = None,
+    bundle_offset: int | None = None,
+    phase: str = PHASE_GENERATE,
+    **_: Any,
+) -> tuple[PlacementGroupView, list[PlacementRequest]]:
+    """What :func:`start_servers` would plan, for a dry run before any engine
+    starts.
+
+    Takes the same placement arguments. Without ``pg`` the view stands in for
+    the dedicated group ``start_servers`` would create, sized to fit.
+    """
+    requests = _placement_requests(args, models, role=role, bundle_offset=bundle_offset, phase=phase)
+    if pg is not None:
+        return PlacementGroupView(tuple(pg[1]), tuple(pg[2]), PlacementOwner.CONTROLLER, identity=pg[0]), requests
+    size = sum(model.total_num_gpus for model in models)
+    identity = f"preview/{role.value}/{'+'.join(model.name for model in models)}"
+    view = PlacementGroupView(tuple(range(size)), tuple(range(size)), PlacementOwner.MANAGER, identity=identity)
+    return view, requests
 
 
 def start_servers(
@@ -4982,6 +5045,7 @@ def start_servers(
     must have been called before.
     """
     static = role is not Role.ROLLOUT
+    placement_requests = _placement_requests(args, models, role=role, bundle_offset=bundle_offset, phase=phase)
     pg_owner = PlacementOwner.CONTROLLER
     if pg is None:
         from relax.core.service import create_placement_group
@@ -4991,35 +5055,16 @@ def start_servers(
             node_group_affinity=getattr(args, "enable_affinity", True),
         )
         pg_owner = PlacementOwner.MANAGER
-    pg_view = PlacementGroupView(tuple(pg[1]), tuple(pg[2]), pg_owner, identity=pg[0])
-    # The ledger is shared by every role of the task, so a group id carries its
-    # role: a Teacher and a Rollout model may both be called "default".
-    group_ids = {
-        (model.name, group_index): f"{role.value}/{model.name}/group-{group_index}"
-        for model in models
-        for group_index in range(len(model.engine_groups))
-    }
-    placement_requests = []
-    # An explicit offset lays out every group of this call back to back from it,
-    # instead of appending behind whatever other roles already hold in the phase.
-    next_offset = bundle_offset
-    for model in models:
-        for group_index, group in enumerate(model.engine_groups):
-            placement_requests.append(
-                PlacementRequest(
-                    group_id=group_ids[(model.name, group_index)],
-                    worker_type=group.worker_type,
-                    num_gpus=group.num_gpus,
-                    num_gpus_per_engine=group.num_gpus_per_engine,
-                    num_gpus_per_node=args.num_gpus_per_node,
-                    phase=phase,
-                    bundle_offset=next_offset,
-                    active=group.worker_type != "placeholder",
-                )
-            )
-            if next_offset is not None:
-                next_offset += group.num_gpus
-    planned_by_id = {planned.group_id: planned for planned in planner.plan(placement_requests, pg_view)}
+    try:
+        pg_view = PlacementGroupView(tuple(pg[1]), tuple(pg[2]), pg_owner, identity=pg[0])
+        planned_by_id = {planned.group_id: planned for planned in planner.plan(placement_requests, pg_view)}
+    except Exception:
+        # Nothing was reserved, but a group created here is still ours to remove.
+        if pg_owner.removable:
+            from ray.util.placement_group import remove_placement_group
+
+            remove_placement_group(pg[0])
+        raise
 
     servers: dict[str, RolloutServer] = {}
     engine_offset = 0
@@ -5047,7 +5092,7 @@ def start_servers(
                 gpus_per_engine = group_cfg.num_gpus_per_engine
                 num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
                 num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
-                planned = planned_by_id[group_ids[(model_cfg.name, group_index)]]
+                planned = planned_by_id[_group_id(role, model_cfg.name, group_index)]
                 # The topology resolved with the model is what the engines are
                 # created from; a mismatch means the two were derived from
                 # different configurations and the identities would not line up.

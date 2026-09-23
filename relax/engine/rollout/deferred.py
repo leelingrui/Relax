@@ -18,12 +18,13 @@ Two rules shape everything here:
   student cannot be offloaded for the teacher until the last request is done,
   which is why batches are staged during the step and flushed after it.
 
-This executor belongs to the rollout workload: the Coordinator owns phases, the
-Manager owns models, and this owns samples and the queue handoff.
+This executor belongs to the rollout workload: the Manager owns models and
+switches the shared GPUs between phases, and this owns samples and the queue
+handoff.
 """
 
 import asyncio
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Sequence
 
@@ -35,33 +36,15 @@ logger = get_logger(__name__)
 
 
 class DeferredState(str, Enum):
-    """The fixed order a deferred batch passes through."""
+    """A deferred batch goes staged, scoring, validating, publishing and ends
+    completed or failed."""
 
     STAGED = "staged"
-    WAITING_PHASE = "waiting_phase"
     SCORING = "scoring"
     VALIDATING = "validating"
-    GPU_RELEASE_CONFIRMED = "gpu_release_confirmed"
-    TRAIN_HANDOFF_GRANTED = "train_handoff_granted"
     PUBLISHING = "publishing"
-    PRODUCTION_COMPLETE = "production_complete"
     COMPLETED = "completed"
     FAILED = "failed"
-    CANCEL_PENDING = "cancel_pending"
-    CANCELLED = "cancelled"
-
-
-DEFERRED_ORDER = (
-    DeferredState.STAGED,
-    DeferredState.WAITING_PHASE,
-    DeferredState.SCORING,
-    DeferredState.VALIDATING,
-    DeferredState.GPU_RELEASE_CONFIRMED,
-    DeferredState.TRAIN_HANDOFF_GRANTED,
-    DeferredState.PUBLISHING,
-    DeferredState.PRODUCTION_COMPLETE,
-    DeferredState.COMPLETED,
-)
 
 
 @dataclass(frozen=True)
@@ -113,7 +96,6 @@ class DeferredSnapshot:
     operation_id: str
     batch_id: str
     state: DeferredState
-    last_confirmed_step: DeferredState | None = None
     scored: int = 0
     published: int = 0
     missing: tuple[Any, ...] = ()
@@ -121,10 +103,7 @@ class DeferredSnapshot:
 
     @property
     def terminal(self) -> bool:
-        return self.state in (DeferredState.COMPLETED, DeferredState.FAILED, DeferredState.CANCELLED)
-
-
-DeferredResult = DeferredSnapshot
+        return self.state in (DeferredState.COMPLETED, DeferredState.FAILED)
 
 
 @dataclass
@@ -139,7 +118,6 @@ class _Record:
     is_last: bool
     snapshot: DeferredSnapshot
     task: asyncio.Task | None = None
-    cancelled: bool = field(default=False)
 
 
 def _leading_length(value: Any) -> int | None:
@@ -293,29 +271,7 @@ class DeferredExecutor:
         )
         return handle
 
-    def get_deferred(self, operation_id: str) -> DeferredSnapshot:
-        record = self._records.get(operation_id)
-        if record is None:
-            raise KeyError(f"Unknown deferred operation: {operation_id}")
-        return record.snapshot
-
-    def cancel_deferred(self, operation_id: str) -> DeferredSnapshot:
-        """Stop further scoring requests; stay ``cancel_pending`` until
-        confirmed."""
-        record = self._records.get(operation_id)
-        if record is None:
-            raise KeyError(f"Unknown deferred operation: {operation_id}")
-        record.cancelled = True
-        if record.snapshot.terminal:
-            return record.snapshot
-        if record.snapshot.state is DeferredState.STAGED:
-            # Nothing was sent, so the cancellation is already confirmed.
-            record.snapshot = replace(record.snapshot, state=DeferredState.CANCELLED)
-            return record.snapshot
-        record.snapshot = replace(record.snapshot, state=DeferredState.CANCEL_PENDING)
-        return record.snapshot
-
-    async def wait_deferred(self, handle: DeferredHandle, *, timeout_s: float | None = None) -> DeferredResult:
+    async def wait_deferred(self, handle: DeferredHandle, *, timeout_s: float | None = None) -> DeferredSnapshot:
         """Wait for a terminal state; a timeout ends the wait, not the
         batch."""
         record = self._records[handle.operation_id]
@@ -326,9 +282,6 @@ class DeferredExecutor:
         except asyncio.TimeoutError:
             return record.snapshot
         return record.snapshot
-
-    def operations(self) -> tuple[str, ...]:
-        return tuple(self._records)
 
     # ------------------------------------------------------------------
     # Execution.
@@ -346,7 +299,7 @@ class DeferredExecutor:
         return record.task
 
     def _advance(self, record: _Record, state: DeferredState, **changes: Any) -> None:
-        record.snapshot = replace(record.snapshot, state=state, last_confirmed_step=state, **changes)
+        record.snapshot = replace(record.snapshot, state=state, **changes)
 
     def _fail(self, record: _Record, message: str, **changes: Any) -> None:
         record.snapshot = replace(record.snapshot, state=DeferredState.FAILED, error=message, **changes)
@@ -358,20 +311,12 @@ class DeferredExecutor:
         publish: Callable[[Any, bool], Any],
     ) -> DeferredSnapshot:
         async with self._lock:
-            if record.cancelled:
-                self._advance(record, DeferredState.CANCELLED)
-                return record.snapshot
-            self._advance(record, DeferredState.WAITING_PHASE)
             try:
                 self._advance(record, DeferredState.SCORING)
                 failures = await score(record.samples)
             except Exception as exc:
                 self._fail(record, f"{type(exc).__name__}: {exc}")
                 logger.exception(f"Deferred scoring failed for batch {record.batch_ref.batch_id}")
-                return record.snapshot
-            if record.cancelled:
-                # The requests already sent were confirmed finished by ``score``.
-                self._advance(record, DeferredState.CANCELLED)
                 return record.snapshot
             self._advance(record, DeferredState.VALIDATING)
             missing, problems = validate_scored_batch(record.batch_ref, record.samples)
@@ -392,25 +337,20 @@ class DeferredExecutor:
                     f"{len(unscored)} of {record.batch_ref.eligible_count} samples unscored; {problems[:5]}"
                 )
                 return record.snapshot
-            self._advance(record, DeferredState.GPU_RELEASE_CONFIRMED, scored=record.batch_ref.eligible_count)
-            self._advance(record, DeferredState.TRAIN_HANDOFF_GRANTED)
-            self._advance(record, DeferredState.PUBLISHING)
+            self._advance(record, DeferredState.PUBLISHING, scored=record.batch_ref.eligible_count)
             try:
                 await publish(record.payload, record.is_last)
             except Exception as exc:
                 self._fail(record, f"publication failed: {type(exc).__name__}: {exc}")
                 return record.snapshot
-            self._advance(record, DeferredState.PRODUCTION_COMPLETE, published=len(record.samples))
             self._advance(record, DeferredState.COMPLETED, published=len(record.samples))
             return record.snapshot
 
 
 __all__ = [
-    "DEFERRED_ORDER",
     "BatchRef",
     "DeferredExecutor",
     "DeferredHandle",
-    "DeferredResult",
     "DeferredSnapshot",
     "DeferredState",
     "SampleRef",

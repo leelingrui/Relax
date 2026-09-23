@@ -308,26 +308,9 @@ def maybe_start_managed_opd_teacher(args: Any, *, inference_manager_handle: Any)
     return shared_pg, teacher_manager
 
 
-def _start_managed_multi_teacher(
-    args: Any,
-    routes_json: str,
-    *,
-    inference_manager_handle: Any,
-) -> tuple[Any, list]:
-    """Launch multiple managed teachers for MOPD and inject routes into args.
-
-    Each teacher (one per ``data_source``) gets an equal share of the 'teacher'
-    resource GPUs; that share is further split into replicas of TP size
-    ``--teacher-num-gpus-per-engine``. Every teacher's replica URLs are
-    collected into a list and written to
-    ``args.opd_teacher_routes_map[data_source]`` so the per-sample router
-    (``_pick_teacher_url``) can route by data_source and then round-robin
-    across that teacher's replicas.
-    """
-    import copy
-
-    import ray
-
+def _multi_teacher_layout(args: Any, routes_json: str) -> tuple[dict[str, str], int, int]:
+    """Validate the MOPD layout; return the routes, GPUs per teacher and GPUs
+    per replica."""
     routes_map: dict[str, str] = json.loads(routes_json)
     if not routes_map:
         raise ValueError("--opd-teacher-routes must be a non-empty JSON object.")
@@ -356,6 +339,78 @@ def _start_managed_multi_teacher(
             "include both 'actor' and 'rollout' in --resource. Dedicated teacher GPUs "
             "are no longer supported."
         )
+    check_teacher_colocate_layout(int(args.rollout_num_gpus), total_teacher_gpus, args.resource["actor"][1])
+    return routes_map, gpus_per_teacher, gpus_per_replica
+
+
+def managed_teacher_models(args: Any, pg: Any) -> list[tuple[Any, Any, dict[str, Any]]]:
+    """Describe every managed teacher for ``InferenceManager.create_role``.
+
+    ``pg`` is the shared actor placement group under colocate, else ``None``.
+    """
+    from relax.distributed.ray.teacher_manager import teacher_role_model
+
+    routes_json = getattr(args, "opd_teacher_routes", None)
+    if routes_json is None:
+        _, teacher_total_gpus = args.resource["teacher"]
+        gpus_per_replica = getattr(args, "teacher_num_gpus_per_engine", None) or teacher_total_gpus
+        if teacher_total_gpus % gpus_per_replica:
+            raise ValueError(
+                f"teacher GPUs in --resource ({teacher_total_gpus}) must be divisible by "
+                f"--teacher-num-gpus-per-engine ({gpus_per_replica})."
+            )
+        return [
+            teacher_role_model(
+                args, model_id="default", num_gpus=teacher_total_gpus, gpus_per_replica=gpus_per_replica, pg=pg
+            )
+        ]
+
+    return _multi_teacher_models(args, routes_json, pg)
+
+
+def _multi_teacher_models(args: Any, routes_json: str, pg: Any) -> list[tuple[Any, Any, dict[str, Any]]]:
+    from relax.distributed.ray.teacher_manager import teacher_role_model
+
+    routes_map, gpus_per_teacher, gpus_per_replica = _multi_teacher_layout(args, routes_json)
+    models = []
+    for index, (data_source, checkpoint) in enumerate(routes_map.items()):
+        teacher_args = copy.copy(args)
+        teacher_args.teacher_hf_checkpoint = checkpoint
+        models.append(
+            teacher_role_model(
+                teacher_args,
+                model_id=data_source,
+                num_gpus=gpus_per_teacher,
+                gpus_per_replica=gpus_per_replica,
+                pg=pg,
+                bundle_offset=index * gpus_per_teacher,
+                index=index,
+            )
+        )
+    return models
+
+
+def _start_managed_multi_teacher(
+    args: Any,
+    routes_json: str,
+    *,
+    inference_manager_handle: Any,
+) -> tuple[Any, list]:
+    """Launch multiple managed teachers for MOPD and inject routes into args.
+
+    Each teacher (one per ``data_source``) gets an equal share of the 'teacher'
+    resource GPUs; that share is further split into replicas of TP size
+    ``--teacher-num-gpus-per-engine``. Every teacher's replica URLs are
+    collected into a list and written to
+    ``args.opd_teacher_routes_map[data_source]`` so the per-sample router
+    (``_pick_teacher_url``) can route by data_source and then round-robin
+    across that teacher's replicas.
+    """
+    import ray
+
+    routes_map, gpus_per_teacher, gpus_per_replica = _multi_teacher_layout(args, routes_json)
+    num_teachers = len(routes_map)
+    total_teacher_gpus = num_teachers * gpus_per_teacher
 
     # MOPD is colocate-only: all teachers SHARE the actor/rollout placement group
     # (same as the single-teacher colocate path). During training the actor uses
@@ -368,12 +423,10 @@ def _start_managed_multi_teacher(
     # chance to short-circuit first.
     from relax.core.service import create_placement_group
     from relax.distributed.ray.inference_manager import ModelHandle
-    from relax.distributed.ray.teacher_manager import teacher_role_model
     from relax.engine.inference.types import Role
 
     actor_gpus = args.resource["actor"][1]
     rollout_gpus = int(args.rollout_num_gpus)
-    check_teacher_colocate_layout(rollout_gpus, total_teacher_gpus, actor_gpus)
 
     shared_pg = create_placement_group(
         num_gpus=actor_gpus,
@@ -389,21 +442,7 @@ def _start_managed_multi_teacher(
         f"{gpus_per_replica} GPU(s)/replica, {gpus_per_teacher} GPU(s)/teacher, total={total_teacher_gpus}"
     )
 
-    models = []
-    for index, (data_source, checkpoint) in enumerate(routes_map.items()):
-        teacher_args = copy.copy(args)
-        teacher_args.teacher_hf_checkpoint = checkpoint
-        models.append(
-            teacher_role_model(
-                teacher_args,
-                model_id=data_source,
-                num_gpus=gpus_per_teacher,
-                gpus_per_replica=gpus_per_replica,
-                pg=shared_pg,
-                bundle_offset=index * gpus_per_teacher,
-                index=index,
-            )
-        )
+    models = _multi_teacher_models(args, routes_json, shared_pg)
     model_ids = ray.get(inference_manager_handle.create_role.remote(Role.TEACHER, models))
     teacher_managers = [ModelHandle(inference_manager_handle, Role.TEACHER, model_id) for model_id in model_ids]
     if getattr(args, "offload_rollout", False):

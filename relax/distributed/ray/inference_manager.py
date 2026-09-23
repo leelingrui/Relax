@@ -17,10 +17,10 @@ model and is the only writer of the published snapshots.
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from threading import Condition, RLock
+from threading import Condition, RLock, get_ident
 from typing import Any
 from uuid import uuid4
 
@@ -29,7 +29,12 @@ import ray
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.engine.inference.config import ModelConfig, validate_routes
 from relax.engine.inference.discovery import new_manager_epoch
-from relax.engine.inference.phase_plans import reject_shared_co_resident
+from relax.engine.inference.phase_plans import (
+    PHASE_GENERATE,
+    PHASE_GENRM,
+    PHASE_TEACHER,
+    reject_shared_co_resident,
+)
 from relax.engine.inference.placement import PlacementGroupView, PlacementPlanner, PlacementRequest, PlacementSlice
 from relax.engine.inference.types import LifecycleState, ModelSnapshot, Role, RoleSnapshot, RoutingSpec
 from relax.utils.logging_utils import get_logger
@@ -44,6 +49,9 @@ SWITCH_DRAIN_TIMEOUT_S = 600.0
 
 _LIFECYCLE_METHODS = frozenset({"onload", "offload", "recover", "health_check", "shutdown"})
 _QUERY_METHODS = frozenset({"get_urls", "get_engine_hosts_ports"})
+# The phase a scorer role holds the shared GPUs in; without a holder the GPUs
+# belong to generation.
+_SCORER_PHASES = {Role.GENRM: PHASE_GENRM, Role.TEACHER: PHASE_TEACHER}
 
 
 @dataclass(frozen=True)
@@ -95,6 +103,13 @@ class InferenceManager:
         self._revision: dict[Role, int] = {}
         self._inflight: dict[str, tuple[Role, str]] = {}
         self._rollout_pool: Any = None
+        # Switches and onloads outside a switch run one at a time, owned by the
+        # thread running them; a scorer that holds the shared GPUs keeps them
+        # until a switch deactivates it. A separate lock, because a waiting
+        # switch must not block admission or request completion.
+        self._switch_done = Condition()
+        self._gpu_owner: int | None = None
+        self._scorer: Role | None = None
 
     # ------------------------------------------------------------------
     # Registration and discovery.
@@ -140,6 +155,7 @@ class InferenceManager:
                 role=role,
                 manager_epoch=self.manager_epoch,
                 topology_revision=self._revision[role],
+                phase=_SCORER_PHASES[self._scorer] if self._scorer is not None else PHASE_GENERATE,
                 models=tuple(model.snapshot for model in self._models[role].values()),
                 routing=self._routing[role],
             )
@@ -181,7 +197,7 @@ class InferenceManager:
                     or any(r.weight_version != model.required_weight_version for r in ready)
                 ):
                     raise ValueError("READY policy replicas must have the required weight version")
-            if _topology(model) != _topology(entry.snapshot):
+            if _topology(model) != _topology(entry.snapshot) or _restarted(entry.snapshot, model):
                 self._revision[role] += 1
             entry.snapshot = model
 
@@ -262,6 +278,22 @@ class InferenceManager:
         return getattr(self._model(role, model_id).pool, method)(*args, **kwargs)
 
     def onload(self, role: Role | str, model_id: str, tags: list[str] | None = None) -> None:
+        """Load a model's memory.
+
+        Outside a switch -- a weight sync, or a teacher following training --
+        it waits while another scorer holds the shared GPUs.
+        """
+        role = Role(role)
+        if self._gpu_owner == get_ident():
+            self._onload(role, model_id, tags)
+            return
+        self._acquire_gpus(lambda: self._scorer in (None, role), SWITCH_DRAIN_TIMEOUT_S)
+        try:
+            self._onload(role, model_id, tags)
+        finally:
+            self._release_gpus()
+
+    def _onload(self, role: Role, model_id: str, tags: list[str] | None) -> None:
         entry = self._model(role, model_id)
         with entry.lock:
             self.set_state(role, model_id, LifecycleState.ONLOADING)
@@ -317,21 +349,74 @@ class InferenceManager:
 
         The outgoing roles stop admitting, finish their requests and release
         their memory before any incoming role is loaded, so two roles never
-        hold the same GPUs at once. Every step is idempotent.
+        hold the same GPUs at once. Switches run one at a time, and a scorer
+        activated here holds the GPUs until a later switch deactivates it: a
+        switch that would load another role meanwhile waits for that release.
+        Every step is idempotent.
         """
-        self.drain(deactivate, timeout)
-        for role in map(Role, deactivate):
-            if role is Role.ROLLOUT and self._rollout_pool is not None:
-                self._rollout_pool.offload_local()
-            else:
-                for model_id in self.model_ids(role):
-                    self.offload(role, model_id)
-        for role in map(Role, activate):
-            if role is Role.ROLLOUT and self._rollout_pool is not None:
-                self._rollout_pool.onload_local()
-            else:
-                for model_id in self.model_ids(role):
-                    self.onload(role, model_id)
+        deactivate = [Role(role) for role in deactivate]
+        activate = [Role(role) for role in activate]
+        scorers = [role for role in activate if role in _SCORER_PHASES]
+        if len(scorers) > 1:
+            raise ValueError(f"Scorer roles cannot share GPUs: {[role.value for role in scorers]}")
+        self._acquire_gpus(
+            lambda: not activate or self._scorer is None or self._scorer in deactivate,
+            timeout,
+        )
+        try:
+            self.drain(deactivate, timeout)
+            for role in deactivate:
+                self._deactivate(role)
+            with self._switch_done:
+                if self._scorer in deactivate:
+                    self._scorer = None
+                if scorers:
+                    self._scorer = scorers[0]
+            try:
+                for role in activate:
+                    self._activate(role)
+            except Exception:
+                # A scorer that failed to load gives the GPUs back, or keeps
+                # holding them when even that fails.
+                for role in scorers:
+                    self._deactivate(role)
+                with self._switch_done:
+                    self._scorer = None
+                raise
+        finally:
+            self._release_gpus()
+
+    def _acquire_gpus(self, may_load: Callable[[], bool], timeout: float) -> None:
+        """Take the shared GPUs once no other switch or onload runs and
+        ``may_load`` holds."""
+        deadline = time.monotonic() + timeout
+        with self._switch_done:
+            while self._gpu_owner is not None or not may_load():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    holder = self._scorer.value if self._scorer is not None else "another switch or onload"
+                    raise TimeoutError(f"Shared inference GPUs still held by {holder} after {timeout}s")
+                self._switch_done.wait(remaining)
+            self._gpu_owner = get_ident()
+
+    def _release_gpus(self) -> None:
+        with self._switch_done:
+            self._gpu_owner = None
+            self._switch_done.notify_all()
+
+    def _deactivate(self, role: Role) -> None:
+        if role is Role.ROLLOUT and self._rollout_pool is not None:
+            self._rollout_pool.offload_local()
+        else:
+            for model_id in self.model_ids(role):
+                self.offload(role, model_id)
+
+    def _activate(self, role: Role) -> None:
+        if role is Role.ROLLOUT and self._rollout_pool is not None:
+            self._rollout_pool.onload_local()
+        else:
+            for model_id in self.model_ids(role):
+                self.onload(role, model_id)
 
     # ------------------------------------------------------------------
     # Placement ledger.
@@ -375,14 +460,21 @@ class InferenceManager:
         """Start a static role's models here and register them.
 
         Each entry is ``(model_config, engine_args, placement_kwargs)``; see
-        :func:`relax.distributed.ray.rollout.start_servers`. A failure closes
-        whatever already started.
+        :func:`relax.distributed.ray.rollout.start_servers`. The whole role's
+        layout is checked against the task ledger before its first engine
+        starts; a later failure closes whatever already started.
         """
-        from relax.distributed.ray.rollout import start_servers
+        from relax.distributed.ray.rollout import placement_preview, start_servers
 
         role = Role(role)
         if role in self._models:
             return self.model_ids(role)
+        previews: dict[str, tuple[PlacementGroupView, list[PlacementRequest]]] = {}
+        for config, engine_args, placement in models:
+            view, requests = placement_preview(engine_args, [config], role=role, **placement)
+            previews.setdefault(view.key, (view, []))[1].extend(requests)
+        for view, requests in previews.values():
+            self.placement.plan(requests, view, dry_run=True)
         pools: dict[str, Any] = {}
         try:
             for config, engine_args, placement in models:
@@ -430,6 +522,24 @@ class InferenceManager:
             raise RuntimeError("Failed to shut down one or more inference roles") from errors[0]
 
 
+def _restarted(previous: ModelSnapshot, model: ModelSnapshot) -> bool:
+    """Whether a replica came back READY after a restart.
+
+    A restarted engine usually keeps its address, so the topology alone does
+    not change; clients still have to drop what they cached for the old
+    process.
+    """
+    restarting = {
+        replica.engine_id
+        for replica in (*previous.replicas, *(worker for _, worker in previous.pd_workers))
+        if replica.state in (LifecycleState.STARTING, LifecycleState.DEAD)
+    }
+    return any(
+        replica.engine_id in restarting and replica.state == LifecycleState.READY
+        for replica in (*model.replicas, *(worker for _, worker in model.pd_workers))
+    )
+
+
 def _topology(model: ModelSnapshot) -> tuple:
     """The discovery fields that describe where a model can be reached."""
     return (
@@ -446,6 +556,64 @@ _MANAGER_CONCURRENCY = 8
 InferenceManagerActor = ray.remote(num_cpus=1, num_gpus=0, concurrency_groups={"rollout": 8})(InferenceManager)
 
 
+def validate_task_layout(args: Any) -> None:
+    """Plan every inference role of the task before its first engine starts.
+
+    Each role is described exactly as it will start -- Teacher, then Rollout,
+    then GenRM, in the placement groups the Controller gives them -- and
+    planned into a scratch ledger over stand-in groups of the same size, so a
+    layout error in a later role fails the task before an earlier role holds
+    GPUs.
+    """
+    from relax.distributed.ray.genrm import genrm_role_models
+    from relax.distributed.ray.rollout import placement_preview, rollout_role_models
+    from relax.utils.opd.opd_utils import is_managed_opd_teacher_colocate, is_managed_opd_teacher_enabled
+
+    resource = getattr(args, "resource", None) or {}
+    engines = not getattr(args, "debug_train_only", False)
+
+    def stand_in(name: str, role: str) -> tuple[str, tuple[int, ...], tuple[int, ...]] | None:
+        num_gpus = int(resource[role][1]) if role in resource else 0
+        return (f"preflight/{name}", tuple(range(num_gpus)), tuple(range(num_gpus))) if num_gpus else None
+
+    # Sync colocate hands the actor placement group to rollout and GenRM; the
+    # colocated teacher builds that same group first.
+    shared = None
+    if (
+        getattr(args, "colocate", False)
+        and not getattr(args, "hybrid", False)
+        and {"actor", "rollout"} <= set(resource)
+    ):
+        shared = stand_in("actor", "actor")
+    # One entry per start_servers call: (role, models, engine args, placement).
+    calls: list[tuple[Role, list[ModelConfig], Any, dict[str, Any]]] = []
+    if engines and is_managed_opd_teacher_enabled(args):
+        from relax.utils.opd.opd_utils import managed_teacher_models
+
+        teacher_pg = shared if is_managed_opd_teacher_colocate(args) else None
+        for config, engine_args, placement in managed_teacher_models(args, teacher_pg):
+            calls.append((Role.TEACHER, [config], engine_args, placement))
+    # SFT starts a rollout only to predict.
+    sft_without_rollout = (
+        getattr(args, "loss_type", None) == "sft" and getattr(args, "sft_predict_interval", None) is None
+    )
+    if engines and "rollout" in resource and not sft_without_rollout:
+        rollout_pg = shared or stand_in("rollout", "rollout")
+        placement = {"pg": rollout_pg, "bundle_offset": 0 if rollout_pg is not None else None}
+        calls.append((Role.ROLLOUT, rollout_role_models(args), args, placement))
+    if getattr(args, "_genrm_instances_resolved", None) and "genrm" in resource:
+        for config, engine_args, placement in genrm_role_models(args, shared or stand_in("genrm", "genrm")):
+            calls.append((Role.GENRM, [config], engine_args, placement))
+
+    ledger = PlacementPlanner()
+    for role, models, engine_args, placement in calls:
+        view, requests = placement_preview(engine_args, models, role=role, **placement)
+        try:
+            ledger.plan(requests, view)
+        except ValueError as exc:
+            raise ValueError(f"Invalid {role.value} placement; no inference engine was started: {exc}") from exc
+
+
 def create_inference_manager(args: Any, runtime_env: dict[str, Any] | None = None) -> Any:
     """Create the task's inference manager actor, pinned to the head node.
 
@@ -459,6 +627,7 @@ def create_inference_manager(args: Any, runtime_env: dict[str, Any] | None = Non
     from relax.distributed.ray.placement_group import _get_head_node_id
 
     reject_shared_co_resident(args)
+    validate_task_layout(args)
     head_node_id = _get_head_node_id()
     require_control_plane_resource_on_node(args, head_node_id)
     return InferenceManagerActor.options(
