@@ -68,7 +68,7 @@ def _replica(manager, generate=None):
     async def ok(payload):
         return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"text": " 1 "})
 
-    cls = genrm_module.GenRM.func_or_class
+    cls = genrm_module.GenRM.func_or_class.__bases__[0]
     replica = object.__new__(cls)
     replica._logger_instance = None
     replica._inference_manager = manager

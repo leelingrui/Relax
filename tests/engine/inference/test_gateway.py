@@ -322,16 +322,25 @@ async def test_gateway_deployment_routes_reach_the_serving_replica(monkeypatch) 
     # Build the replica the way Serve does; its routes are served from the copy
     # of the app that ``serve.ingress`` made, not from the module-level one.
     cls = InferenceGatewayDeployment.func_or_class
-    replica = cls.__new__(cls)
+
+    class TestReplica(cls):
+        def __del__(self):
+            # Python GC cannot await Serve's asynchronous destructor.
+            pass
+
+    replica = TestReplica.__new__(TestReplica)
     await replica.__init__(Role.ROLLOUT, manager_handle=_owner(_snapshot))
     monkeypatch.setattr(serve, "get_replica_context", lambda: SimpleNamespace(servable_object=replica))
-
-    transport = httpx.ASGITransport(app=replica._asgi_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
-        assert (await client.get("/health")).status_code == 200
-        assert (await client.get("/engines")).json()["models"]
-        assert (await client.get("/v1/models")).json()["data"][0]["id"] == "model-a"
-    await replica.close()
+    await replica._run_asgi_lifespan_startup()
+    try:
+        transport = httpx.ASGITransport(app=replica._asgi_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+            assert (await client.get("/health")).status_code == 200
+            assert (await client.get("/engines")).json()["models"]
+            assert (await client.get("/v1/models")).json()["data"][0]["id"] == "model-a"
+    finally:
+        await replica.close()
+        await cls.__del__(replica)
 
 
 @pytest.mark.asyncio

@@ -11,8 +11,8 @@ from relax.utils.autoscaler.metrics_collector import AggregatedMetrics
 from relax.utils.autoscaler.scaling_decision import ScalingAction, ScalingDecision
 
 
-# Underlying class behind the @serve.deployment decorator.
-_ServiceCls = getattr(AutoscalerService, "func_or_class", AutoscalerService)
+# Business class beneath Serve's ASGI wrapper; these tests do not run ASGI.
+_ServiceCls = AutoscalerService.func_or_class.__bases__[0]
 
 
 class _FakeResp:

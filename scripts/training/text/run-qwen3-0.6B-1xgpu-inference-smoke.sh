@@ -49,6 +49,16 @@ FAULT_ARGS=()
 if [[ "${SMOKE_FAULT_TOLERANCE:-0}" == 1 ]]; then
     FAULT_ARGS=(--use-fault-tolerance --rollout-health-check-interval 1 --rollout-health-check-timeout 5)
 fi
+if [[ "${SMOKE_GLOBAL_RECOVERY:-0}" == 1 ]]; then
+    FAULT_ARGS+=(--use-health-check --max-global-restart 2)
+fi
+CHECKPOINT_ARGS=()
+if [[ -n "${SMOKE_CHECKPOINT_DIR:-}" ]]; then
+    CHECKPOINT_ARGS+=(--save "${SMOKE_CHECKPOINT_DIR}" --save-interval 1)
+fi
+if [[ -n "${SMOKE_LOAD_DIR:-}" ]]; then
+    CHECKPOINT_ARGS+=(--load "${SMOKE_LOAD_DIR}")
+fi
 
 # All service traffic in this local smoke run must bypass inherited proxies.
 SMOKE_RUNTIME_ENV="$(python - "${SMOKE_MODE}" <<'PY'
@@ -97,4 +107,4 @@ ray job submit --no-wait --address="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:82
     --attention-dropout 0 --hidden-dropout 0 \
     --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 \
     --tb-project-name Relax/dev/inference-smoke --tb-experiment-name "${RUN_NAME}" \
-    "${MODEL_ARGS[@]}" "${SCORING_ARGS[@]}" "${FAULT_ARGS[@]}" "$@" 2>&1 | tee "${PROJECT_ROOT}/log/${RUN_NAME}-submit.log"
+    "${MODEL_ARGS[@]}" "${SCORING_ARGS[@]}" "${FAULT_ARGS[@]}" "${CHECKPOINT_ARGS[@]}" "$@" 2>&1 | tee "${PROJECT_ROOT}/log/${RUN_NAME}-submit.log"
