@@ -214,11 +214,10 @@ class RayTrainGroup:
         """
         ray.get([actor.set_inference_manager.remote(inference_manager_handle) for actor in self._actor_handlers])
 
-    def set_genrm_manager(self, genrm_manager: Any):
-        """Set the genRM manager for coordinated offload/onload.
+    def set_genrm_models(self, genrm_models: Any):
+        """Set the GenRM models for coordinated offload/onload.
 
-        In colocated mode, the genRM manager is used to offload genRM engines
-        before training and onload them before rollout, since they share GPU
-        resources.
+        In colocated mode the GenRM engines are offloaded before training and
+        onloaded before rollout, since they share GPU resources.
         """
-        ray.get([actor.set_genrm_manager.remote(genrm_manager) for actor in self._actor_handlers])
+        ray.get([actor.set_genrm_models.remote(genrm_models) for actor in self._actor_handlers])

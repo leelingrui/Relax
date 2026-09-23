@@ -25,8 +25,7 @@ from ray import serve
 from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
-from relax.distributed.ray.placement_group import create_genrm_managers
-from relax.engine.inference.discovery import new_manager_epoch
+from relax.distributed.ray.placement_group import create_genrm_role
 from relax.engine.inference.types import Role
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
@@ -77,7 +76,7 @@ class GenerateResponse(BaseModel):
 
 
 class _EngineCacheState:
-    """Per-instance round-robin cache over a GenRMManager's live engine list.
+    """Per-instance round-robin cache over one GenRM model's live engine list.
 
     Isolated per route_key so a dead/rebuilt engine on one instance never
     perturbs another instance's cycle.
@@ -134,7 +133,7 @@ class GenRM(Base):
         config: Namespace,
         role: str,
         runtime_env: Optional[dict] = None,
-        inference_manager_handle: Any | None = None,
+        inference_manager_handle: Any = None,
     ) -> None:
         """Initialize GenRM service.
 
@@ -145,23 +144,23 @@ class GenRM(Base):
             config: Runtime configuration namespace.
             role: Role name (should be "genrm").
             runtime_env: Optional Ray runtime environment dict.
+            inference_manager_handle: Task inference owner that holds every
+                GenRM model's engines, state and lifecycle.
         """
         super().__init__()
         self.config = config
         self.healthy = healthy
         self.role = role
 
-        # {route_key: GenRMManager handle}. Single-instance configs (the legacy
-        # --genrm-model-path path) resolve to exactly {"__default__": manager}.
-        self.genrm_managers = create_genrm_managers(
-            config, pg, runtime_env=runtime_env, inference_manager_handle=inference_manager_handle
-        )
-        self._role_manager = next(iter(self.genrm_managers.values()))
-        self._manager_epoch = new_manager_epoch()
+        # Every instance is one GenRM model on the task owner, addressed by its
+        # route key. The single-instance --genrm-model-path config resolves to
+        # exactly ("__default__",).
+        self._owner = inference_manager_handle
+        self.model_ids = create_genrm_role(config, pg, inference_manager_handle)
         self.instance_specs = config._genrm_instances_resolved
 
-        self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
-        self._logger.info(f"GenRM service initialized successfully: instances={list(self.genrm_managers)}")
+        self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.model_ids}
+        self._logger.info(f"GenRM service initialized successfully: instances={list(self.model_ids)}")
         # Shared HTTP client for engine calls (avoids per-request connection overhead).
         # Raise pool limits well above httpx's default 100 so one replica can fan out
         # many concurrent engine requests; keepalive_expiry >> the default 5s so
@@ -185,45 +184,12 @@ class GenRM(Base):
             return {
                 "models": {
                     key: {"router_ip": None, "router_port": None, "engine_groups": [], "total_engines": 0}
-                    for key in self.genrm_managers
+                    for key in self.model_ids
                 },
                 "total_engines": 0,
             }
-        if getattr(self, "_role_manager", None) is not None:
-            snapshot = await asyncio.to_thread(ray.get, self._role_manager.get_role_snapshot.remote())
-            return snapshot.to_dict(status_filter)
-        refs = [
-            manager.get_discovery_snapshot.remote(
-                role=Role.GENRM, model_id=key, allow_defer=True, status_filter=status_filter
-            )
-            for key, manager in self.genrm_managers.items()
-        ]
-        snapshots = await asyncio.to_thread(ray.get, refs)
-        if not snapshots:
-            return {
-                "schema_version": 2,
-                "role": Role.GENRM.value,
-                "manager_epoch": self._manager_epoch,
-                "topology_revision": 0,
-                "models": {},
-            }
-        return {
-            "schema_version": 2,
-            "role": Role.GENRM.value,
-            "manager_epoch": self._manager_epoch,
-            "topology_revision": max(snapshot.topology_revision for snapshot in snapshots),
-            "phase": None,
-            "routing": {
-                "default_model": next(iter(self.genrm_managers)) if len(self.genrm_managers) == 1 else None,
-                "route_key_to_model": {key: key for key in self.genrm_managers},
-                "config_version": 0,
-            },
-            "models": {model.model_id: model.to_dict() for snapshot in snapshots for model in snapshot.models},
-        }
-
-    async def get_role_snapshot(self) -> Any:
-        """Expose the shared role snapshot to the task inference owner."""
-        return await asyncio.to_thread(ray.get, self._role_manager.get_role_snapshot.remote())
+        snapshot = await self._owner.snapshot.remote(role=Role.GENRM)
+        return snapshot.to_dict(status_filter)
 
     def run(self):
         """GenRM is a passive HTTP service, no background loop needed.
@@ -260,13 +226,11 @@ class GenRM(Base):
             raise
 
     def _resolve_instance_key(self, route_key: Optional[str]) -> str:
-        if route_key is None and len(self.genrm_managers) == 1:
-            return next(iter(self.genrm_managers))
+        if route_key is None and len(self.model_ids) == 1:
+            return self.model_ids[0]
         key = route_key or _DEFAULT_INSTANCE_KEY
-        if key not in self.genrm_managers:
-            raise RuntimeError(
-                f"No GenRM instance registered for route_key={key!r}; available={list(self.genrm_managers)}"
-            )
+        if key not in self.model_ids:
+            raise RuntimeError(f"No GenRM instance registered for route_key={key!r}; available={list(self.model_ids)}")
         return key
 
     def _pick_engine(self, route_key: Optional[str]) -> tuple[str, int, str, int]:
@@ -275,7 +239,7 @@ class GenRM(Base):
         key = self._resolve_instance_key(route_key)
         cache = self._engine_caches[key]
         if cache.needs_refresh():
-            hosts_ports = ray.get(self.genrm_managers[key].get_engine_hosts_ports.remote())
+            hosts_ports = ray.get(self._owner.call.remote(Role.GENRM, key, "get_engine_hosts_ports"))
             cache.refresh(hosts_ports)
 
         hosts_ports = cache.hosts_ports
@@ -379,9 +343,9 @@ class GenRM(Base):
     async def health(self) -> dict:
         """Health check endpoint; reports per-instance status."""
         instances = {}
-        for key, manager in self.genrm_managers.items():
+        for key in self.model_ids:
             try:
-                is_healthy = ray.get(manager.health_check.remote())
+                is_healthy = ray.get(self._owner.lifecycle.remote(Role.GENRM, key, "health_check"))
                 instances[key] = {"status": "healthy" if is_healthy else "unhealthy"}
             except Exception as e:
                 self._logger.error(f"GenRM health check failed for instance '{key}': {e}")
@@ -409,31 +373,12 @@ class GenRM(Base):
             return {"service": "genrm", **instances[_DEFAULT_INSTANCE_KEY]}
         return {"service": "genrm", "instances": instances}
 
-    def get_genrm_manager(self, route_key: Optional[str] = None) -> Any:
-        """Get one GenRM manager by route key.
-
-        Omitting ``route_key`` remains supported when exactly one instance is
-        configured.
-        """
-        return self.genrm_managers[self._resolve_instance_key(route_key)]
-
     def onload(self) -> None:
         """Load genRM model weights to GPU, for every instance."""
         self._logger.info("GenRM onload requested")
-        ray.get([m.onload.remote() for m in self.genrm_managers.values()])
+        ray.get([self._owner.lifecycle.remote(Role.GENRM, key, "onload") for key in self.model_ids])
 
     def offload(self) -> None:
         """Offload genRM model weights from GPU, for every instance."""
         self._logger.info("GenRM offload requested")
-        ray.get([m.offload.remote() for m in self.genrm_managers.values()])
-
-
-# ── Compatibility wrapper for old imports ─────────────────────────────────
-GENRM_ROLE = "genrm"
-
-
-def register_genrm(config, algo: dict) -> list[str]:
-    """Compatibility wrapper; optional-role wiring lives in ``relax.core``."""
-    from relax.core.optional_roles import register_genrm as _register_genrm
-
-    return _register_genrm(config, algo)
+        ray.get([self._owner.lifecycle.remote(Role.GENRM, key, "offload") for key in self.model_ids])

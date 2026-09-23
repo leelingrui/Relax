@@ -127,8 +127,6 @@ class Service:
         backend_prefix = f"/{self.role}/backend" if gateway_enabled else f"/{self.role}"
         self.handle = serve.run(self.service, name=backend_name, route_prefix=backend_prefix)
         if gateway_enabled:
-            if manager_handle is not None:
-                ray.get(manager_handle.register_role.remote(self.role, self.handle))
             backend_url = get_serve_url(backend_prefix)
             gateway = InferenceGatewayDeployment.bind(
                 self.role,
@@ -215,15 +213,11 @@ class Service:
     async def set_barriers(self, *, rollout: Any = None, peers: Any = None) -> None:
         await self.handle.set_barriers.remote(rollout=rollout, peers=peers)
 
-    async def set_genrm_manager(self, genrm_manager: Any) -> None:
-        await self.handle.set_genrm_manager.remote(genrm_manager)
+    async def set_genrm_models(self, genrm_models: Any) -> None:
+        await self.handle.set_genrm_models.remote(genrm_models)
 
     async def set_inference_manager(self, inference_manager_handle: Any) -> None:
         await self.handle.set_inference_manager.remote(inference_manager_handle)
-
-    async def get_genrm_manager(self, route_key: Optional[str] = None) -> Any:
-        """Get the GenRM manager selected by ``route_key``."""
-        return await self.handle.get_genrm_manager.remote(route_key)
 
     async def set_step(self, set_step: int) -> None:
         await self.handle.set_step.remote(set_step)

@@ -1,10 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""GenRM Manager for Generative Reward Model Service.
+"""GenRM engine adapter for the Generative Reward Model service.
 
-This module implements a simplified manager for genRM engines, built on top of
-``MultiEngineManager`` (parallel bring-up, health check, dead-engine recovery,
-onload/offload) with GenRM-specific placement and engine wiring.
+The adapter supplies GenRM-specific placement, ports and engine wiring to the
+shared ``MultiEngineManager`` (parallel bring-up, health check, dead-engine
+recovery, onload/offload); the task inference owner holds its state.
 """
 
 import copy
@@ -14,17 +14,14 @@ from typing import Any
 import ray
 
 from relax.backends.sglang.sglang_engine import GenRMEngine
-from relax.core.node_group_affinity import with_control_plane_affinity
-from relax.distributed.ray.model_pool import ModelPool
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager, _is_engine_dead  # noqa: F401
 from relax.distributed.ray.placement_ledger import plan_placement, release_placement
-from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from relax.engine.inference.capabilities import WeightSource
 from relax.engine.inference.manager import InferenceManager
 from relax.engine.inference.placement import (
     PlacementGroupView,
     PlacementOwner,
-    PlacementPlanner,
     PlacementRelease,
     PlacementRequest,
     PlacementSlice,
@@ -57,10 +54,10 @@ class GenRMEngineAdapter:
         bundle_offset: int = 0,
         port_window_index: int = 0,
         *,
-        inference_manager: InferenceManager | None = None,
+        inference_manager: InferenceManager,
+        placement_manager_handle: Any,
         model_id: str = "default",
         defer_init: bool = False,
-        placement_manager_handle: Any | None = None,
     ):
         args = copy.copy(args)
         args.use_slime_router = False
@@ -77,9 +74,8 @@ class GenRMEngineAdapter:
         self.num_gpu_per_engine = num_gpu_per_engine
         self.bundle_offset = bundle_offset
         self.placement_owner = PlacementOwner.CONTROLLER
-        # Without an owner handle this role keeps its own ledger; the task
-        # owner's planner is the single ledger whenever one is injected.
-        self._placement_ledger = placement_manager_handle or PlacementPlanner()
+        # The task owner's planner is the one ledger every role records in.
+        self._placement_ledger = placement_manager_handle
         # Instances of a multi-instance role share one placement group, so the
         # allocation identity has to carry the model, not just the replica.
         self._placement_model_id = model_id
@@ -88,7 +84,7 @@ class GenRMEngineAdapter:
         self.inference_num_gpus_per_engine = args.genrm_num_gpus_per_engine
         self.inference_overrides = getattr(args, "genrm_engine_config", None) or {}
 
-        from relax.distributed.ray.rollout import _start_router, stop_launched_routers
+        from relax.distributed.ray.rollout import _start_router
 
         self.router_url = None
         self.router_ip, self.router_port = "", 0
@@ -112,19 +108,9 @@ class GenRMEngineAdapter:
             if not args.debug_train_only and not defer_init:
                 self.backend.initialize()
         except Exception:
-            try:
-                if hasattr(self, "all_engines"):
-                    self.backend.shutdown()
-            finally:
-                if inference_manager is None:
-                    stop_launched_routers()
+            if hasattr(self, "backend"):
+                self.backend.shutdown()
             raise
-        self.genrm_engine_lock = Lock.options(
-            **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
-        ).remote()
-
-    def get_genrm_engines_and_lock(self):
-        return self.engines, self.genrm_engine_lock, self.num_new_engines
 
     def __getattr__(self, name):
         backend = self.__dict__.get("backend")
@@ -144,13 +130,8 @@ class GenRMEngineAdapter:
         }
 
     def shutdown(self) -> None:
-        from relax.distributed.ray.rollout import stop_launched_routers
-
-        try:
-            self.backend.shutdown()
-        finally:
-            if self._owns_inference_manager:
-                stop_launched_routers()
+        # The owner's manager stops the routers once every model has closed.
+        self.backend.shutdown()
 
     def get_engine_hosts_ports(self):
         """Return a list of (host, port) tuples for each live genRM engine.
@@ -252,26 +233,14 @@ class GenRMEngineAdapter:
         )
 
 
-class _GenRMManager(ModelPool):
-    """Legacy Ray constructor forwarding to the common model pool."""
-
-    def __init__(self, *args, **kwargs):
-        adapter = GenRMEngineAdapter(*args, **kwargs)
-        super().__init__(adapter, inference_manager=adapter.inference_manager, model_id=adapter.inference_model_id)
-
-
-GenRMManager = ray.remote(_GenRMManager)
-
-
 def _allocate_genrm_engine_addr_and_ports(*, args, new_engines, port_window_index=0):
     """Allocate network addresses and ports for genRM engines.
 
     Similar to _allocate_rollout_engine_addr_and_ports_normal but for genRM.
 
     ``port_window_index`` selects a disjoint range per GenRM instance (multi-instance
-    --genrm-instances): every instance is a separate GenRMManager that probes
-    for free ports independently and in parallel during Serve replica
-    initialization, so two instances starting from the same base port can both
+    --genrm-instances): every instance is a separate model pool that probes
+    for free ports independently, so two instances starting from the same base port can both
     see a given port as free (probe-then-bind race) and then collide when
     their SGLang servers actually bind it.
     """

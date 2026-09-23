@@ -5,7 +5,7 @@
 import asyncio
 import inspect
 import json
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
 
@@ -15,13 +15,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from ray import serve
 
-from relax.engine.inference.discovery import role_snapshot_from_dict
 from relax.engine.inference.routing import RoutingError, resolve_model, select_target
 from relax.engine.inference.types import Role, RoleSnapshot
 from relax.utils.logging_utils import get_logger
 
-
-GatewaySnapshotProvider = Callable[[], RoleSnapshot | Mapping[str, Any] | Awaitable[RoleSnapshot | Mapping[str, Any]]]
 
 _HOP_BY_HOP_HEADERS = {
     "connection",
@@ -83,7 +80,8 @@ class InferenceGateway:
     """Role-neutral HTTP ingress which routes through a Manager snapshot.
 
     The gateway owns no GPU resources and keeps no availability state of its
-    own. ``manager_handle`` or ``snapshot_provider`` is the only state source.
+    own. The task inference owner behind ``manager_handle`` is the only state
+    source.
     """
 
     app = FastAPI()
@@ -92,49 +90,27 @@ class InferenceGateway:
         self,
         role: str | Role,
         *,
-        manager_handle: Any | None = None,
-        snapshot_provider: GatewaySnapshotProvider | None = None,
-        role_manager_handle: Any | None = None,
+        manager_handle: Any,
         upstream_url: str | None = None,
-        # Kept only so old deployment construction fails at request time with
-        # a clear manager error instead of failing while binding Serve.
-        discovery_url: str | None = None,
-        manager_handles: Mapping[str, Any] | None = None,
         genrm_backend_handle: Any | None = None,
         timeout: float = 1800.0,
     ) -> None:
+        if manager_handle is None:
+            raise ValueError("InferenceGateway requires the task inference manager handle")
         self.role = Role(role)
         self.manager_handle = manager_handle
-        self.snapshot_provider = snapshot_provider
-        if manager_handle is not None and role_manager_handle is not None:
-            raise ValueError("Use manager_handle or role_manager_handle, not both")
-        self.role_manager_handle = role_manager_handle
         self.upstream_url = upstream_url.rstrip("/") if upstream_url else None
         self.genrm_backend_handle = genrm_backend_handle
-        if discovery_url is not None or manager_handles:
-            self._logger = get_logger(__name__)
-            self._logger.warning("Ignoring legacy discovery inputs; configure one task InferenceManager handle")
         self._client = httpx.AsyncClient(timeout=timeout, limits=httpx.Limits(max_connections=2048))
         self._logger = get_logger(__name__)
 
     async def _snapshot(self) -> RoleSnapshot:
-        if self.manager_handle is not None:
-            value = self.manager_handle.snapshot.remote(role=self.role)
-            if inspect.isawaitable(value):
-                value = await value
-            elif not isinstance(value, RoleSnapshot):
-                value = await asyncio.to_thread(ray.get, value)
+        value = self.manager_handle.snapshot.remote(role=self.role)
+        if inspect.isawaitable(value):
+            return await value
+        if isinstance(value, RoleSnapshot):
             return value
-        if self.role_manager_handle is not None:
-            return await asyncio.to_thread(ray.get, self.role_manager_handle.get_role_snapshot.remote())
-        if self.snapshot_provider is not None:
-            value = self.snapshot_provider()
-            if inspect.isawaitable(value):
-                value = await value
-            if isinstance(value, RoleSnapshot):
-                return value
-            return role_snapshot_from_dict(value)
-        raise HTTPException(status_code=503, detail="Inference manager is not configured")
+        return await asyncio.to_thread(ray.get, value)
 
     async def _target(self, payload: Mapping[str, Any] | None = None) -> str:
         target, _ = await self._resolve_target(payload)
@@ -262,8 +238,6 @@ class InferenceGateway:
             raise
 
     async def _manager_call(self, method: str, **kwargs: Any) -> Any:
-        if self.manager_handle is None:
-            return None
         remote_method = getattr(self.manager_handle, method, None)
         if remote_method is None:
             return None
@@ -273,8 +247,6 @@ class InferenceGateway:
         return await asyncio.to_thread(ray.get, value)
 
     async def _admit(self, request: Request, model_id: str, target: str) -> Any:
-        if self.manager_handle is None:
-            return None
         request_id = request.headers.get("x-relax-request-id") or uuid4().hex
         try:
             return await self._manager_call(

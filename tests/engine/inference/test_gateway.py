@@ -26,9 +26,19 @@ def _snapshot(*, role: Role = Role.ROLLOUT, state: LifecycleState = LifecycleSta
     )
 
 
+def _owner(provider):
+    """A task owner handle whose snapshot comes from ``provider``."""
+    return SimpleNamespace(snapshot=SimpleNamespace(remote=lambda **kwargs: provider()))
+
+
+def test_gateway_requires_the_task_owner_handle() -> None:
+    with pytest.raises(ValueError, match="task inference manager"):
+        InferenceGateway(Role.ROLLOUT, manager_handle=None)
+
+
 @pytest.mark.asyncio
 async def test_one_gateway_class_serves_all_roles() -> None:
-    gateways = [InferenceGateway(role, snapshot_provider=lambda role=role: _snapshot(role=role)) for role in Role]
+    gateways = [InferenceGateway(role, manager_handle=_owner(lambda role=role: _snapshot(role=role))) for role in Role]
     try:
         assert {gateway.role for gateway in gateways} == set(Role)
         model_lists = [await gateway.models() for gateway in gateways]
@@ -40,10 +50,10 @@ async def test_one_gateway_class_serves_all_roles() -> None:
 
 @pytest.mark.asyncio
 async def test_gateway_reuses_discovery_routing_and_rejects_unavailable_models() -> None:
-    ready = InferenceGateway(Role.ROLLOUT, snapshot_provider=lambda: _snapshot())
+    ready = InferenceGateway(Role.ROLLOUT, manager_handle=_owner(lambda: _snapshot()))
     sleeping = InferenceGateway(
         Role.ROLLOUT,
-        snapshot_provider=lambda: _snapshot(state=LifecycleState.SLEEPING, admission=False),
+        manager_handle=_owner(lambda: _snapshot(state=LifecycleState.SLEEPING, admission=False)),
     )
     try:
         assert await ready._target({"model": "model-a"}) == "http://router"
@@ -75,7 +85,7 @@ async def test_gateway_never_uses_replica_url_when_router_is_missing() -> None:
         ),
         routing=snapshot.routing,
     )
-    gateway = InferenceGateway(Role.ROLLOUT, snapshot_provider=lambda: snapshot)
+    gateway = InferenceGateway(Role.ROLLOUT, manager_handle=_owner(lambda: snapshot))
     try:
         with pytest.raises(Exception) as error:
             await gateway._target({"model": "model-a"})
@@ -108,7 +118,7 @@ async def test_gateway_genrm_router_adapts_only_messages(native: bool) -> None:
     adapt = AsyncMock(return_value={"input_ids": [11, 12], "sampling_params": {"temperature": 0.3}})
     gateway = InferenceGateway(
         Role.GENRM,
-        snapshot_provider=lambda: _snapshot(role=Role.GENRM),
+        manager_handle=_owner(lambda: _snapshot(role=Role.GENRM)),
         genrm_backend_handle=SimpleNamespace(prepare_generate_payload=SimpleNamespace(remote=adapt)),
     )
     sent = []
@@ -143,7 +153,7 @@ async def test_gateway_genrm_router_adapts_only_messages(native: bool) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("field", ["input_ids", "text"])
 async def test_gateway_genrm_rejects_mixed_protocols(field: str) -> None:
-    gateway = InferenceGateway(Role.GENRM)
+    gateway = InferenceGateway(Role.GENRM, manager_handle=_owner(lambda: _snapshot(role=Role.GENRM)))
     try:
         response = await gateway.proxy(_request({"messages": [], field: None}), "generate")
         assert response.status_code == 400
@@ -158,7 +168,7 @@ async def test_gateway_genrm_rejects_missing_router_without_backend_fallback() -
     adapt = AsyncMock()
     gateway = InferenceGateway(
         Role.GENRM,
-        snapshot_provider=lambda: snapshot,
+        manager_handle=_owner(lambda: snapshot),
         upstream_url="http://backend",
         genrm_backend_handle=SimpleNamespace(prepare_generate_payload=SimpleNamespace(remote=adapt)),
     )
@@ -191,7 +201,7 @@ async def test_gateway_reads_one_task_manager_snapshot() -> None:
 
 @pytest.mark.asyncio
 async def test_gateway_teacher_native_strips_routing_metadata() -> None:
-    gateway = InferenceGateway(Role.TEACHER, snapshot_provider=lambda: _snapshot(role=Role.TEACHER))
+    gateway = InferenceGateway(Role.TEACHER, manager_handle=_owner(lambda: _snapshot(role=Role.TEACHER)))
 
     def upstream(request):
         assert json.loads(request.content) == {"input_ids": [1, 2], "return_logprob": True}
@@ -212,7 +222,7 @@ async def test_gateway_teacher_native_strips_routing_metadata() -> None:
 
 @pytest.mark.asyncio
 async def test_gateway_preserves_legacy_engines_and_genrm_response_shape() -> None:
-    gateway = InferenceGateway(Role.GENRM, snapshot_provider=lambda: _snapshot(role=Role.GENRM))
+    gateway = InferenceGateway(Role.GENRM, manager_handle=_owner(lambda: _snapshot(role=Role.GENRM)))
     try:
         legacy = await gateway.engines()
         v2 = await gateway.engines(schema_version=2)
@@ -225,7 +235,9 @@ async def test_gateway_preserves_legacy_engines_and_genrm_response_shape() -> No
 
 @pytest.mark.asyncio
 async def test_gateway_health_reports_manager_unavailable() -> None:
-    gateway = InferenceGateway(Role.TEACHER, snapshot_provider=lambda: (_ for _ in ()).throw(RuntimeError("down")))
+    gateway = InferenceGateway(
+        Role.TEACHER, manager_handle=_owner(lambda: (_ for _ in ()).throw(RuntimeError("down")))
+    )
     try:
         response = await gateway.health()
         assert response.status_code == 503

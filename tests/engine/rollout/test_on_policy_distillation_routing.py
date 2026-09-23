@@ -91,9 +91,9 @@ def test_teacher_gateway_deployment_uses_cpu_role_ingress(monkeypatch):
     monkeypatch.setattr(inference_gateway, "InferenceGatewayDeployment", deployment)
     monkeypatch.setattr(serve, "run", run)
     monkeypatch.setattr(utils, "get_serve_url", lambda prefix: f"http://serve{prefix}")
-    managers = {"text": object(), "vision": object()}
-    assert opd_utils._deploy_teacher_gateway(managers) == "http://serve/teacher"
-    deployment.bind.assert_called_once_with("teacher", role_manager_handle=managers["text"])
+    owner = object()
+    assert opd_utils._deploy_teacher_gateway(owner) == "http://serve/teacher"
+    deployment.bind.assert_called_once_with("teacher", manager_handle=owner)
     run.assert_called_once_with(deployment.bind.return_value, name="teacher_gateway", route_prefix="/teacher")
 
 

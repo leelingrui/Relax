@@ -7,7 +7,6 @@ import ray
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.service import create_placement_group
-from relax.distributed.ray.model_pool import ModelPool
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager
 from relax.distributed.ray.placement_ledger import plan_placement, release_placement
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
@@ -16,7 +15,6 @@ from relax.engine.inference.capabilities import WeightSource
 from relax.engine.inference.placement import (
     PlacementGroupView,
     PlacementOwner,
-    PlacementPlanner,
     PlacementRelease,
     PlacementRequest,
     PlacementSlice,
@@ -29,22 +27,6 @@ from relax.utils.opd.opd_utils import build_teacher_engine_args, build_teacher_o
 
 
 logger = get_logger(__name__)
-
-
-def _resolve_teacher_gpu_index(
-    *, args, replica: int, gpus_per_replica: int, shared_pg: bool, bundle_offset: int = 0
-) -> int:
-    if not shared_pg:
-        # Dedicated (per-teacher own PG) path: each replica creates its OWN
-        # placement group of size gpus_per_replica (see _resolve_placement), so the
-        # index is always 0 within that per-replica PG — a replica*gpus_per_replica
-        # offset would overflow it (only valid when all replicas share one big PG).
-        return 0
-    # Shared (colocate) actor PG: rollout lives at the front [0, rollout_num_gpus);
-    # teachers occupy the bundles after it. ``bundle_offset`` is this teacher's
-    # slice start within the teacher region so multiple teachers (MOPD) sharing the
-    # one actor PG do not collide.
-    return int(args.rollout_num_gpus) + bundle_offset + replica * gpus_per_replica
 
 
 def _build_teacher_engine_env(args) -> dict[str, str]:
@@ -84,10 +66,10 @@ class TeacherEngineAdapter:
         shared_pg: bool = False,
         bundle_offset: int = 0,
         *,
-        inference_manager=None,
+        inference_manager,
+        placement_manager_handle,
         model_id: str = "default",
         defer_init: bool = False,
-        placement_manager_handle=None,
     ) -> None:
         self.args = args
         assert num_replicas >= 1, f"num_replicas must be >= 1, got {num_replicas}."
@@ -111,9 +93,8 @@ class TeacherEngineAdapter:
         self._shared_pg = shared_pg
         self._shared_pg_tuple = pg
         self._bundle_offset = bundle_offset
-        # Without an owner handle this role keeps its own ledger; the task
-        # owner's planner is the single ledger whenever one is injected.
-        self._placement_ledger = placement_manager_handle or PlacementPlanner()
+        # The task owner's planner is the one ledger every role records in.
+        self._placement_ledger = placement_manager_handle
         # Multiple teachers share one placement group, so the allocation
         # identity has to carry the model, not just the replica.
         self._placement_model_id = model_id
@@ -131,7 +112,7 @@ class TeacherEngineAdapter:
             f"shared_pg={shared_pg}, mem_fraction_static={overrides.get('mem_fraction_static')}"
         )
 
-        from relax.distributed.ray.rollout import _start_router, stop_launched_routers
+        from relax.distributed.ray.rollout import _start_router
 
         router_args = copy.copy(args)
         router_args.use_slime_router = False
@@ -152,23 +133,13 @@ class TeacherEngineAdapter:
             if not defer_init:
                 self.backend.initialize()
         except Exception:
-            try:
-                if hasattr(self, "backend"):
-                    self.backend.shutdown()
-            finally:
-                if inference_manager is None:
-                    stop_launched_routers()
+            if hasattr(self, "backend"):
+                self.backend.shutdown()
             raise
 
     def shutdown(self) -> None:
-        from relax.distributed.ray.rollout import stop_launched_routers
-
-        try:
-            self.backend.shutdown()
-        finally:
-            # Router registry is local to this dedicated Manager actor process.
-            if self._owns_inference_manager:
-                stop_launched_routers()
+        # The owner's manager stops the routers once every model has closed.
+        self.backend.shutdown()
 
     def get_urls(self) -> list[str]:
         urls = []
@@ -205,31 +176,6 @@ class TeacherEngineAdapter:
     # ------------------------------------------------------------------
     # MultiEngineManager hooks.
     # ------------------------------------------------------------------
-
-    def _resolve_placement(self, rank: int):
-        nodes_per_engine = getattr(self, "nodes_per_engine", 1)
-        replica, node_rank = divmod(rank, nodes_per_engine)
-        node_offset = node_rank * min(self.gpus_per_replica, self.args.num_gpus_per_node) if node_rank else 0
-        if self._shared_pg:
-            # Colocate: teachers share the actor placement group, which the
-            # controller owns and removes → owns_pg=False.
-            gpu_index = _resolve_teacher_gpu_index(
-                args=self.args,
-                replica=replica,
-                gpus_per_replica=self.gpus_per_replica,
-                shared_pg=True,
-                bundle_offset=self._bundle_offset,
-            )
-            return self._shared_pg_tuple, False, gpu_index + node_offset
-
-        pg_tuple = self._dedicated_placement_group(replica)
-        gpu_index = _resolve_teacher_gpu_index(
-            args=self.args,
-            replica=replica,
-            gpus_per_replica=self.gpus_per_replica,
-            shared_pg=False,
-        )
-        return pg_tuple, True, gpu_index + node_offset
 
     def _dedicated_placement_group(self, replica: int) -> tuple:
         """Provision -- or reuse -- the placement group this replica owns.
@@ -337,14 +283,3 @@ class TeacherEngineAdapter:
             )
             addr_and_ports.update(allocated)
         return addr_and_ports
-
-
-class _TeacherManager(ModelPool):
-    """Legacy Ray constructor forwarding to the common model pool."""
-
-    def __init__(self, *args, **kwargs):
-        adapter = TeacherEngineAdapter(*args, **kwargs)
-        super().__init__(adapter, inference_manager=adapter.inference_manager, model_id=adapter.inference_model_id)
-
-
-TeacherManager = ray.remote(_TeacherManager)

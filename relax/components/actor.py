@@ -61,7 +61,6 @@ class Actor(Base):
         self._lock = threading.RLock()
         self.healthy = healthy
         self.role = role
-        self.genrm_manager = None  # Set later via set_genrm_manager if genRM is enabled
 
         # Threading primitives so the training loop doesn't block the Serve/FastAPI thread
         self._stop_event = threading.Event()
@@ -130,28 +129,26 @@ class Actor(Base):
         self._rollout_barrier = rollout
         self._peer_barrier = peers
 
-    def set_genrm_manager(self, genrm_manager: Any) -> None:
-        """Set the genRM manager(s) for coordinated offload/onload.
+    def set_genrm_models(self, genrm_models: Any) -> None:
+        """Set the GenRM models for coordinated offload/onload.
 
-        ``genrm_manager`` is a list of manager handles -- one per genRM
-        instance (a single-instance config still passes a one-element list). In
-        colocated mode, they are used to offload genRM engines before training
-        and onload them before rollout, since they share GPU resources.
+        ``genrm_models`` holds one ``ModelRef`` per genRM instance. In
+        colocated mode they are offloaded before training and onloaded before
+        rollout through the inference owner, since they share GPU resources.
         """
-        self.genrm_manager = genrm_manager
-        self.actor_model.set_genrm_manager(self.genrm_manager)
-        self._logger.info("GenRM manager(s) set on Actor for coordinated offload/onload")
+        self.actor_model.set_genrm_models(genrm_models)
+        self._logger.info("GenRM models set on Actor for coordinated offload/onload")
 
     def set_inference_manager(self, inference_manager_handle: Any) -> None:
         """Attach the task inference control plane for phase coordination."""
         self.actor_model.set_inference_manager(inference_manager_handle)
         self._logger.info("Inference control plane set on Actor for phase coordination")
 
-    def set_teacher_manager(self, teacher_manager: Any) -> None:
-        """Set the managed OPD teacher manager for coordinated
+    def set_teacher_models(self, teacher_models: Any) -> None:
+        """Set the managed OPD teacher models for coordinated
         offload/onload."""
-        set_managed_opd_teacher_on_train_group(self.actor_model, teacher_manager)
-        self._logger.info("Teacher manager set on Actor for coordinated offload/onload")
+        set_managed_opd_teacher_on_train_group(self.actor_model, teacher_models)
+        self._logger.info("Teacher models set on Actor for coordinated offload/onload")
 
     def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False) -> None:
         self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)

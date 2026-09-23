@@ -32,6 +32,7 @@ from relax.distributed.checkpoint_service.coordinator.service import create_dcs_
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.inference_role import create_task_inference_manager
 from relax.engine.inference.phase_plans import deferred_phases, phase_targets_from_args
+from relax.engine.inference.types import ModelRef, Role
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -167,7 +168,7 @@ class Controller:
     def __init__(self, config: Namespace, runtime_env: dict = None) -> None:
         self.config = config
         self.serve_dict = {}
-        self._teacher_manager = None
+        self._teacher_models = ()
         self._inference_manager_handle = None
         # Initialize health management system
         self.runtime_env = runtime_env
@@ -733,9 +734,8 @@ class Controller:
 
         self._inference_manager_handle = create_task_inference_manager(self.config, self.runtime_env)
 
-        actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
+        actor_rollout_pgs, self._teacher_models = maybe_start_managed_opd_teacher(
             self.config,
-            runtime_env=self.runtime_env,
             inference_manager_handle=self._inference_manager_handle,
         )
 
@@ -888,18 +888,16 @@ class Controller:
         # Each service runs independently: rollout, actor, critic, etc.
         async def run_all_services(*, resume_existing: bool = False):
             if not resume_existing and not (self.config.debug_train_only or self.config.debug_rollout_only):
-                # Pass genRM manager(s) to actor for coordinated offload/onload
+                # Pass the genRM models to actor for coordinated offload/onload
                 if GENRM_ROLE in self.serve_dict and not self.config.fully_async:
-                    genrm_service = self.serve_dict[GENRM_ROLE]
-                    genrm_managers = [
-                        await genrm_service.get_genrm_manager(route_key)
-                        for route_key in self.config._genrm_instances_resolved
+                    genrm_models = [
+                        ModelRef(Role.GENRM, route_key) for route_key in self.config._genrm_instances_resolved
                     ]
-                    await self.serve_dict[ROLES.actor].set_genrm_manager(genrm_managers)
+                    await self.serve_dict[ROLES.actor].set_genrm_models(genrm_models)
 
                 await set_managed_opd_teacher_on_actor_service(
                     self.serve_dict.get(ROLES.actor),
-                    self._teacher_manager,
+                    self._teacher_models,
                     self.config,
                 )
 
@@ -1041,10 +1039,10 @@ class Controller:
             except Exception as e:
                 logger.warning(f"Failed to dispose RolloutManager: {e}")
 
-        shutdown_managed_opd_teacher(self._teacher_manager)
+        shutdown_managed_opd_teacher(self._inference_manager_handle, self._teacher_models)
 
-        # The task-scoped CPU owner is the final lifecycle authority for
-        # rollout, GenRM, and Teacher compatibility hosts.  Keep this call
+        # The task-scoped CPU owner is the final lifecycle authority for the
+        # rollout, GenRM and Teacher engine pools.  Keep this call
         # after workload teardown so in-flight GPU operations have drained,
         # while still closing the owner before Serve/Router cleanup.
         if self._inference_manager_handle is not None:

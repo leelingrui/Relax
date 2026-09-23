@@ -1,72 +1,49 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
+
+from conftest import FakeOwnerHandle
 
 
-def _install_fake_teacher_manager(monkeypatch, captured):
-    teacher_manager_module = ModuleType("relax.distributed.ray.inference_role")
-
-    class _RemoteMethod:
-        def __init__(self, name):
-            self.name = name
-
-        def remote(self):
-            captured["calls"].append(self.name)
-            return f"{self.name}-ref"
-
-    class _TeacherManagerHandle:
-        get_urls = _RemoteMethod("get_urls")
-        offload = _RemoteMethod("offload")
-
-    def create_role_managers(args, role, pool_configs, runtime_env=None):
-        assert role == "teacher"
-        captured["runtime_env"] = runtime_env
-        captured["pool_configs"] = pool_configs
-        captured["handle"] = _TeacherManagerHandle()
-        return {"default": captured["handle"]}
-
-    teacher_manager_module.create_role_managers = create_role_managers
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.inference_role", teacher_manager_module)
-
-
-def test_create_managed_opd_teacher_manager_offloads_shared_pg_teacher(monkeypatch, tmp_path):
+def test_create_managed_opd_teacher_offloads_shared_pg_teacher(monkeypatch):
     import ray
 
-    from relax.utils.opd.opd_utils import create_managed_opd_teacher_manager
+    from relax.engine.inference.types import ModelRef, Role
+    from relax.utils.opd.opd_utils import create_managed_opd_teacher
 
-    captured = {"calls": []}
-    _install_fake_teacher_manager(monkeypatch, captured)
-    monkeypatch.setattr(
-        ray,
-        "get",
-        lambda ref: ["http://teacher/generate"] if ref == "get_urls-ref" else None,
+    owner = FakeOwnerHandle(urls={"default": ["http://teacher/generate"]})
+    monkeypatch.setattr(ray, "get", lambda ref, **kwargs: ref)
+    args = SimpleNamespace(offload_rollout=True, enable_affinity=True)
+    pg = ("pg", list(range(8)), list(range(8)))
+
+    models, urls = create_managed_opd_teacher(
+        args, num_replicas=1, gpus_per_replica=4, inference_manager_handle=owner, pg=pg, shared_pg=True
     )
 
-    autoscaler_config = tmp_path / "autoscaler.yaml"
-    autoscaler_config.write_text("enabled: true\n")
-    args = SimpleNamespace(
-        offload_rollout=True,
-        autoscaler_config=str(autoscaler_config),
-        enable_affinity=True,
-    )
-    manager, urls = create_managed_opd_teacher_manager(
-        args,
-        num_replicas=1,
-        gpus_per_replica=4,
-        pg=("pg", list(range(8)), list(range(8))),
-        shared_pg=True,
-        runtime_env={"env_vars": {"A": "B"}},
-    )
-
-    assert manager is captured["handle"]
+    assert models == (ModelRef(Role.TEACHER, "default"),)
     assert urls == ["http://teacher/generate"]
-    assert captured["calls"] == ["get_urls", "offload"]
-    assert captured["runtime_env"] == {"env_vars": {"A": "B"}}
-    assert captured["pool_configs"]["default"]["args"] == (args,)
-    assert captured["pool_configs"]["default"]["kwargs"] == {
+    assert [name for name, _, _ in owner.calls] == ["create_role", "call", "lifecycle"]
+    ((create_args, _),) = owner.named("create_role")
+    assert create_args[1] == "teacher"
+    assert create_args[2]["default"]["args"] == (args,)
+    assert create_args[2]["default"]["kwargs"] == {
         "num_replicas": 1,
         "gpus_per_replica": 4,
-        "pg": ("pg", list(range(8)), list(range(8))),
+        "pg": pg,
         "shared_pg": True,
     }
+    assert owner.named("lifecycle") == [((Role.TEACHER, "default", "offload"), {})]
+
+
+def test_create_managed_opd_teacher_keeps_a_dedicated_teacher_loaded(monkeypatch):
+    import ray
+
+    from relax.utils.opd.opd_utils import create_managed_opd_teacher
+
+    owner = FakeOwnerHandle(urls={"default": ["http://teacher/generate"]})
+    monkeypatch.setattr(ray, "get", lambda ref, **kwargs: ref)
+    args = SimpleNamespace(offload_rollout=True, enable_affinity=True)
+
+    create_managed_opd_teacher(args, num_replicas=2, gpus_per_replica=4, inference_manager_handle=owner)
+
+    assert owner.named("lifecycle") == []

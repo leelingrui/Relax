@@ -122,75 +122,86 @@ def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkey
     assert captured["options"]["scheduling_strategy"].node_id == node_id
 
 
-def _stub_inference_role_actors(monkeypatch):
-    """Capture the control-plane actor options ``create_role_managers`` uses.
+def test_task_inference_owner_keeps_head_affinity_and_requests_stable_cpu(monkeypatch, tmp_path):
+    """The task owner is the only control-plane actor the inference roles use.
 
-    GenRM bring-up now goes through the unified role owner, so the actors that
-    carry the affinity markers are ``InferenceRoleManager`` and the legacy
-    facades -- not ``GenRMManager``. Both are real Ray actors, so they have to
-    be stubbed or the call blocks on a cluster that no unit test has.
+    GenRM and Teacher pools live inside it, so it is the one that has to carry
+    the stable-CPU marker and stay on the head node that runs the routers.
     """
     from relax.distributed.ray import inference_role
 
-    captured = SimpleNamespace(owner=None, facades=[], pool_configs=None)
+    captured = {}
+    node_id = "b" * 56
 
-    class FakeRoleOwner(_FakeActorClass):
+    class FakeOwnerActor(_FakeActorClass):
         @classmethod
         def options(cls, **options):
-            captured.owner = options
+            captured["options"] = options
             return cls
 
-        @classmethod
-        def remote(cls, role, pool_configs):
-            captured.pool_configs = pool_configs
-            return SimpleNamespace(ready=SimpleNamespace(remote=lambda: True))
-
-    class FakeFacade(_FakeActorClass):
-        @classmethod
-        def options(cls, **options):
-            captured.facades.append(options)
-            return cls
-
-        @classmethod
-        def remote(cls, *args, **kwargs):
-            return SimpleNamespace(ready=SimpleNamespace(remote=lambda: True))
-
-    monkeypatch.setattr(inference_role, "InferenceRoleManager", FakeRoleOwner)
-    monkeypatch.setattr(inference_role, "InferenceManagerFacade", FakeFacade)
+    monkeypatch.setattr(inference_role, "TaskInferenceManagerActor", FakeOwnerActor)
+    monkeypatch.setattr(placement_group_module, "_get_head_node_id", lambda: node_id)
     monkeypatch.setattr(
-        inference_role.ray,
-        "get",
-        lambda refs, **kwargs: list(refs) if isinstance(refs, (list, tuple)) else refs,
+        placement_group_module.ray,
+        "nodes",
+        lambda: [{"NodeID": node_id, "Alive": True, "Resources": {"stable_cpu": 8}}],
     )
-    return captured
+
+    inference_role.create_task_inference_manager(_elastic_args(tmp_path), runtime_env={"env_vars": {"A": "B"}})
+
+    assert captured["options"]["resources"] == {"stable_cpu": 1}
+    assert captured["options"]["num_gpus"] == 0
+    assert captured["options"]["runtime_env"] == {"env_vars": {"A": "B"}}
+    assert captured["options"]["scheduling_strategy"].node_id == node_id
 
 
-def test_genrm_manager_requests_stable_cpu(monkeypatch, tmp_path):
-    captured = _stub_inference_role_actors(monkeypatch)
-    args = _elastic_args(tmp_path, offload_rollout=False)
+def _owner_handle():
+    calls = []
 
-    placement_group_module.create_genrm_manager(args, "pg", runtime_env={"env_vars": {"A": "B"}})
+    def record(name):
+        def remote(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return tuple(args[2]) if name == "create_role" else None
 
-    assert captured.owner == {
-        "num_cpus": 1,
-        "num_gpus": 0,
-        "runtime_env": {"env_vars": {"A": "B"}},
-        "resources": {"stable_cpu": 1},
+        return SimpleNamespace(remote=remote)
+
+    return SimpleNamespace(**{name: record(name) for name in ("plan_placement", "create_role", "lifecycle")}), calls
+
+
+def test_genrm_instances_become_models_on_the_task_owner(monkeypatch, tmp_path):
+    """No GenRM actor is created: every instance is one model of the owner, and
+    no well-known actor name is registered for user code to look up."""
+    spec = {
+        "model_path": "/model",
+        "num_gpus": 1,
+        "num_gpus_per_engine": 1,
+        "engine_config": {},
+        "sampling_config": {},
     }
-    # The well-known single-instance name still lands on the legacy facade.
-    assert captured.facades == [
-        {
-            "name": "relax_genrm_manager",
-            "num_cpus": 0,
-            "num_gpus": 0,
-            "runtime_env": {"env_vars": {"A": "B"}},
-            "resources": {"stable_cpu": 1},
-        }
-    ]
+    args = _elastic_args(
+        tmp_path,
+        offload_rollout=True,
+        fully_async=True,
+        rollout_num_gpus=0,
+        num_gpus_per_node=8,
+        _genrm_instances_resolved={"quality": dict(spec), "safety": dict(spec)},
+    )
+    owner, calls = _owner_handle()
+    monkeypatch.setattr(placement_group_module.ray, "get", lambda refs, **kwargs: refs)
+
+    assert placement_group_module.create_genrm_role(args, ("pg", [0, 1], [0, 1]), owner) == ("quality", "safety")
+
+    assert [name for name, _, _ in calls] == ["plan_placement", "create_role", "lifecycle", "lifecycle"]
+    _, create_args, _ = calls[1]
+    pool_configs = create_args[2]
+    assert create_args[1] == "genrm"
+    assert [config["kwargs"]["port_window_index"] for config in pool_configs.values()] == [0, 1]
+    assert [config["kwargs"]["bundle_offset"] for config in pool_configs.values()] == [0, 1]
+    assert pool_configs["quality"]["args"][0].genrm_model_path == "/model"
+    assert [call[1] for call in calls[2:]] == [("genrm", "quality", "offload"), ("genrm", "safety", "offload")]
 
 
-def test_multi_genrm_managers_have_route_specific_names(monkeypatch, tmp_path):
-    captured = _stub_inference_role_actors(monkeypatch)
+def test_single_genrm_instance_keeps_its_own_args(monkeypatch, tmp_path):
     spec = {
         "model_path": "/model",
         "num_gpus": 1,
@@ -204,17 +215,19 @@ def test_multi_genrm_managers_have_route_specific_names(monkeypatch, tmp_path):
         fully_async=True,
         rollout_num_gpus=0,
         num_gpus_per_node=8,
-        _genrm_instances_resolved={"quality": dict(spec), "safety": dict(spec)},
+        _genrm_instances_resolved={"__default__": spec},
     )
+    owner, calls = _owner_handle()
+    monkeypatch.setattr(placement_group_module.ray, "get", lambda refs, **kwargs: refs)
 
-    placement_group_module.create_genrm_managers(args, ("pg", [0, 1], [0, 1]))
+    assert placement_group_module.create_genrm_role(args, ("pg", [0], [0]), owner) == ("__default__",)
+    _, create_args, _ = calls[1]
+    assert create_args[2]["__default__"]["args"][0] is args
 
-    assert [options["name"] for options in captured.facades] == [
-        "relax_genrm_manager_quality",
-        "relax_genrm_manager_safety",
-    ]
-    assert [config["kwargs"]["port_window_index"] for config in captured.pool_configs.values()] == [0, 1]
-    assert [config["kwargs"]["bundle_offset"] for config in captured.pool_configs.values()] == [0, 1]
+
+def test_genrm_role_requires_the_task_owner(tmp_path):
+    with pytest.raises(ValueError, match="task inference manager"):
+        placement_group_module.create_genrm_role(_elastic_args(tmp_path), ("pg", [0], [0]), None)
 
 
 def test_dcs_proxy_requests_stable_cpu(monkeypatch, tmp_path):

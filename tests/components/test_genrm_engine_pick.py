@@ -2,8 +2,9 @@
 
 """Engine selection in the GenRM Serve replica.
 
-The replica caches the manager's engine list and round-robins over it. Single-
-engine recovery makes that list *mutable at runtime*: the manager compacts it
+The replica caches a model's engine list, read from the task inference owner,
+and round-robins over it. Single-engine recovery makes that list *mutable at
+runtime*: the pool compacts it
 when an engine is retired and hands back a rebuilt engine on a fresh port, so
 every assumption the cache makes has to survive the list changing underneath it.
 
@@ -79,12 +80,11 @@ class _Replica:
 
         self._replica = object.__new__(cls)
         self._replica._engine_caches = {"__default__": genrm_module._EngineCacheState()}
-        # Only ``get_engine_hosts_ports.remote()`` is ever reached; the token it
-        # returns is resolved by the patched ``ray.get`` below, mirroring how a
-        # real ObjectRef is consumed.
-        self._replica.genrm_managers = {
-            "__default__": SimpleNamespace(get_engine_hosts_ports=SimpleNamespace(remote=lambda: _TOKEN))
-        }
+        # Only the owner's ``call.remote(GENRM, key, "get_engine_hosts_ports")``
+        # is ever reached; the token it returns is resolved by the patched
+        # ``ray.get`` below, mirroring how a real ObjectRef is consumed.
+        self._replica.model_ids = ("__default__",)
+        self._replica._owner = SimpleNamespace(call=SimpleNamespace(remote=self._engine_list_call))
 
         self.now = start_time
         self.fetches = 0
@@ -102,6 +102,11 @@ class _Replica:
         monkeypatch.setitem(method_globals, "time", fake_time)
         monkeypatch.setitem(module_globals, "time", fake_time)
         monkeypatch.setenv("GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S", str(COOLDOWN_S))
+
+    @staticmethod
+    def _engine_list_call(role, model_id, method):
+        assert (role, model_id, method) == (genrm_module.Role.GENRM, "__default__", "get_engine_hosts_ports")
+        return _TOKEN
 
     def pick(self):
         _key, idx, host, port = self._replica._pick_engine(None)
@@ -220,28 +225,25 @@ class TestEmptyEngineList:
         assert r.fetches == 2, "but it must keep retrying so recovery is noticed"
 
 
-class TestManagerLookup:
-    def test_selects_manager_by_route_key(self):
+class TestInstanceLookup:
+    def test_selects_instance_by_route_key(self):
         cls = genrm_module.GenRM.func_or_class
         replica = object.__new__(cls)
-        quality_manager = object()
-        safety_manager = object()
-        replica.genrm_managers = {"quality": quality_manager, "safety": safety_manager}
+        replica.model_ids = ("quality", "safety")
 
-        assert replica.get_genrm_manager("quality") is quality_manager
-        assert replica.get_genrm_manager("safety") is safety_manager
+        assert replica._resolve_instance_key("quality") == "quality"
+        assert replica._resolve_instance_key("safety") == "safety"
 
     def test_omitted_route_key_requires_exactly_one_instance(self):
         cls = genrm_module.GenRM.func_or_class
         replica = object.__new__(cls)
-        manager = object()
-        replica.genrm_managers = {"quality": manager}
+        replica.model_ids = ("quality",)
 
-        assert replica.get_genrm_manager() is manager
+        assert replica._resolve_instance_key(None) == "quality"
 
-        replica.genrm_managers["safety"] = object()
+        replica.model_ids = ("quality", "safety")
         with pytest.raises(RuntimeError, match="route_key"):
-            replica.get_genrm_manager()
+            replica._resolve_instance_key(None)
 
 
 async def test_genrm_endpoint_preserves_route_and_strips_response():
@@ -266,7 +268,7 @@ async def test_genrm_prepare_payload_uses_instance_tokenizer_and_defaults():
 
     cls = genrm_module.GenRM.func_or_class
     replica = object.__new__(cls)
-    replica.genrm_managers = {"quality": object(), "safety": object()}
+    replica.model_ids = ("quality", "safety")
     replica.instance_specs = {
         "quality": {"sampling_config": {}},
         "safety": {
@@ -299,3 +301,37 @@ async def test_genrm_prepare_payload_uses_instance_tokenizer_and_defaults():
     assert replica.instance_specs["safety"]["sampling_config"]["temperature"] == 0.4
     payload = await replica.prepare_generate_payload("quality", messages)
     assert payload["sampling_params"] == {"temperature": 0.2, "top_p": 1.0, "top_k": -1, "max_new_tokens": 1024}
+
+
+@pytest.mark.asyncio
+async def test_genrm_lifecycle_and_health_go_through_the_task_owner(monkeypatch):
+    """Every instance is a model of the task owner; the service holds no per-
+    instance actor to call."""
+    cls = genrm_module.GenRM.func_or_class
+    method_globals = cls.onload.__globals__
+    monkeypatch.setitem(method_globals, "ray", SimpleNamespace(get=lambda refs: refs))
+    calls = []
+
+    def lifecycle(role, model_id, method):
+        calls.append((role, model_id, method))
+        return model_id != "safety" if method == "health_check" else None
+
+    replica = object.__new__(cls)
+    replica._logger_instance = SimpleNamespace(info=lambda *a, **k: None, error=lambda *a, **k: None)
+    replica.model_ids = ("quality", "safety")
+    replica._owner = SimpleNamespace(lifecycle=SimpleNamespace(remote=lifecycle))
+
+    replica.onload()
+    replica.offload()
+    health = await replica.health()
+
+    role = genrm_module.Role.GENRM
+    assert calls[:4] == [
+        (role, "quality", "onload"),
+        (role, "safety", "onload"),
+        (role, "quality", "offload"),
+        (role, "safety", "offload"),
+    ]
+    assert calls[4:] == [(role, "quality", "health_check"), (role, "safety", "health_check")]
+    assert health["status"] == "unhealthy"
+    assert health["instances"] == {"quality": {"status": "healthy"}, "safety": {"status": "unhealthy"}}

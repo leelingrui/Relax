@@ -66,52 +66,6 @@ def _import_teacher_manager(monkeypatch):
     return importlib.import_module("relax.distributed.ray.teacher_manager")
 
 
-def test_teacher_gpu_index_uses_rollout_offset_for_shared_pg(monkeypatch):
-    teacher_manager = _import_teacher_manager(monkeypatch)
-    args = SimpleNamespace(rollout_num_gpus=4)
-
-    assert (
-        teacher_manager._resolve_teacher_gpu_index(
-            args=args,
-            replica=0,
-            gpus_per_replica=4,
-            shared_pg=True,
-        )
-        == 4
-    )
-
-
-def test_teacher_gpu_index_starts_at_zero_for_dedicated_pg(monkeypatch):
-    teacher_manager = _import_teacher_manager(monkeypatch)
-    args = SimpleNamespace(rollout_num_gpus=4)
-
-    assert (
-        teacher_manager._resolve_teacher_gpu_index(
-            args=args,
-            replica=0,
-            gpus_per_replica=4,
-            shared_pg=False,
-        )
-        == 0
-    )
-
-
-def test_teacher_gpu_index_uses_teacher_relative_bundle_offset(monkeypatch):
-    teacher_manager = _import_teacher_manager(monkeypatch)
-    args = SimpleNamespace(rollout_num_gpus=8)
-
-    assert (
-        teacher_manager._resolve_teacher_gpu_index(
-            args=args,
-            replica=1,
-            gpus_per_replica=2,
-            shared_pg=True,
-            bundle_offset=4,
-        )
-        == 14
-    )
-
-
 def test_teacher_env_matches_rollout_genrm_stability_envs(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
     # RELAX_OPD_PREEXPANDED_PATCH is passed through from the driver env (default
@@ -130,15 +84,6 @@ def test_teacher_env_matches_rollout_genrm_stability_envs(monkeypatch):
     assert env["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"] == "false"
     assert env["SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE"] == "false"
     assert env["SGLANG_MAMBA_CONV_DTYPE"] == "float16"
-
-
-def test_teacher_manager_exposes_ray_actor_api(monkeypatch):
-    teacher_manager = _import_teacher_manager(monkeypatch)
-
-    assert hasattr(teacher_manager.TeacherManager, "remote")
-    assert hasattr(teacher_manager.TeacherManager, "options")
-    for method in ("onload", "offload", "health_check", "recover", "shutdown", "is_onloaded", "get_urls"):
-        assert method in teacher_manager.TeacherManager.__ray_metadata__.method_meta.methods
 
 
 def test_teacher_recovery_reuses_original_endpoint(monkeypatch):
@@ -173,31 +118,35 @@ def test_dedicated_teacher_recovery_requires_global_restart(monkeypatch):
         manager.recover()
 
 
-@pytest.mark.parametrize("shared", [False, True])
-def test_teacher_placement_preserves_owner_and_bundle_mapping(monkeypatch, shared):
+def test_dedicated_teacher_placement_creates_and_records_its_own_group(monkeypatch):
+    from relax.engine.inference.placement import PlacementOwner, PlacementPlanner
+
     module = _import_teacher_manager(monkeypatch)
-    cls = module.TeacherEngineAdapter
-    manager = object.__new__(cls)
-    manager.args = SimpleNamespace(rollout_num_gpus=4, enable_affinity=False)
+    manager = object.__new__(module.TeacherEngineAdapter)
+    manager.args = SimpleNamespace(rollout_num_gpus=4, num_gpus_per_node=4, enable_affinity=False)
     manager.gpus_per_replica = 2
-    manager._shared_pg = shared
-    manager._bundle_offset = 2
-    manager._shared_pg_tuple = ("shared", list(range(12)), list(range(12)))
+    manager.num_replicas = 2
+    manager.nodes_per_engine = 1
+    manager._shared_pg = False
+    manager._engine_placements = {}
+    manager._placement_ledger = PlacementPlanner()
+    manager._placement_model_id = "math-teacher"
     dedicated = ("dedicated", [3, 1], [1, 0])
     module.create_placement_group.return_value = dedicated
 
-    placement, owns_pg, gpu_index = manager._resolve_placement(rank=1)
+    placement, owns_pg, gpu_index, planned = manager._resolve_planned_placement(rank=1)
 
-    assert placement is (manager._shared_pg_tuple if shared else dedicated)
-    assert owns_pg is not shared
-    assert gpu_index == (8 if shared else 0)
-    if shared:
-        module.create_placement_group.assert_not_called()
-    else:
-        module.create_placement_group.assert_called_once_with(num_gpus=2, node_group_affinity=False)
+    assert placement is dedicated
+    assert owns_pg is True
+    assert gpu_index == 0
+    assert planned.owner is PlacementOwner.MANAGER
+    assert planned.group_id == "teacher/math-teacher/replica-1"
+    module.create_placement_group.assert_called_once_with(num_gpus=2, node_group_affinity=False)
 
 
 def test_teacher_placement_uses_planner_slice_for_shared_pg(monkeypatch):
+    from relax.engine.inference.placement import PlacementOwner, PlacementPlanner
+
     module = _import_teacher_manager(monkeypatch)
     manager = object.__new__(module.TeacherEngineAdapter)
     manager.args = SimpleNamespace(rollout_num_gpus=4, num_gpus_per_node=4, enable_affinity=False)
@@ -207,7 +156,7 @@ def test_teacher_placement_uses_planner_slice_for_shared_pg(monkeypatch):
     manager._shared_pg = True
     manager._bundle_offset = 2
     manager._shared_pg_tuple = ("shared", list(range(12)), list(range(12)))
-    manager._placement_ledger = module.PlacementPlanner()
+    manager._placement_ledger = PlacementPlanner()
     manager._placement_model_id = "math-teacher"
 
     placement, owns_pg, gpu_index, planned = manager._resolve_planned_placement(rank=1)
@@ -216,7 +165,7 @@ def test_teacher_placement_uses_planner_slice_for_shared_pg(monkeypatch):
     assert owns_pg is False
     assert gpu_index == 8
     assert planned.reserved_offset == 8
-    assert planned.owner is module.PlacementOwner.CONTROLLER
+    assert planned.owner is PlacementOwner.CONTROLLER
     # Teachers share one placement group, so the slice identity carries the
     # model and not just the replica index.
     assert planned.group_id == "teacher/math-teacher/replica-1"
@@ -245,13 +194,12 @@ def test_teacher_constructor_declares_checkpoint_weight_source(monkeypatch):
     assert manager._build_engine_ctor_kwargs(0)["weight_source"] == "checkpoint"
 
 
-def test_teacher_shutdown_cleans_router_even_if_engine_cleanup_fails(monkeypatch):
+def test_teacher_shutdown_leaves_router_cleanup_to_the_owner(monkeypatch):
+    """The owner's manager stops the routers once every model has closed."""
     module = _import_teacher_manager(monkeypatch)
-    cls = module.TeacherEngineAdapter
-    manager = object.__new__(cls)
-    manager._owns_inference_manager = True
+    manager = object.__new__(module.TeacherEngineAdapter)
     manager.backend = object.__new__(module.MultiEngineManager)
     monkeypatch.setattr(module.MultiEngineManager, "shutdown", MagicMock(side_effect=RuntimeError("cleanup")))
     with pytest.raises(RuntimeError, match="cleanup"):
         manager.shutdown()
-    sys.modules["relax.distributed.ray.rollout"].stop_launched_routers.assert_called_once()
+    sys.modules["relax.distributed.ray.rollout"].stop_launched_routers.assert_not_called()

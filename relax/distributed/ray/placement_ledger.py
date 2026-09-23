@@ -3,9 +3,9 @@
 """Access to the one placement ledger a control domain owns.
 
 Every role reaches the ledger through these helpers, so no role keeps its own
-allocation bookkeeping. ``ledger`` is either the task-level owner's actor
-handle or, on the compatibility path that has no owner injected, a
-:class:`PlacementPlanner` instance the role constructed for itself. It is never
+allocation bookkeeping. ``ledger`` is the task-level owner's ledger: its actor
+handle from outside the owner process, or the owner's own
+:class:`PlacementPlanner` for the engine pools created inside it. It is never
 implicit shared state.
 """
 

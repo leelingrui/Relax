@@ -35,6 +35,38 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# FakeOwnerHandle -- stands in for the task inference owner's actor handle.
+# ---------------------------------------------------------------------------
+class FakeOwnerHandle:
+    """Record every ``owner.<method>.remote(...)`` call and answer the few
+    whose results callers read.
+
+    The results are plain values, so tests patch ``ray.get`` to return its
+    argument unchanged.
+    """
+
+    def __init__(self, urls: dict | None = None) -> None:
+        self.calls: list[tuple] = []
+        self.urls = urls or {}
+
+    def __getattr__(self, name: str) -> SimpleNamespace:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return SimpleNamespace(remote=lambda *args, **kwargs: self._answer(name, args, kwargs))
+
+    def _answer(self, name: str, args: tuple, kwargs: dict):
+        self.calls.append((name, args, kwargs))
+        if name == "create_role":
+            return tuple(args[2])
+        if name == "call" and args[2] == "get_urls":
+            return self.urls.get(args[1], [])
+        return None
+
+    def named(self, name: str) -> list[tuple]:
+        return [(args, kwargs) for called, args, kwargs in self.calls if called == name]
+
+
+# ---------------------------------------------------------------------------
 # AwaitableValue -- a value that can be consumed by *both* ``ray.get`` (sync)
 # and ``await`` (async), enabling the same mock engine to work in all contexts.
 # ---------------------------------------------------------------------------

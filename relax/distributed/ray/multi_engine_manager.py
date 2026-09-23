@@ -1,22 +1,22 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Common lifecycle skeleton for managers that own a pool of SGLang engine
-replicas (GenRM judges, OPD teachers, ...).
+"""Common lifecycle skeleton for a pool of static SGLang engine replicas (GenRM
+judges, OPD teachers, ...).
 
-Concrete managers subclass ``MultiEngineManager`` (in addition to their own
-``@ray.remote`` decorator) and implement the hooks below to plug in their
-engine actor class, placement, GPU/port allocation, and env vars. The base
-class owns: parallel engine bring-up, health checking, dead-engine
-detection/retirement, recovery, and onload/offload with idempotency tracking.
+A role adapter (``GenRMEngineAdapter``, ``TeacherEngineAdapter``) is passed as
+``adapter`` and implements the hooks below to plug in its engine actor class,
+placement, GPU/port allocation, and env vars. This class owns: parallel engine
+bring-up, health checking, dead-engine detection/retirement, recovery, and
+onload/offload with idempotency tracking. Its state lives in the task owner's
+``InferenceManager``, which every pool is bound to.
 
-Placement is resolved per engine (not once per manager): a manager may put
-all engines on one shared placement group (e.g. GenRM colocated with
-rollout), or give each engine its own dedicated placement group that it
-creates and tears down itself (e.g. a non-colocated OPD teacher). Subclasses
-express this via ``_resolve_placement``.
+Placement is resolved per engine (not once per pool) against the task owner's
+placement ledger: a pool may put all engines on one shared placement group
+(e.g. GenRM colocated with rollout), or give each engine its own dedicated
+placement group that it creates and tears down itself (e.g. a non-colocated
+OPD teacher). Adapters express this via ``_resolve_planned_placement``.
 """
 
-from dataclasses import replace
 from typing import Any, Optional
 
 import ray
@@ -31,9 +31,6 @@ from relax.engine.inference.types import (
     LifecycleState,
     ModelSnapshot,
     ReplicaSnapshot,
-    Role,
-    RoleSnapshot,
-    RoutingSpec,
 )
 from relax.utils.logging_utils import get_logger
 
@@ -125,7 +122,7 @@ class MultiEngineManager:
         engine_actor_cls: type,
         skip_init: bool = False,
         log_prefix: str = "",
-        inference_manager: InferenceManager | None = None,
+        inference_manager: InferenceManager,
         model_id: str = "default",
         adapter: Any | None = None,
     ) -> None:
@@ -147,10 +144,7 @@ class MultiEngineManager:
         # safe no-ops. Engines start onloaded; callers may immediately offload.
         self._onloaded = True
         self._memory_ready = True
-        self._owns_inference_manager = inference_manager is None
-        self.inference_manager = inference_manager or InferenceManager(
-            getattr(self.adapter, "inference_role", Role.GENRM)
-        )
+        self.inference_manager = inference_manager
         model_path = (
             getattr(self.adapter, "inference_model_path", None) or getattr(args, "hf_checkpoint", None) or "managed"
         )
@@ -172,8 +166,6 @@ class MultiEngineManager:
             operation_id=f"register:{model_id}",
         )
         self.inference_manager.bind_pool(model_id, _PoolRuntime(self))
-        if self._owns_inference_manager:
-            self.inference_manager.configure_routes(RoutingSpec(default_model=model_id), operation_id="routes")
         self.manager_epoch = self.inference_manager.snapshot().manager_epoch
         if not skip_init:
             self.initialize()
@@ -218,35 +210,6 @@ class MultiEngineManager:
         model = ModelSnapshot(self.inference_model_id, tuple(replicas), router_url, state, ready, allow_defer=True)
         self.inference_manager.commit_observation(expected, model, evidence=PreparationEvidence(True, ready, ready))
 
-    def get_discovery_snapshot(
-        self,
-        *,
-        role: Role,
-        model_id: str,
-        allow_defer: bool = False,
-        direct_eligible: bool = False,
-        phase: str | None = None,
-        status_filter: str | None = None,
-    ) -> RoleSnapshot:
-        """Project the cached pool snapshot under the legacy model alias."""
-        if status_filter not in (None, "active", "dead"):
-            raise ValueError("status_filter must be one of: active, dead")
-        snapshot = self.inference_manager.snapshot((self.inference_model_id,))
-        model = snapshot.models[0]
-        model = replace(
-            model,
-            model_id=model_id,
-            replicas=tuple(
-                replace(replica, engine_id=f"{model_id}/{replica.engine_id.split('/', 1)[1]}")
-                for replica in model.replicas
-                if status_filter is None
-                or status_filter == ("dead" if replica.state == LifecycleState.DEAD else "active")
-            ),
-            allow_defer=allow_defer,
-            direct_eligible=direct_eligible,
-        )
-        return replace(snapshot, role=role, models=(model,), phase=phase, routing=RoutingSpec(default_model=model_id))
-
     @property
     def engines(self) -> list[Any]:
         """Return the head-node slot of each logical engine."""
@@ -256,28 +219,19 @@ class MultiEngineManager:
     # Hooks -- subclasses must implement these.
     # ------------------------------------------------------------------
 
-    def _resolve_placement(self, rank: int) -> tuple[tuple, bool, int]:
-        """Return ``(pg_tuple, owns_pg, gpu_index)`` for the slot at ``rank``.
+    def _resolve_planned_placement(self, rank: int) -> tuple[tuple, bool, int, PlacementSlice]:
+        """Return ``(pg_tuple, owns_pg, gpu_index, placement_slice)`` for the
+        slot at ``rank``.
 
         ``pg_tuple`` is ``(pg, reordered_bundle_indices, reordered_gpu_ids)``
         as returned by ``create_placement_group``. ``owns_pg`` marks whether
-        this manager created ``pg_tuple`` itself (and must remove it on
-        shutdown/retirement) or is borrowing a placement group it does not
-        own. ``gpu_index`` is this slot's starting index into
-        ``reordered_gpu_ids``/``reordered_bundle_indices``.
+        the adapter created ``pg_tuple`` itself or is borrowing a placement
+        group it does not own. ``gpu_index`` is this slot's starting index into
+        ``reordered_gpu_ids``/``reordered_bundle_indices``. ``placement_slice``
+        is the allocation recorded in the task owner's ledger; releasing it is
+        what authorizes removing an owned group.
         """
         raise NotImplementedError
-
-    def _resolve_planned_placement(self, rank: int) -> tuple[tuple, bool, int, PlacementSlice | None]:
-        """Return the legacy placement tuple plus its static planner result.
-
-        The tuple remains the compatibility contract used by existing manager
-        implementations.  Adapters that participate in Phase 4 override this
-        hook and provide a ``PlacementSlice``; PG lifecycle remains owned by
-        the legacy ``owns_pg`` value until Phase 5.
-        """
-        pg_tuple, owns_pg, gpu_index = self.adapter._resolve_placement(rank)
-        return pg_tuple, owns_pg, gpu_index, None
 
     def _ray_resource_kwargs(self, rank: int) -> dict:
         """Return the num_cpus/num_gpus fractional Ray resource request for one

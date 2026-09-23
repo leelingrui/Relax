@@ -7,10 +7,11 @@ function scores the whole batch through the GenRM Gateway.
 
 The sleep/wake swap is *not* done here. The framework runs this hook inside the
 ``genrm`` activation phase: it closes rollout admission, drains it, offloads it,
-confirms the release, wakes GenRM, and puts GenRM back to sleep afterwards. That
-is why this file no longer looks up ``relax_genrm_manager`` -- a user script
-cannot drain in-flight generation or confirm that GPU memory was really freed,
-and doing the swap from here bypassed the control plane that can.
+confirms the release, wakes GenRM, and puts GenRM back to sleep afterwards. A
+user script has no GenRM handle to swap with -- the well-known
+``relax_genrm_manager`` actor is gone -- and could not drain in-flight
+generation or confirm that GPU memory was really freed anyway; the task's
+inference control plane can.
 
 Wire-up (in the training script):
   --rm-type dummy                        # inline reward is a no-op

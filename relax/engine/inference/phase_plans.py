@@ -46,8 +46,8 @@ def genrm_model_ids(args: Any) -> tuple[str, ...]:
     """The resolved GenRM instance keys, including the single-instance
     sentinel.
 
-    The keys are the model IDs: ``create_genrm_manager(s)`` passes them
-    straight through as the pool identities.
+    The keys are the model IDs: ``create_genrm_role`` passes them straight
+    through as the pool identities.
     """
     return tuple(getattr(args, "_genrm_instances_resolved", None) or ())
 

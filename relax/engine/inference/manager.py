@@ -1076,7 +1076,6 @@ class InferenceManager:
         operation_id: str,
         activation_token: ActivationToken | None = None,
         role: Role | str | None = None,
-        observe: Callable[[Sequence[ModelRef]], None] | None = None,
     ) -> OperationResult:
         """Release device memory and confirm it, model by model.
 
@@ -1109,13 +1108,6 @@ class InferenceManager:
             except Exception as exc:
                 error = OperationError(ErrorCode.UNAVAILABLE, f"{type(exc).__name__}: {exc}", model_id=target.model_id)
                 break
-        if observe is not None:
-            # Let an owner commit the backend's own observation before the
-            # result is evaluated, so one operation produces one recorded state.
-            try:
-                observe(targets)
-            except Exception as exc:
-                error = error or OperationError(ErrorCode.UNAVAILABLE, f"{type(exc).__name__}: {exc}")
         confirmed = error is None and all(self._release_confirmed(target) for target in targets)
         if confirmed:
             for target in targets:
@@ -1156,7 +1148,6 @@ class InferenceManager:
         activation_token: ActivationToken | None = None,
         tags: list[str] | None = None,
         role: Role | str | None = None,
-        observe: Callable[[Sequence[ModelRef]], None] | None = None,
     ) -> OperationResult:
         """Restore device memory for the targets and report what was confirmed.
 
@@ -1187,11 +1178,6 @@ class InferenceManager:
             except Exception as exc:
                 error = OperationError(ErrorCode.UNAVAILABLE, f"{type(exc).__name__}: {exc}", model_id=target.model_id)
                 break
-        if observe is not None:
-            try:
-                observe(targets)
-            except Exception as exc:
-                error = error or OperationError(ErrorCode.UNAVAILABLE, f"{type(exc).__name__}: {exc}")
         states = {target: self._model_state(target).state for target in targets}
         dead = [str(target) for target, state in states.items() if state == LifecycleState.DEAD]
         if error is None and dead:

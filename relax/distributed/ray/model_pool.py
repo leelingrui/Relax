@@ -71,12 +71,6 @@ class ModelPool:
     def get_engine_hosts_ports(self) -> Any:
         return self.backend.get_engine_hosts_ports()
 
-    def get_genrm_engines_and_lock(self) -> Any:
-        return self.backend.get_genrm_engines_and_lock()
-
-    def get_discovery_snapshot(self, *args: Any, **kwargs: Any) -> Any:
-        return self.backend.get_discovery_snapshot(*args, **kwargs)
-
     def fanout(self, method: str, **kwargs: Any) -> Any:
         return self.backend.fanout(method, **kwargs)
 
@@ -91,7 +85,7 @@ def create_model_pool(
     role: Role | str,
     args: Any,
     *role_args: Any,
-    inference_manager: InferenceManager | None = None,
+    inference_manager: InferenceManager,
     model_id: str = "default",
     defer_init: bool = False,
     **role_kwargs: Any,

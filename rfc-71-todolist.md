@@ -67,7 +67,7 @@
 - [x] 实现统一请求代理，保留 Rollout 流式行为、GenRM messages/`{"response": ...}` 适配、Teacher/OPD 路由和连接取消。
 - [x] 休眠、排空或未就绪模型拒绝推理请求；返回 503 和重试指引，不自动唤醒。
 - [x] 将旧 `/rollout`、GenRM、Teacher 入口接到同一个 `InferenceGateway` 类的对应 role 实例；Gateway 实现和状态模型不按 role 复制。
-- [ ] 兼容入口只保留薄适配：GenRM/Teacher 注入 task handle 时已转发至 owner；Rollout 的 workload/runtime 仍持有本地 runtime manager，待 Phase 6 EnginePool 迁移后才能勾选。
+- [x] 兼容入口只保留薄适配：Phase 6 后 `RolloutManager` 不再持有引擎池（owner handle 必填，`_engine`/`dispose` 只走 owner）；Phase 7 删除 GenRM/Teacher 的 per-model 门面 actor，调用方直接持有 owner handle + `ModelRef`。不再存在任何持有第二份状态的兼容入口。
 
 本期启动链已完成的子项：
 
@@ -123,8 +123,8 @@ Review 调用顺序：
 
 - [x] 复用公共 ModelConfig/EngineGroupConfig，删除 Rollout 到第二套模型配置的转换；副本拓扑单独表达。注册定义、操作去重参数及返回值深拷贝隔离调用方的可变配置。
 - [x] 生命周期串行化集中到 InferenceManager，移除角色宿主重复锁；忙碌请求在兼容门面异步等待，不占满角色 RPC 线程。Rollout 本地调用保留同步等待；状态锁不跨远端 RPC，关闭/Router 清理锁仅用于清理路径。
-- [ ] 三角色接入 UnifiedServiceManager 与通用 ModelPool；去掉 GenRMModelPool/TeacherModelPool 类。GenRMEngineAdapter/TeacherEngineAdapter 保留后端放置、端口、参数及旧地址接口，静态引擎状态和生命周期统一委托 MultiEngineManager；Rollout 后端保留伸缩与权重栅栏。
-- [ ] 完成统一控制面下的配置、共享池、并发控制及旧调用链 CPU 回归；当前 143 项相关回归仅证明迁移素材和兼容 role view，不能作为最终架构验收。
+- [x] 三角色接入 UnifiedServiceManager 与通用 ModelPool；去掉 GenRMModelPool/TeacherModelPool 类。`TaskInferenceManager.create_role`（GenRM/Teacher）与 `RolloutEnginePool`（Rollout）都经 `UnifiedServiceManager` 把 pool 挂到 owner 的同一个 `InferenceManager`；GenRMModelPool/TeacherModelPool 已不存在，Phase 7 再删掉仅剩的 `_GenRMManager`/`_TeacherManager` ModelPool 子类。GenRMEngineAdapter/TeacherEngineAdapter 只保留放置、端口、参数与地址接口，`inference_manager`/`placement_manager_handle` 变必填，状态和生命周期全部委托 MultiEngineManager。
+- [x] 完成统一控制面下的配置、共享池、并发控制及旧调用链 CPU 回归。Phase 7 删除 role view 与 external-host 路径后，`test_inference_role.py`/`test_lifecycle_coordination.py` 直接在 owner 的 `create_role`/`call`/`shutdown_role` 与 owner 内的 pool 上验证注册顺序、失败回滚、同 pool 串行、关闭与 Router 清理、许可与阶段切换（59 项）；相关目录回归 `1932 passed`，全量 `3078 passed`（2 项既有失败见 Phase 7 记录）。
 
 当前调用顺序（Phase 3 控制面已实现；Phase 6/7 的运行时迁移和清理仍待完成）：
 
@@ -172,7 +172,7 @@ Phase 3 验收：
 
 - [x] 动态副本失败时回滚 engine 与自有 PG；scale-in 不删除 Controller-owned 或 external PG，并同步释放统一 ledger 中的 allocation。`PlacementRelease.remove_placement_group` 是唯一的删除授权来源，仅 owner 为 MANAGER 且该 PG 最后一个 allocation 被释放时为真；重复释放不再二次授权。`start_rollout_servers` 启动失败时归还已预留 slice。
 
-- [ ] 删除 role-local planner 回退入口：回退已收敛为"无 task handle 时角色自己显式持有一个 planner 实例"，不再有第二套账本实现或隐式类状态；入口本身的删除归 Phase 7。
+- [x] 删除 role-local planner 回退入口：GenRM/Teacher adapter 的 `placement_manager_handle or PlacementPlanner()`、`create_genrm_role`/MOPD 预检的 `inference_manager_handle or PlacementPlanner()`、`MultiEngineManager` 的 `_resolve_placement` 旧 hook（不记账本的 slice=None 路径）全部删除；`placement_ledger.py` 只剩 owner actor handle 与 owner 进程内自己的 `PlacementPlanner` 两种入口，二者是同一本账。
 
 - [ ] 真实 Ray/多节点 GPU 验收与长耗时 Scale-in 验证待提供集群、模型和硬件配置后执行；CPU 回归不替代硬件验收。
 
@@ -291,15 +291,47 @@ Phase 3 验收：
 
 ## Phase 7：清理、文档与最终验收
 
-- [ ] 根据已确认的退役条件，删除旧 managers、GenRM 子类和临时兼容门面。
-- [ ] 删除命名 actor 特例、重复配置计算和废弃调用路径。
-- [ ] 删除无 task handle 的 `InferenceRoleManager` 和 role-local placement fallback；仅保留明确承诺的协议兼容层。
-- [ ] 保留承诺兼容的 HTTP 行为；对破坏性变化提供迁移说明。
-- [ ] 更新需求直接涉及的代码示例；中英文用户文档与 API 文档交由对应维护者处理，不纳入本次实现。
-- [ ] 对照 RFC acceptance checks 逐项提供代码、测试或验证证据。
-- [ ] 完成跨角色、跨模式、多模型、跨节点、PD、恢复及资源清理回归。
-- [ ] 在提供 RAY_ADDRESS、模型、节点拓扑和 GPU 配置后，完成真实 Ray/Router、多节点 follower actor、部分初始化与资源清理验收。
-- [ ] 提交前运行 pre-commit run --all-files 和相关测试。
+- [x] 根据已确认的退役条件，删除旧 managers、GenRM 子类和临时兼容门面。2026-09-23 经用户确认"彻底删除门面"：删除 `ModelManagerFacade`/`InferenceManagerFacade`、`InferenceRole`/`InferenceRoleManager`、`create_role_managers`、`GenRMManager`/`TeacherManager`（及其 `_GenRMManager`/`_TeacherManager` ModelPool 子类）。`GenRMEngine`（SGLangEngine 子类）保留：Phase 6 已把它收敛到三项真实差异（checkpoint 权重来源、server-args 构造、colocate offload 排空语义），不是兼容层。
+- [x] 删除命名 actor 特例、重复配置计算和废弃调用路径。删除 `relax_genrm_manager`/`relax_genrm_manager_{key}` 命名 actor（经用户确认）；单/多实例 GenRM 两个工厂合并为 `create_genrm_role`（`__default__` 不再走特例，统一预检）；删除无调用方的 `multi_instance_orchestrator.py`、`components/genrm.py::register_genrm` 旧导入包装、GenRM 服务自拼的 v2 快照与私有 `_manager_epoch`、`MultiEngineManager.get_discovery_snapshot` 别名投影、GenRM 的 `genrm_engine_lock`/`get_genrm_engines_and_lock`、`InferenceManager.deactivate/activate` 仅供 external host 用的 `observe` 钩子。
+- [x] 删除无 task handle 的 `InferenceRoleManager` 和 role-local placement fallback；仅保留明确承诺的协议兼容层。owner 删除 `_ExternalPoolRuntime`、`register_role`/`register_external_role`/`sync_role_snapshot`、host 快照发布、`_legacy_permits`；Gateway 删除 `role_manager_handle`/`snapshot_provider`/`discovery_url`/`manager_handles`，`manager_handle` 必填；`MultiEngineManager` 的 `inference_manager` 必填且不再自建 manager/路由。保留的协议兼容层只有 HTTP（见"Phase 7 迁移说明"）。
+- [x] 保留承诺兼容的 HTTP 行为；对破坏性变化提供迁移说明。`/rollout`、`/genrm`、`/teacher` 的 Gateway 路由、旧 `/engines` 默认结构、`?schema_version=2`、GenRM messages/`{"response": ...}` 不变；GenRM 后端 `/engines?schema_version=2` 改由 owner 快照投影（字段不变，epoch 与 Gateway 一致）。Ray/Python 层破坏性变化见"Phase 7 迁移说明"。
+- [x] 更新需求直接涉及的代码示例；中英文用户文档与 API 文档交由对应维护者处理，不纳入本次实现。`examples/generate_reward_model/post_process_genrm_swap.py` 的说明同步为"命名 actor 已删除"。遗留给文档维护者：`docs/{en,zh}/guide/architecture.md:103` 仍写 "GenRMManager"。
+- [x] 对照 RFC acceptance checks 逐项提供代码、测试或验证证据：见"Phase 7 验收对照"。
+- [x] 完成跨角色、跨模式、多模型、跨节点、PD、恢复及资源清理回归（CPU 部分）。全量 `tests/` `3078 passed, 2 failed, 26 skipped`，2 项失败均为基点既有、与本 RFC 无关（见执行记录）。跨节点/PD/恢复的 CPU 覆盖见验收对照；真实硬件部分归下一项。
+- [ ] 在提供 RAY_ADDRESS、模型、节点拓扑和 GPU 配置后，完成真实 Ray/Router、多节点 follower actor、部分初始化与资源清理验收。未执行：本轮未提供集群端口、模型与节点拓扑，CPU 回归不替代。
+- [x] 提交前运行 pre-commit run --all-files 和相关测试：全仓 pre-commit 通过（首遍 ruff/ruff-format/docformatter 仅改本次文件，第二遍全部 Passed），`git diff --check` 通过。
+
+Phase 7 迁移说明（破坏性变化，HTTP 层无破坏）：
+
+| 旧接口                                                                                                                                    | 新接口 / 做法                                                                                                                                    |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ray.get_actor("relax_genrm_manager")` / `relax_genrm_manager_{key}`                                                                      | 删除。GenRM 生命周期由框架 `scoring_phase` 管理；需要推理走 `/genrm` Gateway                                                                     |
+| `create_genrm_manager(s)(args, pg, runtime_env, inference_manager_handle)`                                                                | `create_genrm_role(args, pg, inference_manager_handle) -> tuple[model_id]`，handle 必填                                                          |
+| `create_managed_opd_teacher_manager(...)`                                                                                                 | `create_managed_opd_teacher(..., inference_manager_handle) -> (tuple[ModelRef], urls)`                                                           |
+| `maybe_start_managed_opd_teacher(args, runtime_env=, inference_manager_handle=None) -> (pg, manager)`                                     | `maybe_start_managed_opd_teacher(args, inference_manager_handle=) -> (pg, tuple[ModelRef])`                                                      |
+| `shutdown_managed_opd_teacher(manager)`                                                                                                   | `shutdown_managed_opd_teacher(owner, teacher_models)`，经 `owner.shutdown_role("teacher")`                                                       |
+| `Service/Actor/TrainRayActor/RayTrainGroup.set_genrm_manager(handles)`、`Service.get_genrm_manager(route_key)`、`GenRM.get_genrm_manager` | `set_genrm_models([ModelRef(Role.GENRM, key)])`；无 getter，按 `(role, model_id)` 经 owner 调用                                                  |
+| `set_teacher_manager(manager)`                                                                                                            | `set_teacher_models(tuple[ModelRef])`                                                                                                            |
+| `has_managed_opd_teacher_manager(owner)`                                                                                                  | `has_managed_opd_teacher(owner)`（读 `teacher_models`）                                                                                          |
+| 按模型的门面 `.onload/.offload/.get_urls/...remote()`                                                                                     | `owner.lifecycle.remote(role, model_id, method)` / `owner.call.remote(role, model_id, method)`；训练侧用 `lifecycle_refs(owner, models, method)` |
+| `InferenceGateway(role, snapshot_provider=/role_manager_handle=/discovery_url=)`                                                          | `InferenceGateway(role, manager_handle=owner)`，必填                                                                                             |
+| `TaskInferenceManager.register_role/register_external_role/sync_role_snapshot`                                                            | 删除；所有角色的 pool 由 owner 在自己进程内创建（`create_role`/`create_rollout_role`）                                                           |
+| `GenRMEngineAdapter/TeacherEngineAdapter/MultiEngineManager/create_model_pool` 可省略 `inference_manager`/`placement_manager_handle`      | 两者必填                                                                                                                                         |
+
+Phase 7 验收对照：
+
+| RFC 验收项                                           | 结果与证据                                                                                                                                                                                                   |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 只有一套公共 Gateway                                 | `InferenceGateway` 单类，按 role 部署；状态源只有 owner handle（`manager_handle` 必填）。`test_gateway.py::test_one_gateway_class_serves_all_roles`、`test_gateway_requires_the_task_owner_handle`           |
+| 只有一套引擎管理                                     | 三角色 pool 都在 `TaskInferenceManager` 进程内，挂同一个 `InferenceManager`；无 per-role Manager/门面 actor。`test_inference_role.py::test_owner_roles_share_one_task_manager`、`test_rollout_owner_pool.py` |
+| 只有一套 SGLang 初始化路径                           | Phase 6：`_finalize_server_args` 共用尾部，`GenRMEngine.init` 覆写已删。`test_server_args_assembly.py`                                                                                                       |
+| 单一 epoch / snapshot / permit                       | owner 采用控制面 manager 的 epoch（本期修复双 epoch）。`test_owner_owns_request_permits_under_the_task_epoch`                                                                                                |
+| 单一 placement 账本、非法布局启动前失败、不删借用 PG | `test_placement.py`、`test_inference_role.py` 账本段、`test_model_pool_real_constructor_with_fake_engines`（关闭后账本清空）、`test_multi_engine_manager.py::test_shutdown_*`                                |
+| 生命周期与阶段切换、释放确认                         | `test_lifecycle.py`、`test_lifecycle_coordination.py`（owner 内 pool）；训练侧 `lifecycle_refs` 到达 pool：`test_training_side_lifecycle_refs_reach_the_pool_through_the_owner`                              |
+| Deferred OPD 等价与发布                              | Phase 5B：`test_deferred_opd*.py`                                                                                                                                                                            |
+| 多模型/多实例                                        | `test_genrm_instances_become_models_on_the_task_owner`、`test_opd_multi_teacher_orchestration.py`、`test_multi_instance_genrm_slices_do_not_collide_in_one_ledger`                                           |
+| 跨节点 follower / PD 投影 / 恢复（CPU）              | `test_pool_recovery_retires_surviving_multinode_followers`、`test_multinode_manager_shutdown_includes_followers`、`test_replica_identity.py`、`test_rollout_inference_pool.py`（PD 折叠）                    |
+| 多节点 GPU、真实 Ray/Router                          | 未执行：未提供集群与硬件配置；不以 mock 替代                                                                                                                                                                 |
 
 验收：
 
@@ -756,4 +788,5 @@ GenRM defer 示例在后处理内执行 Rollout offload → named GenRM onload �
 - 2026-09-23 Phase 6D 副本身份：全仓原本有三套副本命名（config 的 `{model}/group-{i}/replica-{head}`、快照的 `{model}/replica-{rank_offset+head}`、scale-out 失败的 `replica_{idx}`），spec 因此形同虚设。现统一为 discovery 格式并在组创建时冻结。核对过 `replicas_from_slots` 的另一调用方 `model_spec_from_pool`（GenRM/Teacher）默认 `first_slot=0`，行为不变。新增 `tests/distributed/ray/test_replica_identity.py`（9 项：命名格式、跨组连号、placeholder 槽位、多节点单身份、spec 查表、scale-in 后不漂移、scale-out 组命名、超出 spec 的兜底不撞名、fixture 前提）。回归 `tests/distributed/ray` + `tests/engine/inference` + `tests/components` + `tests/core` `811 passed`。
 - 2026-09-23 Phase 6C 发现（留给 Phase 7）：删除 Rollout 侧回退后，`TaskInferenceManager.register_external_role` 在生产代码中已无调用方（仅 `tests/distributed/ray/test_inference_role.py` 与 `test_lifecycle_coordination.py` 使用），external-role 注册路径随 `InferenceRoleManager` 分支一并退役。
 - 2026-09-23 Phase 6C：删除 Rollout 侧两条兼容回退（本地 pool、role-local placement ledger），并修复 6B 引入的两个生产缺陷（rollout 进程缺 `init_http_client`、推理端口同步 `ray.get` 阻塞生成事件循环）。`start_rollout_servers` 失败回滚路径里残留的 `ledger` 变量一并改为参数本身。回归：`tests/distributed/ray` + `tests/core` + `tests/components` `654 passed`。测试调整：`conftest.create_test_manager` 显式注入 ledger；`test_rollout_startup_placement` 的两个兼容路径用例改写为"只用注入的 ledger"与"构造参数必填"；`test_rollout_owner_pool` 补"无 owner 拒绝启动"。真实 Ray/GPU 验收仍未执行。
+- 2026-09-23 Phase 7 清理：按用户确认（彻底删除门面、删除命名 actor、删除全部无 owner 回退）删除 `InferenceRole`/`InferenceRoleManager`/`ModelManagerFacade`/`create_role_managers`、`GenRMManager`/`TeacherManager`、`multi_instance_orchestrator.py`、owner 的 external-host 路径与 legacy permit、Gateway 旧参数、adapter/MEM 的自建 manager 与 role-local planner。GenRM 服务、训练侧（megatron actor）、OPD teacher 与 Controller 改为 owner handle + `ModelRef`。修复一处由此暴露的真实缺陷：`TaskInferenceManager` 自己生成一个 `manager_epoch`，其内部 `InferenceManager` 又生成一个；快照被改写为前者，而 `admit_request` 签发的许可带后者，同一任务对外有两个 epoch（旧测试只走 legacy 许可，未覆盖）。现 owner 直接采用控制面 manager 的 epoch。行为变化：`owner.call` 以 `wait=True` 排队等待模型操作锁，不再返回 `ModelBusyError`（原门面本就对 busy 自动重试，外部可见行为不变）。回归：相关目录 `1932 passed, 1 failed`，全量 `tests/` `3078 passed, 2 failed, 26 skipped`；两项失败 `test_chunked_mtp_loss.py::test_is_training_logging_matches`、`test_identity_window_sampler.py::test_identity_window_sampler_backfills_lagging_dp_dummy_round` 均为既有失败。未处理：`workload.py` 仍延迟 import `rollout._log_eval_rollout_data`（非依赖阻塞项，下沉涉及大量指标函数与测试 monkeypatch，另行处理）；5B 的 `--opd-deferred-scoring` 参数与 teacher/rollout 同 bundle 布局属受保护参数改动，仍待单独确认；真实 Ray/多节点 GPU 验收未执行。
 - 2026-09-22 Phase 5 回归：新增 `tests/engine/inference/test_lifecycle.py`(30)、`test_phase_plans.py`(8)、`test_gateway_cancellation.py`(9)、`tests/distributed/ray/test_lifecycle_coordination.py`(13)、`tests/engine/rollout/test_deferred_opd.py`(19)、`test_deferred_opd_session.py`(8)、`test_deferred_opd_equivalence.py`(5)。`tests/core` 修正一处测试缺陷：`test_controller_s3_cleanup_runs_after_initial_sync_before_service_run` 用 `__new__` 手工装配 Controller，未跟上新增的 `_inference_manager_handle`（生产代码 `__init__` 已初始化，故修测试）。真实 Ray/多节点 GPU 阶段切换验收未执行：未提供集群与硬件配置。

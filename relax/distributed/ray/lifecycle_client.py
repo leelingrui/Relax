@@ -132,6 +132,16 @@ class PhaseClient:
         return self._call("get_activation_group", activation_group)
 
 
+def lifecycle_refs(owner: Any, models: Sequence[Any], method: str) -> list[Any]:
+    """Start ``method`` on each model through the task owner, returning the
+    refs.
+
+    ``models`` are :class:`~relax.engine.inference.types.ModelRef` values; the
+    owner serializes each call with that model's other lifecycle operations.
+    """
+    return [owner.lifecycle.remote(model.role, model.model_id, method) for model in models]
+
+
 def phase_client(owner: Any, *, phases: Sequence[str] | None = None) -> PhaseClient | None:
     """Return a client only when the task sequences the requested phases."""
     if owner is None:
@@ -145,4 +155,4 @@ def phase_client(owner: Any, *, phases: Sequence[str] | None = None) -> PhaseCli
     return client
 
 
-__all__ = ["PhaseClient", "phase_client"]
+__all__ = ["PhaseClient", "lifecycle_refs", "phase_client"]

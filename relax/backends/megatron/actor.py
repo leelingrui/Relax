@@ -29,7 +29,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
-from relax.distributed.ray.lifecycle_client import PHASE_DRAIN_TIMEOUT_S
+from relax.distributed.ray.lifecycle_client import PHASE_DRAIN_TIMEOUT_S, lifecycle_refs
 from relax.distributed.ray.train_actor import TrainRayActor
 from relax.engine.inference.phase_plans import PHASE_GENERATE, PHASE_GENRM, PHASE_TEACHER
 from relax.engine.sft.eval.runner import run_sft_eval
@@ -77,7 +77,7 @@ from relax.utils.opd.opd_utils import (
     append_managed_opd_teacher_offload_handle,
     append_managed_opd_teacher_onload_handle,
     consume_opd_train_data,
-    has_managed_opd_teacher_manager,
+    has_managed_opd_teacher,
 )
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from relax.utils.replay import capture_hooks
@@ -366,7 +366,6 @@ class MegatronTrainRayActor(TrainRayActor):
         # Leaf actor with private args, safe to remap in place.
         prepare_model_maybe_update_args(args)
 
-        self.genrm_manager = None
         self._phase_adopt_seq = 0
         self._phase_release_seq = 0
 
@@ -948,9 +947,9 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                 )
         handles = []
-        if self.genrm_manager is not None and PHASE_GENRM not in coordinated:
-            # A list of one or more GenRM manager handles (one per instance).
-            handles.extend(m.offload.remote() for m in self.genrm_manager)
+        if self.genrm_models and PHASE_GENRM not in coordinated:
+            # One model per GenRM instance, offloaded through the inference owner.
+            handles.extend(lifecycle_refs(self._inference_manager_handle, self.genrm_models, "offload"))
         if PHASE_TEACHER not in coordinated:
             append_managed_opd_teacher_offload_handle(handles, self)
         if handles:
@@ -980,9 +979,7 @@ class MegatronTrainRayActor(TrainRayActor):
     def _needs_inference_release_barrier(self) -> bool:
         """Whether the other ranks must wait for rank 0 to free inference
         memory."""
-        return (
-            self.genrm_manager is not None or has_managed_opd_teacher_manager(self) or bool(self.coordinated_phases())
-        )
+        return bool(self.genrm_models) or has_managed_opd_teacher(self) or bool(self.coordinated_phases())
 
     def train(self, rollout_id: int) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
@@ -2577,12 +2574,12 @@ class MegatronTrainRayActor(TrainRayActor):
             if self._per_step_rollout:
                 post_sync_handles.append(self.rollout_manager.onload_kv.remote())
             if (
-                self.genrm_manager is not None
+                self.genrm_models
                 and PHASE_GENRM not in coordinated_phases
                 and not getattr(self.args, "defer_reward_to_post_process", False)
             ):
-                # A list of one or more GenRM manager handles (one per instance).
-                post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
+                # One model per GenRM instance, onloaded through the inference owner.
+                post_sync_handles.extend(lifecycle_refs(self._inference_manager_handle, self.genrm_models, "onload"))
             if post_sync_handles:
                 ray.get(post_sync_handles)
 

@@ -62,6 +62,10 @@ class TrainRayActor(RayActor):
         # Set by set_inference_manager once the control plane exists.
         self._inference_manager_handle = None
         self._phase_client = None
+        # Colocated static models this actor offloads/onloads in lock-step
+        # with training, through the inference owner.
+        self.genrm_models = ()
+        self.teacher_models = ()
 
         torch.serialization.add_safe_globals([relax.utils.training.eval_config.EvalDatasetConfig])
 
@@ -119,19 +123,18 @@ class TrainRayActor(RayActor):
         # P2P direct sync (_sync_weights_from_seed_engine on RolloutManager).
         self._weight_sync_lock = ray.get(self.rollout_manager.get_weight_sync_lock.remote())
 
-    def set_genrm_manager(self, genrm_manager):
-        """Set the genRM manager for coordinated offload/onload.
+    def set_genrm_models(self, genrm_models):
+        """Set the GenRM models to offload/onload around training.
 
-        In colocated mode, the genRM manager is used to offload genRM engines
-        before training and onload them before rollout, since they share GPU
-        resources.
+        In colocated mode the GenRM engines share GPUs with training, so they
+        are offloaded before training and onloaded before rollout.
         """
-        self.genrm_manager = genrm_manager
+        self.genrm_models = tuple(genrm_models)
 
-    def set_teacher_manager(self, teacher_manager):
-        """Set the managed OPD teacher manager for coordinated
-        offload/onload."""
-        self.teacher_manager = teacher_manager
+    def set_teacher_models(self, teacher_models):
+        """Set the managed OPD teacher models to offload/onload around
+        training."""
+        self.teacher_models = tuple(teacher_models)
 
     def set_inference_manager(self, inference_manager_handle):
         """Attach the task's inference control plane for phase coordination.

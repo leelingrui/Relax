@@ -1,45 +1,17 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Role-manager migration preserves MOPD offsets, URLs and legacy handles."""
+"""MOPD teachers are created on the task owner with prefix-sum offsets."""
 
 import json
-import sys
 from argparse import Namespace
-from types import ModuleType
+
+from conftest import FakeOwnerHandle
 
 
-def _install_fake_teacher_manager(monkeypatch, captured):
+def _install_fake_gateway(monkeypatch):
     from relax.utils.opd import opd_utils
 
-    monkeypatch.setattr(opd_utils, "_deploy_teacher_gateway", lambda managers: "http://gateway/teacher")
-    teacher_manager_module = ModuleType("relax.distributed.ray.inference_role")
-
-    class _RemoteMethod:
-        def __init__(self, name, owner):
-            self.name = name
-            self.owner = owner
-
-        def remote(self, **kwargs):
-            captured["calls"].append((self.owner, self.name))
-            return (self.owner, self.name)
-
-    class _TeacherManagerHandle:
-        def __init__(self, key):
-            self.key = key
-            self.get_urls = _RemoteMethod("get_urls", key)
-            self.offload = _RemoteMethod("offload", key)
-
-    def create_role_managers(args, role, pool_configs, **kwargs):
-        assert role == "teacher"
-        handles = {}
-        for model_id, config in pool_configs.items():
-            key = config["args"][0].teacher_hf_checkpoint
-            captured["ctor_calls"][key] = config["kwargs"]
-            handles[model_id] = _TeacherManagerHandle(key)
-        return handles
-
-    teacher_manager_module.create_role_managers = create_role_managers
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.inference_role", teacher_manager_module)
+    monkeypatch.setattr(opd_utils, "_deploy_teacher_gateway", lambda owner: "http://gateway/teacher")
 
 
 def _base_args(**overrides):
@@ -68,35 +40,45 @@ def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monke
     import ray
 
     from relax.core.service import create_placement_group as _real_create_pg  # noqa: F401
+    from relax.engine.inference.types import ModelRef, Role
     from relax.utils.opd import opd_utils
 
-    captured = {"calls": [], "ctor_calls": {}}
-    _install_fake_teacher_manager(monkeypatch, captured)
+    _install_fake_gateway(monkeypatch)
     monkeypatch.setattr(opd_utils, "is_managed_opd_teacher_colocate", lambda args: True)
     full_pg = ("pg", list(range(16)), list(range(16)))
     monkeypatch.setattr(
         "relax.core.service.create_placement_group",
         lambda **kwargs: full_pg,
     )
-    checkpoint_to_source = {"/ckpt/math": "math", "/ckpt/code": "code"}
-    monkeypatch.setattr(ray, "get", lambda ref: [f"http://{checkpoint_to_source[ref[0]]}/generate"])
+    owner = FakeOwnerHandle(urls={"math": ["http://math"], "code": ["http://code/generate"]})
+    monkeypatch.setattr(ray, "get", lambda ref, **kwargs: ref)
 
     args = _base_args()
     routes_json = json.dumps({"math": "/ckpt/math", "code": "/ckpt/code"})
 
-    shared_pg, managers = opd_utils._start_managed_multi_teacher(args, routes_json)
+    shared_pg, models = opd_utils._start_managed_multi_teacher(args, routes_json, inference_manager_handle=owner)
 
     assert shared_pg == full_pg
-    assert isinstance(managers, list) and len(managers) == 2
+    assert models == (ModelRef(Role.TEACHER, "math"), ModelRef(Role.TEACHER, "code"))
 
-    # TeacherManager adds rollout_num_gpus itself, so these offsets are
-    # relative to the teacher region: math at 0, code at 0+4=4.
-    assert captured["ctor_calls"]["/ckpt/math"]["bundle_offset"] == 0
-    assert captured["ctor_calls"]["/ckpt/code"]["bundle_offset"] == 4
-    assert captured["ctor_calls"]["/ckpt/math"]["num_replicas"] == 1
-    assert captured["ctor_calls"]["/ckpt/math"]["gpus_per_replica"] == 4
-    assert captured["ctor_calls"]["/ckpt/math"]["shared_pg"] is True
-    assert captured["ctor_calls"]["/ckpt/math"]["pg"] == full_pg
+    # The whole layout is validated on the owner's ledger before any teacher
+    # starts, and reserves nothing.
+    ((plan_args, plan_kwargs),) = owner.named("plan_placement")
+    assert plan_kwargs == {"dry_run": True}
+    assert [request.bundle_offset for request in plan_args[0]] == [8, 12]
+
+    ((create_args, _),) = owner.named("create_role")
+    assert create_args[1] == "teacher"
+    ctor = {model_id: config["kwargs"] for model_id, config in create_args[2].items()}
+    assert create_args[2]["math"]["args"][0].teacher_hf_checkpoint == "/ckpt/math"
+    # The adapter adds rollout_num_gpus itself, so these offsets are relative
+    # to the teacher region: math at 0, code at 0+4=4.
+    assert ctor["math"]["bundle_offset"] == 0
+    assert ctor["code"]["bundle_offset"] == 4
+    assert ctor["math"]["num_replicas"] == 1
+    assert ctor["math"]["gpus_per_replica"] == 4
+    assert ctor["math"]["shared_pg"] is True
+    assert ctor["math"]["pg"] == full_pg
 
     assert args.opd_teacher_routes_map == {
         "math": ["http://math/generate"],
@@ -114,7 +96,7 @@ def test_multi_teacher_requires_colocate(monkeypatch):
     routes_json = json.dumps({"math": "/ckpt/math"})
 
     with pytest.raises(ValueError, match="requires colocate mode"):
-        opd_utils._start_managed_multi_teacher(args, routes_json)
+        opd_utils._start_managed_multi_teacher(args, routes_json, inference_manager_handle=FakeOwnerHandle())
 
 
 def test_multi_teacher_rejects_uneven_gpu_split(monkeypatch):
@@ -127,4 +109,4 @@ def test_multi_teacher_rejects_uneven_gpu_split(monkeypatch):
     routes_json = json.dumps({"math": "/ckpt/math", "code": "/ckpt/code"})
 
     with pytest.raises(ValueError, match="evenly divisible"):
-        opd_utils._start_managed_multi_teacher(args, routes_json)
+        opd_utils._start_managed_multi_teacher(args, routes_json, inference_manager_handle=FakeOwnerHandle())

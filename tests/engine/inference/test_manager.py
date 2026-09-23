@@ -166,7 +166,12 @@ def test_multinode_manager_shutdown_includes_followers(monkeypatch):
     from relax.distributed.ray import multi_engine_manager as module
 
     manager = module.MultiEngineManager(
-        SimpleNamespace(), num_slots=4, nodes_per_engine=2, engine_actor_cls=object, skip_init=True
+        SimpleNamespace(),
+        num_slots=4,
+        nodes_per_engine=2,
+        engine_actor_cls=object,
+        skip_init=True,
+        inference_manager=InferenceManager(Role.GENRM),
     )
     engines = [MagicMock() for _ in range(4)]
     manager.all_engines = list(engines)

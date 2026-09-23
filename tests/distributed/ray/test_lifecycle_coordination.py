@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Owner-level phase coordination over externally hosted roles.
+"""Owner-level phase coordination over the engine pools the owner holds.
 
 The interesting property is the handover: entering a scoring phase must close
-generation admission, offload it, *confirm* the release from the host rather
+generation admission, offload it, *confirm* the release from the pool rather
 than from the fact that the call returned, and only then wake the scorer.
 """
 
@@ -15,69 +15,102 @@ import pytest
 from relax.distributed.ray import inference_role as module
 from relax.engine.inference.capabilities import WeightSource
 from relax.engine.inference.lifecycle import ErrorCode, LifecycleError
+from relax.engine.inference.manager import PreparationEvidence
 from relax.engine.inference.phase_plans import PHASE_GENERATE, PHASE_GENRM
 from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementRequest
 from relax.engine.inference.specs import ModelSpec
 from relax.engine.inference.types import (
     LifecycleState,
     ModelRef,
-    ModelSnapshot,
     ReplicaSnapshot,
     Role,
-    RoleSnapshot,
     RoutingSpec,
 )
 
 
 class FakeHost:
-    """A role host that only releases memory when actually asked to.
+    """An engine pool that only releases memory when actually asked to.
 
     ``leak`` models a backend that answers the RPC while keeping the memory;
-    the owner must then refuse to hand the slice on.
+    the owner must then refuse to hand the slice on. The pool publishes its own
+    observation after every lifecycle call, as a real role pool does.
     """
 
-    def __init__(self, role: Role, model_id: str, events: list, *, leak: bool = False, onloaded: bool = True) -> None:
+    def __init__(self, manager, role: Role, model_id: str, events: list, *, leak: bool, onloaded: bool) -> None:
+        self.manager = manager
         self.role = role
         self.model_id = model_id
         self.events = events
         self.leak = leak
         self.onloaded = onloaded
-        self.call = SimpleNamespace(remote=self._call)
-        self.snapshot = SimpleNamespace(remote=self._snapshot)
 
-    def _call(self, model_id, method, *args, **kwargs):
-        assert model_id == self.model_id
-        self.events.append((self.role.value, method))
-        if method == "offload":
-            self.onloaded = bool(self.leak)
-        elif method == "onload":
-            self.onloaded = True
-        elif method == "is_onloaded":
-            return self.onloaded
-        elif method == "set_onloaded":
-            self.onloaded = bool(args[0])
-        return None
+    def health_check(self) -> bool:
+        return True
 
-    def _snapshot(self):
+    def recover(self) -> set[int]:
+        return set()
+
+    def is_onloaded(self) -> bool:
+        return self.onloaded
+
+    def set_onloaded(self, value: bool) -> None:
+        self.onloaded = bool(value)
+
+    def fanout(self, method, *, skip_ranks=None, **kwargs):
+        return []
+
+    def retire(self, ranks) -> None:
+        pass
+
+    def onload(self, tags=None) -> None:
+        self.events.append((self.role.value, "onload"))
+        self.onloaded = True
+        self.publish()
+
+    def offload(self) -> None:
+        self.events.append((self.role.value, "offload"))
+        self.onloaded = bool(self.leak)
+        self.publish()
+
+    def shutdown(self) -> None:
+        self.events.append((self.role.value, "shutdown"))
+
+    def publish(self) -> None:
         state = LifecycleState.READY if self.onloaded else LifecycleState.SLEEPING
-        return RoleSnapshot(
-            role=self.role,
-            manager_epoch="host-epoch",
-            models=(
-                ModelSnapshot(
-                    model_id=self.model_id,
-                    state=state,
-                    admission=state == LifecycleState.READY,
-                    router_url="http://router:1",
-                    replicas=(ReplicaSnapshot(f"{self.model_id}/replica-0", state, "http://engine:1"),),
-                ),
-            ),
-            routing=RoutingSpec(default_model=self.model_id),
+        current = self.manager.snapshot((self.model_id,)).models[0]
+        model = replace(
+            current,
+            state=state,
+            admission=state == LifecycleState.READY,
+            router_url="http://router:1",
+            replicas=(ReplicaSnapshot(f"{self.model_id}/replica-0", state, "http://engine:1"),),
         )
+        if state == LifecycleState.READY:
+            token = self.manager.begin_preparation(self.model_id)
+            self.manager.complete_preparation(token, model, evidence=PreparationEvidence(True, True, True))
+        else:
+            self.manager.publish_model(model)
+
+
+def install_pool(owner, role: Role, model_id: str, events: list, *, leak: bool = False, onloaded: bool = True):
+    """Bind one model's pool into the owner's manager, as ``create_role``
+    does."""
+    manager = owner._control_manager.for_role(role)
+    manager.register_model(
+        ModelSpec(model_id, "checkpoint", weight_source=WeightSource.CHECKPOINT, allow_defer=True),
+        operation_id=f"register:{role.value}:{model_id}",
+    )
+    host = FakeHost(manager, role, model_id, events, leak=leak, onloaded=onloaded)
+    manager.bind_pool(model_id, host)
+    manager.configure_routes(RoutingSpec(default_model=model_id), operation_id=f"routes:{role.value}:startup")
+    module.UnifiedServiceManager(role, inference_manager=manager, pools={model_id: host})
+    owner._role_pools[role] = {model_id: host}
+    host.publish()
+    return host
 
 
 def build_owner(*, leak_generation: bool = False, shared: bool = True):
-    """One owner, two externally hosted roles, optionally on one slice."""
+    """One owner, two roles, optionally on one slice."""
     events: list = []
     owner = module.TaskInferenceManager()
     view = PlacementGroupView(tuple(range(4)), tuple(range(4)), PlacementOwner.CONTROLLER, identity="pg")
@@ -96,21 +129,12 @@ def build_owner(*, leak_generation: bool = False, shared: bool = True):
             ),
             view,
         )
-    hosts = {}
     # The scorer starts asleep, which is what the launch path does under
     # colocate: the deferred stage is what wakes it.
-    for role, model_id, leak, onloaded in (
-        (Role.ROLLOUT, "policy", leak_generation, True),
-        (Role.GENRM, "judge", False, False),
-    ):
-        host = FakeHost(role, model_id, events, leak=leak, onloaded=onloaded)
-        hosts[role] = host
-        owner.register_external_role(
-            role,
-            host,
-            (ModelSpec(model_id, "checkpoint", weight_source=WeightSource.CHECKPOINT, allow_defer=True),),
-            RoutingSpec(default_model=model_id),
-        )
+    hosts = {
+        Role.ROLLOUT: install_pool(owner, Role.ROLLOUT, "policy", events, leak=leak_generation, onloaded=True),
+        Role.GENRM: install_pool(owner, Role.GENRM, "judge", events, onloaded=False),
+    }
     phase_targets = {
         PHASE_GENERATE: (ModelRef(Role.ROLLOUT, "policy"),),
         PHASE_GENRM: (ModelRef(Role.GENRM, "judge"),),
@@ -215,10 +239,8 @@ def test_owner_rejects_an_untokened_activation_once_the_coordinator_exists():
         owner.activate((ModelRef(Role.GENRM, "judge"),), operation_id="sneaky")
 
 
-def test_owner_refuses_a_managed_transition_for_an_unregistered_legacy_host():
+def test_owner_refuses_a_managed_transition_for_an_unregistered_role():
     owner = module.TaskInferenceManager()
-    host = SimpleNamespace(snapshot=SimpleNamespace(remote=lambda: RoleSnapshot(Role.TEACHER, "epoch")))
-    owner.register_role(Role.TEACHER, host)
     result = owner.drain((ModelRef(Role.TEACHER, "default"),), operation_id="drain-1")
     assert not result.succeeded
     assert result.error.code is ErrorCode.UNSUPPORTED
@@ -302,3 +324,52 @@ def test_owner_snapshot_keeps_the_task_epoch_after_a_phase_switch():
     assert snapshot.models[0].state == LifecycleState.SLEEPING
     assert not snapshot.models[0].admission
     assert replace(snapshot, models=()) == replace(owner.snapshot(role=Role.ROLLOUT), models=())
+
+
+def _handle(owner):
+    """Expose an in-process owner through the ``.remote`` surface callers
+    use."""
+    return SimpleNamespace(lifecycle=SimpleNamespace(remote=owner.lifecycle))
+
+
+def test_training_side_lifecycle_refs_reach_the_pool_through_the_owner():
+    """Training offloads/onloads colocated static models by ``ModelRef``, with
+    no per-model actor in between."""
+    from relax.distributed.ray.lifecycle_client import lifecycle_refs
+
+    owner, hosts, events, _phase_targets = build_owner()
+    events.clear()
+
+    lifecycle_refs(_handle(owner), (ModelRef(Role.GENRM, "judge"),), "onload")
+    assert hosts[Role.GENRM].onloaded is True
+    lifecycle_refs(_handle(owner), (ModelRef(Role.GENRM, "judge"),), "offload")
+    assert hosts[Role.GENRM].onloaded is False
+    assert events == [("genrm", "onload"), ("genrm", "offload")]
+    assert lifecycle_refs(_handle(owner), (), "offload") == []
+
+
+def test_colocated_teacher_handles_are_owner_lifecycle_calls():
+    from relax.utils.opd.opd_utils import (
+        append_managed_opd_teacher_offload_handle,
+        append_managed_opd_teacher_onload_handle,
+        has_managed_opd_teacher,
+    )
+
+    calls = []
+    owner = SimpleNamespace(lifecycle=SimpleNamespace(remote=lambda *args: calls.append(args) or args))
+    actor = SimpleNamespace(teacher_models=(), _inference_manager_handle=owner)
+    handles: list = []
+    append_managed_opd_teacher_offload_handle(handles, actor)
+    assert not has_managed_opd_teacher(actor) and handles == [] and calls == []
+
+    actor.teacher_models = (ModelRef(Role.TEACHER, "math"), ModelRef(Role.TEACHER, "code"))
+    append_managed_opd_teacher_offload_handle(handles, actor)
+    append_managed_opd_teacher_onload_handle(handles, actor)
+    assert has_managed_opd_teacher(actor)
+    assert calls == [
+        (Role.TEACHER, "math", "offload"),
+        (Role.TEACHER, "code", "offload"),
+        (Role.TEACHER, "math", "onload"),
+        (Role.TEACHER, "code", "onload"),
+    ]
+    assert handles == calls

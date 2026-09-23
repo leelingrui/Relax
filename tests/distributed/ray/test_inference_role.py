@@ -1,29 +1,22 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU-only role ownership and compatibility forwarding tests."""
+"""CPU-only tests for the task owner's role pools, dispatch and shutdown."""
 
-import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from threading import Barrier, Event
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
 from relax.distributed.ray import inference_role as module
 from relax.engine.inference.capabilities import WeightSource
-from relax.engine.inference.manager import InferenceManager, ModelBusyError
+from relax.engine.inference.manager import InferenceManager, PreparationEvidence
 from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementRequest
 from relax.engine.inference.specs import ModelSpec
-from relax.engine.inference.types import (
-    LifecycleState,
-    ModelSnapshot,
-    ReplicaSnapshot,
-    Role,
-    RoleSnapshot,
-    RoutingSpec,
-)
+from relax.engine.inference.types import LifecycleState, ReplicaSnapshot, Role
 
 
 @pytest.fixture
@@ -75,193 +68,237 @@ def _configs() -> dict[str, dict[str, Any]]:
     return {key: {"args": (key,), "kwargs": {"bundle_offset": index}} for index, key in enumerate(("a", "b"))}
 
 
+def _create(role: Role = Role.TEACHER, configs: dict | None = None) -> module.TaskInferenceManager:
+    owner = module.TaskInferenceManager()
+    owner.create_role(SimpleNamespace(), role, _configs() if configs is None else configs)
+    return owner
+
+
+def _manager(owner: module.TaskInferenceManager, role: Role = Role.TEACHER) -> InferenceManager:
+    return owner._control_manager.for_role(role)
+
+
+def _publish_ready(owner: module.TaskInferenceManager, role: Role, model_id: str) -> None:
+    manager = _manager(owner, role)
+    current = manager.snapshot((model_id,)).models[0]
+    model = replace(
+        current,
+        state=LifecycleState.READY,
+        admission=True,
+        router_url="http://router:1",
+        replicas=(ReplicaSnapshot(f"{model_id}/replica-0", LifecycleState.READY, "http://engine:1"),),
+    )
+    token = manager.begin_preparation(model_id)
+    manager.complete_preparation(token, model, evidence=PreparationEvidence(True, True, True))
+
+
 @pytest.mark.parametrize("role", [Role.GENRM, Role.TEACHER])
-def test_role_registers_all_models_before_initialization(pools: SimpleNamespace, role: Role) -> None:
+def test_owner_create_role_registers_all_models_before_initialization(pools: SimpleNamespace, role: Role) -> None:
     configs = _configs()
-    owner = module.InferenceRole(role, configs)
-    assert owner.ready() is True
+    owner = module.TaskInferenceManager()
+    assert owner.create_role(SimpleNamespace(), role, configs) == ("a", "b")
+    assert owner.ready(role=role) is True
     assert pools.events == [("construct", "a"), ("construct", "b"), ("initialize", "a"), ("initialize", "b")]
-    assert pools.instances["a"].manager is pools.instances["b"].manager is owner.inference_manager
+    assert pools.instances["a"].manager.role is pools.instances["b"].manager.role is role
+    assert pools.instances["a"].manager.manager_epoch == owner._control_manager.manager_epoch
     assert pools.instances["b"].value == "b"
-    assert pools.instances["b"].kwargs == {"bundle_offset": 1}
+    # Every pool records its slices in the owner's one ledger.
+    assert pools.instances["b"].kwargs == {"bundle_offset": 1, "placement_manager_handle": owner._placement_planner}
     assert configs == _configs()
-    assert owner.snapshot() is owner.inference_manager.snapshot()
-    assert owner.snapshot().routing.default_model is None
-    assert [model.model_id for model in owner.snapshot(["b"]).models] == ["b"]
-    assert all(not model.admission for model in owner.snapshot().models)
+    snapshot = owner.snapshot(role=role)
+    assert snapshot.manager_epoch == owner.manager_epoch
+    assert snapshot.routing.default_model is None
+    assert all(not model.admission for model in snapshot.models)
     assert [call.args for call in pools.factory.call_args_list] == [(role, "a"), (role, "b")]
+    assert owner.role_models(role) == ("a", "b")
+    assert owner.registered_roles() == (role.value,)
+    assert owner.get_operation(f"routes:{role.value}:startup").kind == "routes"
 
 
-def test_role_single_model_has_default_route(pools: SimpleNamespace) -> None:
-    owner = module.InferenceRole("teacher", {"a": _configs()["a"]})
-    assert owner.snapshot().routing.default_model == "a"
+def test_owner_create_role_is_idempotent(pools: SimpleNamespace) -> None:
+    owner = _create()
+    assert owner.create_role(SimpleNamespace(), Role.TEACHER, _configs()) == ("a", "b")
+    assert pools.factory.call_count == 2
 
 
-def test_role_compatibility_views_can_share_task_manager(pools: SimpleNamespace) -> None:
-    manager = InferenceManager()
-    teacher = module.InferenceRole("teacher", {"teacher": _configs()["a"]}, inference_manager=manager)
-    genrm = module.InferenceRole("genrm", {"genrm": _configs()["b"]}, inference_manager=manager)
+def test_owner_single_model_has_default_route(pools: SimpleNamespace) -> None:
+    owner = _create(configs={"a": _configs()["a"]})
+    assert owner.snapshot(role=Role.TEACHER).routing.default_model == "a"
 
-    assert teacher.inference_manager.manager_epoch == manager.manager_epoch
-    assert genrm.inference_manager.manager_epoch == manager.manager_epoch
-    assert manager.snapshot(role=Role.TEACHER).models[0].model_id == "teacher"
-    assert manager.snapshot(role=Role.GENRM).models[0].model_id == "genrm"
+
+def test_owner_roles_share_one_task_manager(pools: SimpleNamespace) -> None:
+    owner = module.TaskInferenceManager()
+    owner.create_role(SimpleNamespace(), Role.TEACHER, {"teacher": _configs()["a"]})
+    owner.create_role(SimpleNamespace(), Role.GENRM, {"genrm": _configs()["b"]})
+
+    assert pools.instances["teacher"].manager.manager_epoch == pools.instances["genrm"].manager.manager_epoch
+    assert owner.snapshot(role=Role.TEACHER).models[0].model_id == "teacher"
+    assert owner.snapshot(role=Role.GENRM).models[0].model_id == "genrm"
+    assert owner.snapshot(role=Role.TEACHER).manager_epoch == owner.snapshot(role=Role.GENRM).manager_epoch
 
 
 @pytest.mark.parametrize("failing_model", ["a", "b"])
-def test_role_initialization_failure_cleans_even_uninitialized_pools(
+def test_owner_initialization_failure_cleans_even_uninitialized_pools(
     pools: SimpleNamespace, failing_model: str
 ) -> None:
     pools.fail_init = failing_model
     pools.fail_shutdown = "b"
+    owner = module.TaskInferenceManager()
     with pytest.raises(RuntimeError, match="initialize failed"):
-        module.InferenceRole("genrm", _configs())
+        owner.create_role(SimpleNamespace(), Role.GENRM, _configs())
     assert pools.events[-3:] == [("shutdown", "b"), ("shutdown", "a"), ("routers", "shutdown")]
     pools.router_cleanup.assert_called_once_with()
+    assert owner.registered_roles() == ()
 
 
-def test_role_constructor_failure_cleans_previously_constructed_pools(pools: SimpleNamespace) -> None:
+def test_owner_constructor_failure_cleans_previously_constructed_pools(pools: SimpleNamespace) -> None:
     pools.fail_construct = "b"
     with pytest.raises(RuntimeError, match="constructor failed"):
-        module.InferenceRole("teacher", _configs())
+        _create()
     assert pools.events == [("construct", "a"), ("shutdown", "a"), ("routers", "shutdown")]
 
 
+def test_owner_constructor_error_survives_router_cleanup_failure(pools: SimpleNamespace) -> None:
+    pools.fail_construct = "a"
+    pools.router_cleanup.side_effect = RuntimeError("router cleanup failed")
+    with pytest.raises(RuntimeError, match="constructor failed"):
+        _create()
+    pools.router_cleanup.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "configs",
+    [
+        {},
+        {"a": {"args": (), "kwargs": {"defer_init": False}}},
+        {"a": {"args": (), "kwargs": {"placement_manager_handle": object()}}},
+        {"a": {"args": "a"}},
+        {"a": {"args": (), "unknown": 1}},
+    ],
+)
+def test_owner_rejects_invalid_config_before_constructing(pools: SimpleNamespace, configs: dict) -> None:
+    with pytest.raises(ValueError):
+        _create(configs=configs)
+    assert pools.events == []
+
+
+def test_owner_rejects_rollout_pool_before_construction(pools: SimpleNamespace) -> None:
+    with pytest.raises(ValueError, match="Unsupported inference pool role"):
+        _create(Role.ROLLOUT)
+    assert pools.events == []
+
+
 @pytest.mark.parametrize("method", sorted(module._POOL_METHODS))
-def test_role_dispatch_preserves_arguments_and_return_value(pools: SimpleNamespace, method: str) -> None:
-    owner = module.InferenceRole("genrm", _configs())
+def test_owner_call_preserves_arguments_and_return_value(pools: SimpleNamespace, method: str) -> None:
+    owner = _create(Role.GENRM)
     result = ([object()], object(), 2)
     implementation = MagicMock(return_value=result)
     setattr(pools.instances["b"], method, implementation)
-    assert owner.call("b", method, 7, model_id="legacy-alias", tags=["weights"]) is result
-    implementation.assert_called_once_with(7, model_id="legacy-alias", tags=["weights"])
+    assert owner.call(Role.GENRM, "b", method, 7, model_id="alias", tags=["weights"]) is result
+    implementation.assert_called_once_with(7, model_id="alias", tags=["weights"])
 
 
-def test_role_dispatch_rejects_private_methods_and_unknown_models(pools: SimpleNamespace) -> None:
-    owner = module.InferenceRole("teacher", _configs())
+def test_owner_call_rejects_private_methods_unknown_models_and_roles(pools: SimpleNamespace) -> None:
+    owner = _create()
     for method in ("initialize", "_init_engines", "__dict__", "snapshot"):
         with pytest.raises(ValueError, match="Unsupported pool method"):
-            owner.call("a", method)
+            owner.call(Role.TEACHER, "a", method)
     with pytest.raises(KeyError, match="Unknown model"):
-        owner.call("missing", "health_check")
-    owner.shutdown()
-    assert owner.ready() is False
-    with pytest.raises(RuntimeError, match="shut down"):
-        owner.call("a", "recover")
+        owner.call(Role.TEACHER, "missing", "health_check")
+    with pytest.raises(RuntimeError, match="not registered"):
+        owner.call(Role.GENRM, "a", "health_check")
+    with pytest.raises(RuntimeError, match="not registered"):
+        owner.snapshot(role=Role.GENRM)
+    assert owner.ready(role=Role.GENRM) is False
+    owner.shutdown_role(Role.TEACHER)
+    assert owner.ready(role=Role.TEACHER) is False
+    with pytest.raises(RuntimeError, match="not registered"):
+        owner.call(Role.TEACHER, "a", "recover")
 
 
-def test_role_shutdown_attempts_all_pools_on_error(pools: SimpleNamespace) -> None:
-    owner = module.InferenceRole("teacher", _configs())
+def test_owner_lifecycle_accepts_only_lifecycle_methods(pools: SimpleNamespace) -> None:
+    owner = _create()
+    pools.instances["a"].onload = MagicMock(return_value="onloaded")
+    assert owner.lifecycle(Role.TEACHER, "a", "onload") == "onloaded"
+    with pytest.raises(ValueError, match="Unsupported lifecycle method"):
+        owner.lifecycle(Role.TEACHER, "a", "get_urls")
+
+
+def test_owner_shutdown_attempts_all_pools_on_error(pools: SimpleNamespace) -> None:
+    owner = _create()
     pools.fail_shutdown = "b"
     with pytest.raises(RuntimeError, match="one or more"):
-        owner.shutdown()
+        owner.shutdown_role(Role.TEACHER)
     assert pools.events[-3:] == [("shutdown", "b"), ("shutdown", "a"), ("routers", "shutdown")]
-    assert owner.ready() is False
+    assert owner.ready(role=Role.TEACHER) is False
 
 
-@pytest.mark.parametrize("method", sorted(module._POOL_METHODS))
-def test_role_facade_forwards_explicit_methods(pools: SimpleNamespace, method: str) -> None:
-    owner = module.InferenceRole("genrm", _configs())
-    result = ([object()], object(), 3)
-    implementation = MagicMock(return_value=result)
-    setattr(pools.instances["a"], method, implementation)
-    remote = AsyncMock(side_effect=owner.call)
-    facade = module.ModelManagerFacade(SimpleNamespace(call=SimpleNamespace(remote=remote)), "a")
-    actual = asyncio.run(getattr(facade, method)(model_id="a", flag=True))
-    assert actual is result
-    remote.assert_awaited_once_with("a", method, model_id="a", flag=True)
-    implementation.assert_called_once_with(model_id="a", flag=True)
+def test_owner_shutdown_all_closes_every_role(pools: SimpleNamespace) -> None:
+    owner = module.TaskInferenceManager()
+    owner.create_role(SimpleNamespace(), Role.TEACHER, {"teacher": _configs()["a"]})
+    owner.create_role(SimpleNamespace(), Role.GENRM, {"genrm": _configs()["b"]})
+    owner.shutdown_all()
+    assert ("shutdown", "teacher") in pools.events and ("shutdown", "genrm") in pools.events
+    assert owner.registered_roles() == ()
 
 
-def test_role_facade_propagates_failure() -> None:
-    remote = AsyncMock(side_effect=RuntimeError("pool failed"))
-    facade = module.ModelManagerFacade(SimpleNamespace(call=SimpleNamespace(remote=remote)), "a")
-    with pytest.raises(RuntimeError, match="pool failed"):
-        asyncio.run(facade.onload())
-
-
-def test_role_facade_is_onloaded_reads_current_pool_state(pools: SimpleNamespace) -> None:
-    owner = module.InferenceRole("teacher", _configs())
-    implementation = MagicMock(side_effect=[True, False, True])
-    pools.instances["a"].is_onloaded = implementation
-    remote = AsyncMock(side_effect=owner.call)
-    facade = module.ModelManagerFacade(SimpleNamespace(call=SimpleNamespace(remote=remote)), "a")
-
-    for expected in (True, False, True):
-        assert asyncio.run(facade.is_onloaded()) is expected
-    assert implementation.call_count == 3
-    implementation.assert_called_with()
-    remote.assert_awaited_with("a", "is_onloaded")
-
-
-def test_role_model_shutdown_keeps_other_model_routers(pools: SimpleNamespace) -> None:
-    owner = module.InferenceRole("teacher", _configs())
-    owner.call("a", "shutdown")
+def test_owner_model_shutdown_keeps_other_model_routers(pools: SimpleNamespace) -> None:
+    owner = _create()
+    owner.call(Role.TEACHER, "a", "shutdown")
     pools.router_cleanup.assert_not_called()
-    assert owner.ready() is True
+    assert owner.ready(role=Role.TEACHER) is True
     assert pools.events[-1] == ("shutdown", "a")
-    owner.shutdown()
+    owner.shutdown_role(Role.TEACHER)
     pools.router_cleanup.assert_called_once_with()
     assert pools.events.count(("shutdown", "a")) == 1
 
 
-def test_role_last_model_shutdown_stops_routers_once(pools: SimpleNamespace) -> None:
-    owner = module.InferenceRole("teacher", _configs())
-    owner.call("a", "shutdown")
-    owner.call("a", "shutdown")
+def test_owner_last_model_shutdown_stops_routers_once(pools: SimpleNamespace) -> None:
+    owner = _create()
+    owner.call(Role.TEACHER, "a", "shutdown")
+    owner.call(Role.TEACHER, "a", "shutdown")
     pools.router_cleanup.assert_not_called()
-    owner.call("b", "shutdown")
-    assert set(owner.inference_manager._closed_models) == {"a", "b"}
-    assert owner.ready() is False
-    owner.call("b", "shutdown")
-    owner.shutdown()
+    owner.call(Role.TEACHER, "b", "shutdown")
+    assert set(_manager(owner)._closed_models) == {"a", "b"}
+    assert owner.ready(role=Role.TEACHER) is False
+    owner.call(Role.TEACHER, "b", "shutdown")
+    with pytest.raises(RuntimeError, match="shut down"):
+        owner.call(Role.TEACHER, "a", "onload")
+    owner.shutdown_role(Role.TEACHER)
     pools.router_cleanup.assert_called_once_with()
     assert pools.events.count(("shutdown", "a")) == 1
     assert pools.events.count(("shutdown", "b")) == 1
-    with pytest.raises(RuntimeError, match="shut down"):
-        owner.call("a", "onload")
 
 
-def test_role_failed_model_shutdown_blocks_revival_but_allows_retry(pools: SimpleNamespace) -> None:
-    owner = module.InferenceRole("teacher", _configs())
+def test_owner_failed_model_shutdown_blocks_revival_but_allows_retry(pools: SimpleNamespace) -> None:
+    owner = _create()
     pools.fail_shutdown = "a"
     with pytest.raises(RuntimeError, match="shutdown failed"):
-        owner.call("a", "shutdown")
-    assert "a" not in owner.inference_manager._closed_models
+        owner.call(Role.TEACHER, "a", "shutdown")
+    assert "a" not in _manager(owner)._closed_models
     with pytest.raises(RuntimeError, match="closing"):
-        owner.call("a", "recover")
-    owner.call("b", "shutdown")
+        owner.call(Role.TEACHER, "a", "recover")
+    owner.call(Role.TEACHER, "b", "shutdown")
     pools.router_cleanup.assert_not_called()
     pools.fail_shutdown = None
-    owner.call("a", "shutdown")
+    owner.call(Role.TEACHER, "a", "shutdown")
     pools.router_cleanup.assert_called_once_with()
 
 
-def test_role_last_model_shutdown_retries_failed_router_cleanup(pools: SimpleNamespace) -> None:
-    owner = module.InferenceRole("teacher", {"a": _configs()["a"]})
+def test_owner_last_model_shutdown_retries_failed_router_cleanup(pools: SimpleNamespace) -> None:
+    owner = _create(configs={"a": _configs()["a"]})
     pools.router_cleanup.side_effect = RuntimeError("router cleanup failed")
     with pytest.raises(RuntimeError, match="router cleanup failed"):
-        owner.call("a", "shutdown")
-    assert owner.ready() is False
+        owner.call(Role.TEACHER, "a", "shutdown")
+    assert owner.ready(role=Role.TEACHER) is False
     pools.router_cleanup.side_effect = None
-    owner.call("a", "shutdown")
+    owner.call(Role.TEACHER, "a", "shutdown")
     assert pools.router_cleanup.call_count == 2
     assert pools.events.count(("shutdown", "a")) == 1
 
 
-def test_role_concurrency_groups_reserve_snapshot_and_shutdown_workers() -> None:
-    groups = module.InferenceRoleManager.__ray_metadata__.concurrency_groups
-    assert groups["snapshot"] == 1
-    assert groups["pool"] > 1
-    assert groups["control"] == 1
-    assert module.InferenceRole.snapshot.__ray_concurrency_group__ == "snapshot"
-    assert module.InferenceRole.ready.__ray_concurrency_group__ == "snapshot"
-    assert module.InferenceRole.call.__ray_concurrency_group__ == "pool"
-    assert module.InferenceRole.shutdown.__ray_concurrency_group__ == "control"
-
-
-def test_role_same_pool_calls_serialize_without_blocking_snapshot_or_other_pool(pools: SimpleNamespace) -> None:
-    owner = module.InferenceRole("teacher", _configs())
+def test_owner_same_pool_calls_serialize_without_blocking_snapshot_or_other_pool(pools: SimpleNamespace) -> None:
+    owner = _create()
     entered, release, queued, second_entered = Event(), Event(), Event(), Event()
 
     def onload() -> str:
@@ -275,55 +312,45 @@ def test_role_same_pool_calls_serialize_without_blocking_snapshot_or_other_pool(
 
     def queued_call() -> Any:
         queued.set()
-        return owner.call("a", "offload")
+        return owner.call(Role.TEACHER, "a", "offload")
 
     pools.instances["a"].onload = onload
     pools.instances["a"].offload = offload
     pools.instances["b"].health_check = lambda: True
     with ThreadPoolExecutor(max_workers=4) as executor:
-        first = executor.submit(owner.call, "a", "onload")
+        first = executor.submit(owner.call, Role.TEACHER, "a", "onload")
         try:
             assert entered.wait(2)
             second = executor.submit(queued_call)
             assert queued.wait(2)
-            assert executor.submit(owner.snapshot).result(timeout=2) is owner.inference_manager.snapshot()
-            assert executor.submit(owner.call, "b", "health_check").result(timeout=2) is True
-            with pytest.raises(ModelBusyError):
-                second.result(timeout=2)
-            assert not second_entered.is_set()
+            snapshot = executor.submit(owner.snapshot, role=Role.TEACHER).result(timeout=2)
+            assert [model.model_id for model in snapshot.models] == ["a", "b"]
+            assert executor.submit(owner.call, Role.TEACHER, "b", "health_check").result(timeout=2) is True
+            # The owner waits for the model's operation lock instead of
+            # rejecting: the queued call runs only once the first one ends.
+            assert not second_entered.wait(0.05)
         finally:
             release.set()
         assert first.result(timeout=2) == "onloaded"
-        assert owner.call("a", "offload") == "offloaded"
+        assert second.result(timeout=2) == "offloaded"
 
 
-def test_local_call_wait_preserves_synchronous_pool_semantics(pools: SimpleNamespace) -> None:
-    owner = module.InferenceRole("teacher", {"a": _configs()["a"]})
-    entered, release, finished = Event(), Event(), Event()
-
-    def onload() -> str:
-        entered.set()
-        assert release.wait(5)
-        finished.set()
-        return "onloaded"
-
-    pools.instances["a"].onload = onload
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        active = executor.submit(owner.call, "a", "onload")
-        assert entered.wait(2)
-        waiting = executor.submit(owner.call_wait, "a", "onload")
-        assert not finished.wait(0.05)
-        release.set()
-        assert active.result(timeout=2) == "onloaded"
-        assert waiting.result(timeout=2) == "onloaded"
+def test_unified_service_manager_call_wait_rejects_non_pool_methods(pools: SimpleNamespace) -> None:
+    owner = _create(configs={"a": _configs()["a"]})
+    host = module.UnifiedServiceManager.__new__(module.UnifiedServiceManager)
+    host.inference_manager = _manager(owner)
+    pools.instances["a"].health_check = lambda: True
+    assert host.call_wait("a", "health_check") is True
+    with pytest.raises(ValueError, match="Unsupported pool method"):
+        host.call_wait("a", "initialize")
 
 
-def test_role_shutdown_waits_for_calls_and_rejects_new_operations(
+def test_owner_shutdown_waits_for_calls_and_rejects_new_operations(
     pools: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    owner = module.InferenceRole("teacher", _configs())
+    owner = _create()
     entered, release, cleanup_entered = Event(), Event(), Event()
-    cleanup = owner.inference_manager._close_pool
+    cleanup = owner._control_manager._close_pool
 
     def onload() -> None:
         entered.set()
@@ -335,17 +362,17 @@ def test_role_shutdown_waits_for_calls_and_rejects_new_operations(
         return cleanup(*args, **kwargs)
 
     pools.instances["a"].onload = onload
-    monkeypatch.setattr(owner.inference_manager, "_close_pool", shutdown_cleanup)
+    monkeypatch.setattr(owner._control_manager, "_close_pool", shutdown_cleanup)
     with ThreadPoolExecutor(max_workers=4) as executor:
-        active = executor.submit(owner.call, "a", "onload")
+        active = executor.submit(owner.call, Role.TEACHER, "a", "onload")
         try:
             assert entered.wait(2)
-            closing = executor.submit(owner.shutdown)
+            closing = executor.submit(owner.shutdown_role, Role.TEACHER)
             assert cleanup_entered.wait(2)
-            assert owner.ready() is False
-            assert executor.submit(owner.snapshot).result(timeout=2) is owner.inference_manager.snapshot()
+            assert owner.ready(role=Role.TEACHER) is False
+            assert executor.submit(owner.snapshot, role=Role.TEACHER).result(timeout=2).manager_epoch
             with pytest.raises(RuntimeError, match="shut down"):
-                executor.submit(owner.call, "b", "recover").result(timeout=2)
+                executor.submit(owner.call, Role.TEACHER, "b", "recover").result(timeout=2)
             pools.router_cleanup.assert_not_called()
             assert ("shutdown", "a") not in pools.events
         finally:
@@ -356,8 +383,8 @@ def test_role_shutdown_waits_for_calls_and_rejects_new_operations(
     assert pools.events[-1] == ("routers", "shutdown")
 
 
-def test_role_concurrent_model_shutdown_cleans_routers_once(pools: SimpleNamespace) -> None:
-    owner = module.InferenceRole("teacher", _configs())
+def test_owner_concurrent_model_shutdown_cleans_routers_once(pools: SimpleNamespace) -> None:
+    owner = _create()
     barrier = Barrier(2, timeout=5)
 
     def shutdown(model_id: str) -> str:
@@ -368,24 +395,24 @@ def test_role_concurrent_model_shutdown_cleans_routers_once(pools: SimpleNamespa
     pools.instances["a"].shutdown = lambda: shutdown("a")
     pools.instances["b"].shutdown = lambda: shutdown("b")
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(owner.call, "a", "shutdown")
-        second = executor.submit(owner.call, "b", "shutdown")
+        first = executor.submit(owner.call, Role.TEACHER, "a", "shutdown")
+        second = executor.submit(owner.call, Role.TEACHER, "b", "shutdown")
         assert first.result(timeout=6) == "a"
         assert second.result(timeout=6) == "b"
-    assert owner.ready() is False
+    assert owner.ready(role=Role.TEACHER) is False
     assert pools.events[-1] == ("routers", "shutdown")
     pools.router_cleanup.assert_called_once_with()
-    assert owner.call("a", "shutdown") == "a"
-    owner.shutdown()
+    assert owner.call(Role.TEACHER, "a", "shutdown") == "a"
+    owner.shutdown_role(Role.TEACHER)
     pools.router_cleanup.assert_called_once_with()
 
 
-def test_role_concurrent_role_and_model_shutdown_do_not_double_close(
+def test_owner_concurrent_role_and_model_shutdown_do_not_double_close(
     pools: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    owner = module.InferenceRole("teacher", {"a": _configs()["a"]})
+    owner = _create(configs={"a": _configs()["a"]})
     entered, release, cleanup_entered = Event(), Event(), Event()
-    cleanup = owner.inference_manager._close_pool
+    cleanup = owner._control_manager._close_pool
 
     def shutdown_pool() -> None:
         entered.set()
@@ -397,12 +424,12 @@ def test_role_concurrent_role_and_model_shutdown_do_not_double_close(
         return cleanup(*args, **kwargs)
 
     pools.instances["a"].shutdown = shutdown_pool
-    monkeypatch.setattr(owner.inference_manager, "_close_pool", shutdown_cleanup)
+    monkeypatch.setattr(owner._control_manager, "_close_pool", shutdown_cleanup)
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(owner.call, "a", "shutdown")
+        first = executor.submit(owner.call, Role.TEACHER, "a", "shutdown")
         try:
             assert entered.wait(2)
-            second = executor.submit(owner.shutdown)
+            second = executor.submit(owner.shutdown_role, Role.TEACHER)
             assert cleanup_entered.wait(2)
             pools.router_cleanup.assert_not_called()
         finally:
@@ -413,259 +440,24 @@ def test_role_concurrent_role_and_model_shutdown_do_not_double_close(
     pools.router_cleanup.assert_called_once_with()
 
 
-def test_role_facade_exposes_full_authoritative_snapshot(pools: SimpleNamespace) -> None:
-    owner = module.InferenceRole("teacher", _configs())
-    remote = AsyncMock(side_effect=owner.snapshot)
-    facade = module.ModelManagerFacade(SimpleNamespace(snapshot=SimpleNamespace(remote=remote)), "a")
-    snapshot = asyncio.run(facade.get_role_snapshot())
-    assert snapshot is owner.inference_manager.snapshot()
-    assert [model.model_id for model in snapshot.models] == ["a", "b"]
-    remote.assert_awaited_once_with()
+def test_owner_owns_request_permits_under_the_task_epoch(pools: SimpleNamespace) -> None:
+    owner = _create(configs={"model": _configs()["a"]})
+    _publish_ready(owner, Role.TEACHER, "model")
 
+    permit = owner.admit_request("model", request_id="request", role=Role.TEACHER, target="http://router")
 
-def test_role_constructor_error_survives_router_cleanup_failure(pools: SimpleNamespace) -> None:
-    pools.fail_construct = "a"
-    pools.router_cleanup.side_effect = RuntimeError("router cleanup failed")
-    with pytest.raises(RuntimeError, match="constructor failed"):
-        module.InferenceRole("teacher", _configs())
-    pools.router_cleanup.assert_called_once_with()
-
-
-@pytest.fixture
-def actors(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    owner = MagicMock()
-    owner.ready.remote.return_value = True
-    facades = [MagicMock(), MagicMock()]
-    for facade in facades:
-        facade.ready.remote.return_value = True
-    role_cls, facade_cls = MagicMock(), MagicMock()
-    role_cls.options.return_value.remote.return_value = owner
-    facade_cls.options.return_value.remote.side_effect = facades
-    monkeypatch.setattr(module, "InferenceRoleManager", role_cls)
-    monkeypatch.setattr(module, "InferenceManagerFacade", facade_cls)
-    get = MagicMock(side_effect=lambda refs, **kwargs: refs)
-    kill = MagicMock()
-    monkeypatch.setattr(module.ray, "get", get)
-    monkeypatch.setattr(module.ray, "kill", kill)
-    return SimpleNamespace(owner=owner, facades=facades, role_cls=role_cls, facade_cls=facade_cls, get=get, kill=kill)
-
-
-def test_role_factory_creates_one_cpu_owner_and_named_facades(actors: SimpleNamespace) -> None:
-    runtime_env = {"env_vars": {"TEST_ROLE": "1"}}
-    names = {"a": "legacy-a", "b": "legacy-b"}
-    result = module.create_role_managers(SimpleNamespace(), "genrm", _configs(), runtime_env, names)
-    assert result == dict(zip(("a", "b"), actors.facades, strict=True))
-    actors.role_cls.options.assert_called_once_with(num_cpus=1, num_gpus=0, runtime_env=runtime_env)
-    actors.role_cls.options.return_value.remote.assert_called_once_with(Role.GENRM, _configs())
-    assert actors.facade_cls.options.call_count == 2
-    for index, model_id in enumerate(("a", "b")):
-        assert actors.facade_cls.options.call_args_list[index].kwargs == {
-            "num_cpus": 0,
-            "num_gpus": 0,
-            "runtime_env": runtime_env,
-            "name": names[model_id],
-        }
-        assert actors.facade_cls.options.return_value.remote.call_args_list[index].args == (actors.owner, model_id)
-        actors.facades[index].ready.remote.assert_called_once_with()
-    actors.owner.ready.remote.assert_called_once_with()
-    assert actors.get.call_args_list[0].args == (True,)
-    actors.kill.assert_not_called()
-
-
-@pytest.mark.parametrize("failure", ["owner", "spawn", "facade_ready"])
-def test_role_factory_failure_cleans_owner_and_created_facades(actors: SimpleNamespace, failure: str) -> None:
-    if failure == "owner":
-        actors.owner.ready.remote.return_value = False
-    elif failure == "spawn":
-        actors.facade_cls.options.return_value.remote.side_effect = [actors.facades[0], RuntimeError("spawn failed")]
-    else:
-        actors.facades[1].ready.remote.return_value = False
-    with pytest.raises(RuntimeError):
-        module.create_role_managers(SimpleNamespace(), "teacher", _configs())
-    actors.owner.shutdown.remote.assert_called_once_with()
-    actors.kill.assert_any_call(actors.owner, no_restart=True)
-    expected_count = {"owner": 1, "spawn": 2, "facade_ready": 3}[failure]
-    assert actors.kill.call_count == expected_count
-
-
-@pytest.mark.parametrize(
-    "configs,names",
-    [
-        ({}, None),
-        (_configs(), {"missing": "name"}),
-        (_configs(), {"a": "same", "b": "same"}),
-        ({"a": {"args": (), "kwargs": {"defer_init": False}}}, None),
-    ],
-)
-def test_role_factory_rejects_invalid_config_before_spawning(
-    actors: SimpleNamespace, configs: dict, names: dict | None
-) -> None:
-    with pytest.raises(ValueError):
-        module.create_role_managers(SimpleNamespace(), "teacher", configs, actor_names=names)
-    actors.role_cls.options.assert_not_called()
-
-
-def test_role_rejects_rollout_pool_before_construction(pools: SimpleNamespace) -> None:
-    with pytest.raises(ValueError, match="Unsupported inference pool role"):
-        module.InferenceRole("rollout", _configs())
-    assert pools.events == []
-
-
-def test_task_manager_normalizes_snapshots_and_owns_request_permits() -> None:
-    snapshot = RoleSnapshot(
-        role=Role.ROLLOUT,
-        manager_epoch="role-local-epoch",
-        models=(
-            ModelSnapshot(
-                model_id="model",
-                state=LifecycleState.READY,
-                admission=True,
-                replicas=(ReplicaSnapshot("replica", LifecycleState.READY, "http://router"),),
-            ),
-        ),
-        routing=RoutingSpec(default_model="model", route_key_to_model=(("model", "model"),)),
-    )
-    host = SimpleNamespace(snapshot=SimpleNamespace(remote=MagicMock(return_value=snapshot)))
-    owner = module.TaskInferenceManager()
-    owner.register_role(Role.ROLLOUT, host)
-
-    normalized = owner.snapshot(role=Role.ROLLOUT)
-    permit = owner.admit_request("model", request_id="request", role=Role.ROLLOUT, target="http://router")
-
-    assert normalized.manager_epoch == owner.manager_epoch
+    assert owner.snapshot(role=Role.TEACHER).manager_epoch == owner.manager_epoch
     assert permit.manager_epoch == owner.manager_epoch
     assert owner.get_request("request") == permit
     owner.complete_request(permit)
     assert owner.get_request("request") is None
 
 
-def test_task_manager_registers_external_role_before_host_binding() -> None:
-    snapshot = RoleSnapshot(
-        role=Role.ROLLOUT,
-        manager_epoch="backend-epoch",
-        models=(ModelSnapshot(model_id="model"),),
-        routing=RoutingSpec(default_model="model"),
-    )
-    host = SimpleNamespace(snapshot=SimpleNamespace(remote=MagicMock(return_value=snapshot)))
-    owner = module.TaskInferenceManager()
-
-    owner.register_external_role(
-        Role.ROLLOUT,
-        None,
-        (module.ModelConfig("model", "checkpoint", weight_source=WeightSource.CHECKPOINT),),
-        RoutingSpec(default_model="model"),
-    )
-    owner.register_role(Role.ROLLOUT, host)
-
-    normalized = owner.snapshot(role=Role.ROLLOUT)
-    assert normalized.manager_epoch == owner.manager_epoch
-    assert normalized.routing.default_model == "model"
-    assert owner.get_operation("register:rollout:model").kind == "register"
-
-
-def test_task_manager_external_snapshot_uses_owner_routes() -> None:
-    observed = RoleSnapshot(
-        role=Role.ROLLOUT,
-        manager_epoch="backend-epoch",
-        models=(ModelSnapshot(model_id="model"),),
-        routing=RoutingSpec(default_model="backend-default"),
-    )
-    host = SimpleNamespace(snapshot=SimpleNamespace(remote=MagicMock(return_value=observed)))
-    owner = module.TaskInferenceManager()
-    owner.register_external_role(
-        Role.ROLLOUT,
-        None,
-        (module.ModelConfig("model", "checkpoint", weight_source=WeightSource.CHECKPOINT),),
-        RoutingSpec(default_model="model"),
-    )
-    owner.register_role(Role.ROLLOUT, host)
-
-    assert owner.snapshot(role=Role.ROLLOUT).routing.default_model == "model"
-
-
-def test_task_manager_records_external_lifecycle_operation() -> None:
-    snapshot = RoleSnapshot(
-        role=Role.ROLLOUT,
-        manager_epoch="backend-epoch",
-        models=(ModelSnapshot(model_id="model"),),
-        routing=RoutingSpec(default_model="model"),
-    )
-    host = SimpleNamespace(
-        snapshot=SimpleNamespace(remote=MagicMock(return_value=snapshot)),
-        call=SimpleNamespace(remote=MagicMock(return_value="healthy")),
-    )
-    owner = module.TaskInferenceManager()
-    owner.register_external_role(
-        Role.ROLLOUT,
-        host,
-        (module.ModelConfig("model", "checkpoint", weight_source=WeightSource.CHECKPOINT),),
-        RoutingSpec(default_model="model"),
-    )
-
-    assert owner.lifecycle(Role.ROLLOUT, "model", "health_check") is True
-    operation = next(item for item in owner._operations.values() if item.kind == "health_check")
-    assert operation.status == "completed"
-    assert operation.result is True
-
-
-def test_external_pool_runtime_preserves_partial_restore_skip_ranks() -> None:
-    host = SimpleNamespace(call=SimpleNamespace(remote=MagicMock(return_value=[])))
-    runtime = module._ExternalPoolRuntime(host, "model")
-
-    assert runtime.fanout("resume_memory_occupation", skip_ranks={1, 3}, tags=["weights"]) == []
-    host.call.remote.assert_called_once_with("model", "resume_memory_occupation", skip_ranks={1, 3}, tags=["weights"])
-
-
-def test_task_manager_shutdown_external_role_uses_owner_pool_shutdown() -> None:
-    snapshot = RoleSnapshot(
-        role=Role.ROLLOUT,
-        manager_epoch="backend-epoch",
-        models=(ModelSnapshot(model_id="model"),),
-        routing=RoutingSpec(default_model="model"),
-    )
-    host = SimpleNamespace(snapshot=SimpleNamespace(remote=MagicMock(return_value=snapshot)))
-    owner = module.TaskInferenceManager()
-    owner.register_external_role(
-        Role.ROLLOUT,
-        host,
-        (module.ModelConfig("model", "checkpoint", weight_source=WeightSource.CHECKPOINT),),
-        RoutingSpec(default_model="model"),
-    )
-
-    owner.shutdown_role(Role.ROLLOUT)
-    assert Role.ROLLOUT not in owner._external_roles
-
-
-def test_task_manager_publishes_external_ready_snapshot_after_preparation() -> None:
-    snapshot = RoleSnapshot(
-        role=Role.ROLLOUT,
-        manager_epoch="backend-epoch",
-        models=(
-            ModelSnapshot(
-                model_id="model",
-                replicas=(ReplicaSnapshot("model/replica-0", LifecycleState.READY, "http://engine"),),
-                router_url="http://router",
-                state=LifecycleState.READY,
-                admission=True,
-            ),
-        ),
-        routing=RoutingSpec(default_model="backend-default"),
-    )
-    host = SimpleNamespace(snapshot=SimpleNamespace(remote=MagicMock(return_value=snapshot)))
-    owner = module.TaskInferenceManager()
-    owner.register_external_role(
-        Role.ROLLOUT,
-        host,
-        (module.ModelConfig("model", "checkpoint", weight_source=WeightSource.CHECKPOINT),),
-        RoutingSpec(default_model="model"),
-    )
-
-    published = owner.snapshot(role=Role.ROLLOUT)
-    model = published.models[0]
-    assert model.state is LifecycleState.READY
-    assert model.admission is True
-    assert model.router_url == "http://router"
-    assert published.routing.default_model == "model"
+def test_owner_refuses_a_request_for_a_model_that_is_not_ready(pools: SimpleNamespace) -> None:
+    owner = _create(configs={"model": _configs()["a"]})
+    with pytest.raises(RuntimeError, match="not ready"):
+        owner.admit_request("model", request_id="request", role=Role.TEACHER)
+    assert owner.get_request("request") is None
 
 
 # ---------------------------------------------------------------------------

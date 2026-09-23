@@ -74,7 +74,7 @@ def test_real_pool_dispatch_can_publish_ready_after_onload(monkeypatch) -> None:
     backend._memory_ready = False
     pool = ModelPool.from_backend(backend, inference_manager=manager, model_id="model")
     host = UnifiedServiceManager(Role.TEACHER, inference_manager=manager, pools={"model": pool})
-    host.call("model", "onload")
+    host.call_wait("model", "onload")
     assert host.snapshot().models[0].admission
-    host.call("model", "offload")
+    host.call_wait("model", "offload")
     assert not host.snapshot().models[0].admission
