@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -157,12 +158,32 @@ def test_model_handle_forwards_calls_through_manager() -> None:
     assert calls == [((Role.TEACHER, "default", "onload"), {"tags": ["kv_cache"]})]
 
 
-def test_manager_switch_keeps_scorers_mutually_exclusive() -> None:
-    import threading
+def _shared(**roles: FakePool) -> tuple[InferenceManager, dict[str, FakePool]]:
+    """Rollout, GenRM and Teacher on the same GPUs, each in its own phase."""
+    from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementRequest
 
-    judge, teacher = FakePool("judge"), FakePool("teacher")
-    manager = _manager(genrm={"judge": judge}, teacher={"teacher": teacher})
-    manager.switch([Role.GENRM, Role.TEACHER], [], timeout=0.01)
+    pools = {"rollout": FakePool("policy", version="1"), "genrm": FakePool("judge"), "teacher": FakePool("teacher")}
+    pools.update(roles)
+    manager = _manager(**{role: {pool.model_spec.name: pool} for role, pool in pools.items()})
+    view = PlacementGroupView((0, 1), (0, 1), PlacementOwner.CONTROLLER, identity="shared")
+    phases = {"rollout": "inference", "genrm": "genrm", "teacher": "teacher"}
+    for role, pool in pools.items():
+        request = PlacementRequest(f"{role}/{pool.model_spec.name}/group-0", "regular", 2, 1, 2, phases[role], 0)
+        manager.plan_placement([request], view)
+    manager.switch([Role.ROLLOUT, Role.GENRM, Role.TEACHER], [], timeout=0.01)
+    return manager, pools
+
+
+def _start(target, *args) -> threading.Thread:
+    thread = threading.Thread(target=target, args=args)
+    thread.start()
+    thread.join(0.1)
+    return thread
+
+
+def test_manager_switch_keeps_scorers_mutually_exclusive() -> None:
+    manager, pools = _shared()
+    judge, teacher = pools["genrm"], pools["teacher"]
     both_ready = []
 
     def onload(pool, tags=None):
@@ -172,11 +193,9 @@ def test_manager_switch_keeps_scorers_mutually_exclusive() -> None:
     judge.onload = lambda tags=None: onload(judge)
     teacher.onload = lambda tags=None: onload(teacher)
 
-    manager.switch([], [Role.GENRM], timeout=0.01)
+    manager.switch([Role.ROLLOUT], [Role.GENRM], timeout=0.01)
     assert manager.snapshot(Role.TEACHER).phase == "genrm"
-    waiter = threading.Thread(target=manager.switch, args=([], [Role.TEACHER], 5.0))
-    waiter.start()
-    waiter.join(0.1)
+    waiter = _start(manager.switch, [Role.ROLLOUT], [Role.TEACHER], 5.0)
     # The teacher waits while GenRM holds the shared GPUs.
     assert waiter.is_alive() and not teacher.onloaded
     manager.switch([Role.GENRM], [], timeout=0.01)
@@ -188,25 +207,36 @@ def test_manager_switch_keeps_scorers_mutually_exclusive() -> None:
 
 
 def test_manager_switch_times_out_while_another_scorer_holds_the_gpus() -> None:
-    manager = _manager(genrm={"judge": FakePool("judge")}, teacher={"teacher": FakePool("teacher")})
-    manager.switch([Role.TEACHER], [Role.GENRM], timeout=0.01)
+    manager, _ = _shared()
+    manager.switch([], [Role.GENRM], timeout=0.01)
     with pytest.raises(TimeoutError, match="genrm"):
         manager.switch([], [Role.TEACHER], timeout=0.01)
     manager.switch([Role.GENRM], [Role.TEACHER], timeout=0.01)
     assert manager.snapshot(Role.TEACHER).models[0].state == LifecycleState.READY
 
 
+def test_manager_switch_rejects_activating_two_conflicting_roles() -> None:
+    manager, _ = _shared()
+    with pytest.raises(ValueError, match="cannot be active together"):
+        manager.switch([], [Role.GENRM, Role.TEACHER], timeout=0.01)
+
+
+def test_manager_switch_reactivates_the_resident_scorer() -> None:
+    manager, pools = _shared()
+    manager.switch([], [Role.GENRM], timeout=0.01)
+    manager.switch([], [Role.GENRM], timeout=0.01)
+    assert pools["genrm"].calls == ["offload", "onload", "onload"]
+
+
 def test_manager_switch_releases_the_gpus_when_a_scorer_fails_to_load() -> None:
-    judge, teacher = FakePool("judge"), FakePool("teacher")
-    manager = _manager(genrm={"judge": judge}, teacher={"teacher": teacher})
-    manager.switch([Role.GENRM, Role.TEACHER], [], timeout=0.01)
-    judge.onload = lambda tags=None: (_ for _ in ()).throw(RuntimeError("OOM"))
+    manager, pools = _shared()
+    pools["genrm"].onload = lambda tags=None: (_ for _ in ()).throw(RuntimeError("OOM"))
 
     with pytest.raises(RuntimeError, match="OOM"):
         manager.switch([], [Role.GENRM], timeout=0.01)
 
     manager.switch([], [Role.TEACHER], timeout=0.01)
-    assert teacher.onloaded
+    assert pools["teacher"].onloaded
 
 
 def test_manager_snapshot_reports_the_generation_phase_without_a_scorer() -> None:
@@ -232,29 +262,63 @@ def test_manager_topology_revision_bumps_when_a_replica_restarts_in_place() -> N
     assert manager.snapshot(Role.GENRM).topology_revision == revision + 1
 
 
-def test_manager_onload_outside_a_switch_waits_for_the_scorer() -> None:
-    import threading
-
-    judge, teacher, policy = FakePool("judge"), FakePool("teacher"), FakePool("policy", version="1")
-    manager = _manager(genrm={"judge": judge}, teacher={"teacher": teacher}, rollout={"policy": policy})
-    manager.switch([Role.ROLLOUT, Role.TEACHER], [Role.GENRM], timeout=0.01)
-    # The scorer that holds the GPUs may still reload itself.
+def test_manager_direct_onload_blocks_a_conflicting_switch() -> None:
+    manager, pools = _shared()
     manager.onload(Role.GENRM, "judge")
 
-    waiters = [
-        threading.Thread(target=manager.onload, args=(Role.ROLLOUT, "policy")),
-        threading.Thread(target=manager.onload, args=(Role.TEACHER, "teacher")),
-    ]
-    for waiter in waiters:
-        waiter.start()
-    for waiter in waiters:
-        waiter.join(0.1)
-    # A weight sync or a teacher following training waits for the release.
-    assert all(waiter.is_alive() for waiter in waiters)
-    assert not policy.onloaded and not teacher.onloaded
+    with pytest.raises(TimeoutError, match="genrm"):
+        manager.switch([], [Role.TEACHER], timeout=0.01)
+    assert not pools["teacher"].onloaded
+
+
+def test_manager_direct_offload_releases_the_gpus() -> None:
+    manager, pools = _shared()
+    manager.switch([], [Role.GENRM], timeout=0.01)
+    waiter = _start(manager.switch, [], [Role.TEACHER], 5.0)
+    assert waiter.is_alive()
+
+    # Training offloads the scorer directly, not through a switch.
+    manager.offload(Role.GENRM, "judge")
+    waiter.join(5.0)
+
+    assert not waiter.is_alive() and pools["teacher"].onloaded
+    assert manager.snapshot(Role.GENRM).phase == "teacher"
+
+
+def test_manager_recover_waits_for_a_conflicting_role() -> None:
+    manager, pools = _shared()
+    recovered = []
+    pools["teacher"].recover = lambda: recovered.append(True)
+    manager.switch([], [Role.GENRM], timeout=0.01)
+
+    waiter = _start(manager.recover, Role.TEACHER, "teacher")
+    assert waiter.is_alive() and not recovered
+    manager.switch([Role.GENRM], [], timeout=0.01)
+    waiter.join(5.0)
+
+    assert not waiter.is_alive() and recovered
+
+
+def test_manager_onload_outside_a_switch_waits_for_the_scorer() -> None:
+    manager, pools = _shared()
+    manager.switch([], [Role.GENRM], timeout=0.01)
+    # The role that holds the GPUs may still reload itself.
+    manager.onload(Role.GENRM, "judge")
+
+    # A weight sync waits for the release.
+    waiter = _start(manager.onload, Role.ROLLOUT, "policy")
+    assert waiter.is_alive() and not pools["rollout"].onloaded
 
     manager.switch([Role.GENRM], [], timeout=0.01)
-    for waiter in waiters:
-        waiter.join(5.0)
-    assert not any(waiter.is_alive() for waiter in waiters)
-    assert policy.onloaded and teacher.onloaded and not judge.onloaded
+    waiter.join(5.0)
+    assert not waiter.is_alive() and pools["rollout"].onloaded
+    assert manager.snapshot(Role.ROLLOUT).phase == "inference"
+
+
+def test_manager_split_roles_load_without_waiting() -> None:
+    judge, policy = FakePool("judge"), FakePool("policy", version="1")
+    manager = _manager(genrm={"judge": judge}, rollout={"policy": policy})
+    manager.offload(Role.ROLLOUT, "policy")
+    manager.onload(Role.GENRM, "judge")
+    manager.onload(Role.ROLLOUT, "policy")
+    assert judge.onloaded and policy.onloaded

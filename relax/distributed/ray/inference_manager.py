@@ -17,7 +17,8 @@ model and is the only writer of the published snapshots.
 
 import asyncio
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from threading import Condition, RLock, get_ident
@@ -29,12 +30,7 @@ import ray
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.engine.inference.config import ModelConfig, validate_routes
 from relax.engine.inference.discovery import new_manager_epoch
-from relax.engine.inference.phase_plans import (
-    PHASE_GENERATE,
-    PHASE_GENRM,
-    PHASE_TEACHER,
-    reject_shared_co_resident,
-)
+from relax.engine.inference.phase_plans import PHASE_GENERATE, reject_shared_co_resident
 from relax.engine.inference.placement import PlacementGroupView, PlacementPlanner, PlacementRequest, PlacementSlice
 from relax.engine.inference.types import LifecycleState, ModelSnapshot, Role, RoleSnapshot, RoutingSpec
 from relax.utils.logging_utils import get_logger
@@ -49,9 +45,11 @@ SWITCH_DRAIN_TIMEOUT_S = 600.0
 
 _LIFECYCLE_METHODS = frozenset({"onload", "offload", "recover", "health_check", "shutdown"})
 _QUERY_METHODS = frozenset({"get_urls", "get_engine_hosts_ports"})
-# The phase a scorer role holds the shared GPUs in; without a holder the GPUs
-# belong to generation.
-_SCORER_PHASES = {Role.GENRM: PHASE_GENRM, Role.TEACHER: PHASE_TEACHER}
+# States in which a model holds no GPU memory.
+_RELEASED = (LifecycleState.SLEEPING, LifecycleState.DEAD)
+# A waiting load re-checks residency this often, for releases it is not told
+# about (an engine the health monitor found dead).
+_GPU_WAIT_POLL_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -103,13 +101,12 @@ class InferenceManager:
         self._revision: dict[Role, int] = {}
         self._inflight: dict[str, tuple[Role, str]] = {}
         self._rollout_pool: Any = None
-        # Switches and onloads outside a switch run one at a time, owned by the
-        # thread running them; a scorer that holds the shared GPUs keeps them
-        # until a switch deactivates it. A separate lock, because a waiting
-        # switch must not block admission or request completion.
-        self._switch_done = Condition()
+        # Loads (switch, onload, recover) run one at a time, owned by the
+        # thread running them, and only once no conflicting role is resident.
+        # A separate lock, because a waiting load must not block admission or
+        # request completion.
+        self._gpus_changed = Condition()
         self._gpu_owner: int | None = None
-        self._scorer: Role | None = None
 
     # ------------------------------------------------------------------
     # Registration and discovery.
@@ -155,7 +152,7 @@ class InferenceManager:
                 role=role,
                 manager_epoch=self.manager_epoch,
                 topology_revision=self._revision[role],
-                phase=_SCORER_PHASES[self._scorer] if self._scorer is not None else PHASE_GENERATE,
+                phase=self._current_phase(),
                 models=tuple(model.snapshot for model in self._models[role].values()),
                 routing=self._routing[role],
             )
@@ -278,49 +275,44 @@ class InferenceManager:
         return getattr(self._model(role, model_id).pool, method)(*args, **kwargs)
 
     def onload(self, role: Role | str, model_id: str, tags: list[str] | None = None) -> None:
-        """Load a model's memory.
-
-        Outside a switch -- a weight sync, or a teacher following training --
-        it waits while another scorer holds the shared GPUs.
-        """
+        """Load a model's memory once no conflicting role holds its GPUs."""
         role = Role(role)
-        if self._gpu_owner == get_ident():
-            self._onload(role, model_id, tags)
-            return
-        self._acquire_gpus(lambda: self._scorer in (None, role), SWITCH_DRAIN_TIMEOUT_S)
-        try:
-            self._onload(role, model_id, tags)
-        finally:
-            self._release_gpus()
-
-    def _onload(self, role: Role, model_id: str, tags: list[str] | None) -> None:
-        entry = self._model(role, model_id)
-        with entry.lock:
-            self.set_state(role, model_id, LifecycleState.ONLOADING)
-            try:
-                entry.pool.onload(tags)
-            finally:
-                self._observe(Role(role), model_id)
+        with self._loading([role]):
+            entry = self._model(role, model_id)
+            with entry.lock:
+                self.set_state(role, model_id, LifecycleState.ONLOADING)
+                try:
+                    entry.pool.onload(tags)
+                finally:
+                    self._observe(role, model_id)
 
     def offload(self, role: Role | str, model_id: str) -> None:
         entry = self._model(role, model_id)
-        with entry.lock:
-            self.set_state(role, model_id, LifecycleState.DRAINING)
-            try:
-                entry.pool.offload()
-            except Exception:
-                self.set_state(role, model_id, LifecycleState.DEAD)
-                raise
-            self.set_state(role, model_id, LifecycleState.SLEEPING)
+        try:
+            with entry.lock:
+                self.set_state(role, model_id, LifecycleState.DRAINING)
+                try:
+                    entry.pool.offload()
+                except Exception:
+                    self.set_state(role, model_id, LifecycleState.DEAD)
+                    raise
+                self.set_state(role, model_id, LifecycleState.SLEEPING)
+        finally:
+            # A load waiting for these GPUs re-checks now.
+            self._notify_gpus_changed()
 
     def recover(self, role: Role | str, model_id: str) -> None:
-        entry = self._model(role, model_id)
-        with entry.lock:
-            self.set_state(role, model_id, LifecycleState.STARTING)
-            try:
-                entry.pool.recover()
-            finally:
-                self._observe(Role(role), model_id)
+        """Restart dead engines; they allocate memory, so this waits like a
+        load."""
+        role = Role(role)
+        with self._loading([role]):
+            entry = self._model(role, model_id)
+            with entry.lock:
+                self.set_state(role, model_id, LifecycleState.STARTING)
+                try:
+                    entry.pool.recover()
+                finally:
+                    self._observe(role, model_id)
 
     def health_check(self, role: Role | str, model_id: str) -> bool:
         entry = self._model(role, model_id)
@@ -338,6 +330,7 @@ class InferenceManager:
             finally:
                 # Stopping engines reports a topology change; the model stays DEAD.
                 self.set_state(role, model_id, LifecycleState.DEAD)
+        self._notify_gpus_changed()
 
     def switch(
         self,
@@ -349,60 +342,113 @@ class InferenceManager:
 
         The outgoing roles stop admitting, finish their requests and release
         their memory before any incoming role is loaded, so two roles never
-        hold the same GPUs at once. Switches run one at a time, and a scorer
-        activated here holds the GPUs until a later switch deactivates it: a
-        switch that would load another role meanwhile waits for that release.
-        Every step is idempotent.
+        hold the same GPUs at once. Like every load it runs alone, and waits
+        while a role outside ``deactivate`` that conflicts with an incoming one
+        is resident. Every step is idempotent.
         """
         deactivate = [Role(role) for role in deactivate]
         activate = [Role(role) for role in activate]
-        scorers = [role for role in activate if role in _SCORER_PHASES]
-        if len(scorers) > 1:
-            raise ValueError(f"Scorer roles cannot share GPUs: {[role.value for role in scorers]}")
-        self._acquire_gpus(
-            lambda: not activate or self._scorer is None or self._scorer in deactivate,
-            timeout,
-        )
-        try:
+        clashing = [
+            (a.value, b.value) for i, a in enumerate(activate) for b in activate[i + 1 :] if self._conflict(a, b)
+        ]
+        if clashing:
+            raise ValueError(f"Roles that share GPUs cannot be active together: {clashing}")
+        with self._loading(activate, released=deactivate, timeout=timeout):
             self.drain(deactivate, timeout)
             for role in deactivate:
                 self._deactivate(role)
-            with self._switch_done:
-                if self._scorer in deactivate:
-                    self._scorer = None
-                if scorers:
-                    self._scorer = scorers[0]
             try:
                 for role in activate:
                     self._activate(role)
             except Exception:
-                # A scorer that failed to load gives the GPUs back, or keeps
-                # holding them when even that fails.
-                for role in scorers:
-                    self._deactivate(role)
-                with self._switch_done:
-                    self._scorer = None
+                # An incoming role that failed to load gives its GPUs back.
+                for role in activate:
+                    try:
+                        self._deactivate(role)
+                    except Exception as exc:
+                        logger.warning(f"Failed to release {role.value} after a failed switch: {exc}")
                 raise
-        finally:
-            self._release_gpus()
 
-    def _acquire_gpus(self, may_load: Callable[[], bool], timeout: float) -> None:
-        """Take the shared GPUs once no other switch or onload runs and
-        ``may_load`` holds."""
+    @contextmanager
+    def _loading(
+        self, roles: Sequence[Role], *, released: Sequence[Role] = (), timeout: float = SWITCH_DRAIN_TIMEOUT_S
+    ) -> Iterator[None]:
+        """Own the GPUs while ``roles`` load.
+
+        Waits until no other load runs and no role that conflicts with
+        ``roles`` is resident, apart from ``released``, which the caller frees
+        first. A load nested in the owning thread runs directly.
+        """
+        if self._gpu_owner == get_ident():
+            yield
+            return
         deadline = time.monotonic() + timeout
-        with self._switch_done:
-            while self._gpu_owner is not None or not may_load():
+        with self._gpus_changed:
+            while True:
+                blockers = self._blockers(roles, released)
+                if self._gpu_owner is None and not blockers:
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    holder = self._scorer.value if self._scorer is not None else "another switch or onload"
-                    raise TimeoutError(f"Shared inference GPUs still held by {holder} after {timeout}s")
-                self._switch_done.wait(remaining)
+                    holders = [role.value for role in blockers] or ["another load"]
+                    raise TimeoutError(
+                        f"GPUs for {[role.value for role in roles]} still held by {holders} after {timeout}s"
+                    )
+                self._gpus_changed.wait(min(remaining, _GPU_WAIT_POLL_S))
             self._gpu_owner = get_ident()
+        try:
+            yield
+        finally:
+            with self._gpus_changed:
+                self._gpu_owner = None
+                self._gpus_changed.notify_all()
 
-    def _release_gpus(self) -> None:
-        with self._switch_done:
-            self._gpu_owner = None
-            self._switch_done.notify_all()
+    def _notify_gpus_changed(self) -> None:
+        with self._gpus_changed:
+            self._gpus_changed.notify_all()
+
+    def _slices(self, role: Role) -> tuple[PlacementSlice, ...]:
+        prefix = f"{role.value}/"
+        return tuple(item for item in self.placement.allocations() if item.group_id.startswith(prefix))
+
+    def _conflict(self, role: Role, other: Role) -> bool:
+        """Whether two roles are placed on the same GPUs in different phases,
+        so they may only take turns."""
+        return role is not other and any(
+            mine.placement_group_key == theirs.placement_group_key
+            and mine.phase != theirs.phase
+            and mine.reserved_offset < theirs.reserved_offset + theirs.reserved_size
+            and theirs.reserved_offset < mine.reserved_offset + mine.reserved_size
+            for mine in self._slices(role)
+            for theirs in self._slices(other)
+        )
+
+    def _resident(self, role: Role) -> bool:
+        with self._lock:
+            models = tuple(self._models.get(role, {}).values())
+        return any(model.snapshot.state not in _RELEASED for model in models)
+
+    def _blockers(self, roles: Sequence[Role], released: Sequence[Role]) -> list[Role]:
+        with self._lock:
+            registered = tuple(self._models)
+        return [
+            other
+            for other in registered
+            if other not in released
+            and other not in roles
+            and any(self._conflict(role, other) for role in roles)
+            and self._resident(other)
+        ]
+
+    def _current_phase(self) -> str:
+        """The phase of the resident role placed outside generation, if any."""
+        with self._lock:
+            registered = tuple(self._models)
+        for role in registered:
+            phases = {item.phase for item in self._slices(role)} - {PHASE_GENERATE}
+            if phases and self._resident(role):
+                return phases.pop()
+        return PHASE_GENERATE
 
     def _deactivate(self, role: Role) -> None:
         if role is Role.ROLLOUT and self._rollout_pool is not None:
