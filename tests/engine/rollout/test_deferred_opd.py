@@ -310,3 +310,16 @@ def test_batches_are_scored_one_at_a_time():
     run(main())
     assert peak == 1
     assert all(executor._records[f"op-{index}"].snapshot.state is DeferredState.COMPLETED for index in range(2))
+
+
+def test_deferred_opd_active_for_agentic_rollout_on_shared_teacher():
+    from relax.engine.rollout.deferred_opd import deferred_opd_active
+
+    shared = build_args(
+        use_agentic_rollout=True,
+        rollout_num_gpus=8,
+        resource={"teacher": [1, 8], "actor": [1, 8], "rollout": [1, 8]},
+    )
+    split = build_args(use_agentic_rollout=True, rollout_num_gpus=4)
+    assert deferred_opd_active(shared)
+    assert not deferred_opd_active(split)

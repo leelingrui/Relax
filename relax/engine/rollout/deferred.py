@@ -62,11 +62,19 @@ class SampleRef:
     prompt_length: int
     route_key: str | None = None
     has_multimodal: bool = False
+    # Set when ``sample_index`` is not unique in the batch, e.g. the several
+    # exports of one Agentic Session that keep their training index.
+    scoring_id: Any = None
 
     @property
     def eligible(self) -> bool:
         """An empty response has nothing to score and no fields to validate."""
         return self.response_length > 0
+
+    @property
+    def identity(self) -> Any:
+        """The key results are correlated against within the batch."""
+        return self.sample_index if self.scoring_id is None else self.scoring_id
 
 
 @dataclass(frozen=True)
@@ -145,16 +153,18 @@ def validate_scored_batch(batch_ref: BatchRef, samples: Sequence[Sample]) -> tup
     missing: list[Any] = []
     if len(samples) != len(batch_ref.samples):
         problems.append(f"batch size changed: sealed {len(batch_ref.samples)}, scored {len(samples)}")
-        return tuple(ref.sample_index for ref in batch_ref.samples), problems
+        return tuple(ref.identity for ref in batch_ref.samples), problems
 
     seen: set[Any] = set()
+    seen_objects: set[int] = set()
     for ref, sample in zip(batch_ref.samples, samples, strict=True):
-        identity = ref.sample_index
-        if identity in seen:
+        identity = ref.identity
+        if identity in seen or id(sample) in seen_objects:
             problems.append(f"sample {identity} appears twice in the scored batch")
             missing.append(identity)
             continue
         seen.add(identity)
+        seen_objects.add(id(sample))
         if sample.index != ref.sample_index:
             problems.append(f"sample order changed: sealed {ref.sample_index}, scored {sample.index}")
             missing.append(identity)
@@ -196,11 +206,18 @@ def seal_batch(
     rollout_id: int,
     required_fields: Sequence[str],
     policy_version: str | None = None,
+    scoring_ids: Sequence[Any] | None = None,
 ) -> BatchRef:
-    """Seal what the scorer must produce for this batch."""
+    """Seal what the scorer must produce for this batch.
+
+    ``scoring_ids`` replaces ``sample.index`` as the per-batch identity when
+    several samples legitimately share a training index.
+    """
+    if scoring_ids is not None and (len(scoring_ids) != len(samples) or len(set(scoring_ids)) != len(scoring_ids)):
+        raise ValueError(f"Batch {batch_id} needs one unique scoring ID per sample")
     route_key_field = getattr(args, "opd_teacher_key", None) or "data_source"
     refs = []
-    for sample in samples:
+    for position, sample in enumerate(samples):
         metadata = getattr(sample, "metadata", None) or {}
         multimodal = getattr(sample, "multimodal_inputs", None)
         response_length = int(sample.response_length or 0)
@@ -212,6 +229,7 @@ def seal_batch(
                 prompt_length=max(len(sample.tokens or ()) - response_length, 0),
                 route_key=metadata.get(route_key_field) if isinstance(metadata, dict) else None,
                 has_multimodal=bool(multimodal),
+                scoring_id=None if scoring_ids is None else scoring_ids[position],
             )
         )
     return BatchRef(
@@ -297,6 +315,20 @@ class DeferredExecutor:
         if record.task is None:
             record.task = asyncio.create_task(self._run(record, score, publish))
         return record.task
+
+    async def cancel(self) -> None:
+        """Cancel every unfinished batch and wait until its task has stopped.
+
+        ``wait_deferred`` shields the task, so cancelling a waiter alone would
+        leave the batch scoring and publishing on its own.
+        """
+        records = [record for record in self._records.values() if record.task is not None and not record.task.done()]
+        for record in records:
+            record.task.cancel()
+        await asyncio.gather(*(record.task for record in records), return_exceptions=True)
+        for record in records:
+            if not record.snapshot.terminal:
+                self._fail(record, "cancelled")
 
     def _advance(self, record: _Record, state: DeferredState, **changes: Any) -> None:
         record.snapshot = replace(record.snapshot, state=state, **changes)
