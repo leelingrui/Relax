@@ -772,6 +772,7 @@ async def manager_remove_engine(g, idx):
 # ===================== _cleanup_engine_groups ==============================
 
 
+@pytest.mark.usefixtures("patch_ray_get")
 class TestCleanupEngineGroups:
     def test_removes_empty_groups(self):
         g_live = make_engine_group(engines=[make_mock_engine()])
@@ -853,7 +854,7 @@ class TestCleanupEngineGroups:
         with patch("ray.util.remove_placement_group") as mock_remove:
             manager._cleanup_engine_groups(srv)
             mock_remove.assert_called_once_with(mock_pg)
-        assert manager._placement_ledger.allocations(view) == ()
+        assert manager._planner.allocations(view) == ()
 
     def test_ledger_ownership_overrides_a_stale_group_owner(self):
         from relax.engine.inference.placement import PlacementGroupView, PlacementRequest
@@ -883,7 +884,7 @@ class TestCleanupEngineGroups:
         with patch("ray.util.remove_placement_group") as mock_remove:
             manager._cleanup_engine_groups(srv)
             mock_remove.assert_not_called()
-        assert manager._placement_ledger.allocations(view) == ()
+        assert manager._planner.allocations(view) == ()
 
 
 # ===================== Scale-in status queries =============================

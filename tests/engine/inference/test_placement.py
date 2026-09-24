@@ -204,25 +204,6 @@ def test_placement_planner_lets_a_deferred_phase_reuse_the_same_slice():
     assert student.gpu_ids == teacher.gpu_ids
 
 
-def test_placement_planner_reports_the_phases_that_share_gpus():
-    planner = PlacementPlanner()
-    view = _view()
-    planner.plan((_request("rollout/group-0", num_gpus=4, bundle_offset=0),), view)
-    planner.plan((_request("teacher-0", num_gpus=4, bundle_offset=0, phase="teacher_score"),), view)
-    # A disjoint region in a third phase is not contended.
-    planner.plan((_request("genrm-0", num_gpus=4, bundle_offset=4, phase="genrm"),), view)
-
-    contentions = planner.contended_phases(view)
-
-    assert len(contentions) == 1
-    assert contentions[0].phases == ("inference", "teacher_score")
-    assert contentions[0].group_ids == ("rollout/group-0", "teacher-0")
-    assert contentions[0].reserved_offsets == (0,)
-
-
-# ---------------------------------------------------------------------------
-# Idempotency, ledger identity and dry runs.
-# ---------------------------------------------------------------------------
 def test_placement_planner_replays_an_identical_request():
     planner = PlacementPlanner()
     view = _view()

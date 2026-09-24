@@ -11,13 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 import torch.distributed as dist
 
-from relax.distributed.ray.placement_ledger import plan_placement
-from relax.engine.inference.placement import (
-    PlacementGroupView,
-    PlacementOwner,
-    PlacementPlanner,
-    PlacementRequest,
-)
+from relax.engine.inference.phase_plans import deferred_opd_enabled
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_opsd_worker
 
@@ -81,24 +75,6 @@ def is_managed_opd_teacher_enabled(args: Any) -> bool:
     )
 
 
-def parse_opd_teacher_routes(routes_json: str | None) -> dict[str, str]:
-    """Parse ``--opd-teacher-routes`` into ``{data_source: checkpoint}``.
-
-    One parser for the flag keeps the launch path and the phase plan from
-    disagreeing about which teachers exist.
-    """
-    if routes_json is None:
-        return {}
-    routes_map = json.loads(routes_json)
-    if not routes_map:
-        raise ValueError("--opd-teacher-routes must be a non-empty JSON object.")
-    return routes_map
-
-
-def resolve_opd_teacher_routes(args: Any) -> dict[str, str]:
-    return parse_opd_teacher_routes(getattr(args, "opd_teacher_routes", None))
-
-
 def is_managed_opd_teacher_colocate(args: Any) -> bool:
     return (
         is_managed_opd_teacher_enabled(args)
@@ -107,6 +83,42 @@ def is_managed_opd_teacher_colocate(args: Any) -> bool:
         and "actor" in args.resource
         and "rollout" in args.resource
     )
+
+
+def teacher_shares_rollout_bundles(args: Any) -> bool:
+    """Whether colocated teachers sit on the same bundles as rollout.
+
+    Teachers live in the actor placement group behind the rollout region, so
+    they share rollout GPUs exactly when rollout already covers every actor
+    bundle. The split layout the argument checks require never does.
+    """
+    return is_managed_opd_teacher_colocate(args) and int(args.rollout_num_gpus) >= int(args.resource["actor"][1])
+
+
+def check_teacher_colocate_layout(rollout_gpus: int, teacher_gpus: int, actor_gpus: int) -> None:
+    """Accept the two colocated teacher layouts the placement planner supports.
+
+    * split: rollout at the front of the actor bundles, teachers after it, so
+      both serve concurrently (``rollout + teacher == actor``);
+    * shared: rollout covers every actor bundle and teachers reuse them, so the
+      teacher scores in its own deferred phase (``rollout == actor``,
+      ``teacher <= actor``).
+    """
+    if rollout_gpus + teacher_gpus == actor_gpus:
+        return
+    if rollout_gpus == actor_gpus and 0 < teacher_gpus <= actor_gpus:
+        return
+    raise ValueError(
+        "Managed OPD teacher colocate requires either split bundles "
+        "(--rollout-num-gpus + resource['teacher'][1] == actor GPUs) or shared bundles with deferred scoring "
+        "(--rollout-num-gpus == actor GPUs and resource['teacher'][1] <= actor GPUs). "
+        f"Got rollout={rollout_gpus}, teacher={teacher_gpus}, actor={actor_gpus}."
+    )
+
+
+def teacher_region_offset(args: Any) -> int:
+    """First actor-PG bundle of the colocated teacher region."""
+    return 0 if teacher_shares_rollout_bundles(args) else int(args.rollout_num_gpus)
 
 
 def _mirror_teacher_sglang_server_args(parser: Any) -> None:
@@ -178,44 +190,36 @@ def build_teacher_engine_args(args: Any, overrides: dict[str, object]) -> Any:
     return teacher_args
 
 
-def create_managed_opd_teacher_manager(
+def create_managed_opd_teacher(
     args: Any,
     *,
     num_replicas: int,
     gpus_per_replica: int,
+    inference_manager_handle: Any,
     pg: Any = None,
     shared_pg: bool = False,
-    runtime_env: dict | None = None,
-    inference_manager_handle: Any | None = None,
 ) -> tuple[Any, list[str]]:
+    """Create the single managed teacher on the task inference owner.
+
+    Returns the teacher's ``ModelHandle`` and its replica ``/generate`` URLs.
+    """
     import ray
 
-    from relax.distributed.ray.inference_role import create_role_managers
+    from relax.distributed.ray.inference_manager import ModelHandle
+    from relax.distributed.ray.teacher_manager import teacher_role_model
+    from relax.engine.inference.types import Role
 
-    role_kwargs = {"runtime_env": runtime_env}
-    if inference_manager_handle is not None:
-        role_kwargs["task_manager_handle"] = inference_manager_handle
-    teacher_manager = create_role_managers(
+    model = teacher_role_model(
         args,
-        "teacher",
-        {
-            "default": {
-                "args": (args,),
-                "kwargs": {
-                    "num_replicas": num_replicas,
-                    "gpus_per_replica": gpus_per_replica,
-                    "pg": pg,
-                    "shared_pg": shared_pg,
-                },
-            }
-        },
-        **role_kwargs,
-    )["default"]
-    if inference_manager_handle is not None:
-        ray.get(inference_manager_handle.register_role.remote("teacher", teacher_manager))
-
-    urls = ray.get(teacher_manager.get_urls.remote())
-    logger.info(f"[OPD teacher] TeacherManager initialized successfully: urls={urls}")
+        model_id="default",
+        num_gpus=num_replicas * gpus_per_replica,
+        gpus_per_replica=gpus_per_replica,
+        pg=pg if shared_pg else None,
+    )
+    ray.get(inference_manager_handle.create_role.remote(Role.TEACHER, [model]))
+    teacher_manager = ModelHandle(inference_manager_handle, Role.TEACHER, "default")
+    urls = [f"{url}/generate" for url in ray.get(teacher_manager.get_urls.remote())]
+    logger.info(f"[OPD teacher] Teacher initialized successfully: urls={urls}")
 
     if shared_pg and getattr(args, "offload_rollout", False):
         logger.info("[OPD teacher] Offloading teacher engines before actor init")
@@ -224,37 +228,31 @@ def create_managed_opd_teacher_manager(
     return teacher_manager, urls
 
 
-def _deploy_teacher_gateway(managers: dict[str, Any], inference_manager_handle: Any | None = None) -> str:
+def _deploy_teacher_gateway(inference_manager_handle: Any) -> str:
     from ray import serve
 
     from relax.components.inference_gateway import InferenceGatewayDeployment
     from relax.utils.utils import get_serve_url
 
-    gateway_kwargs = (
-        {"manager_handle": inference_manager_handle}
-        if inference_manager_handle is not None
-        else {"role_manager_handle": next(iter(managers.values()))}
-    )
-    gateway = InferenceGatewayDeployment.bind("teacher", **gateway_kwargs)
+    gateway = InferenceGatewayDeployment.bind("teacher", manager_handle=inference_manager_handle)
     serve.run(gateway, name="teacher_gateway", route_prefix="/teacher")
     return get_serve_url("/teacher")
 
 
-def maybe_start_managed_opd_teacher(
-    args: Any,
-    *,
-    runtime_env: dict | None = None,
-    inference_manager_handle: Any | None = None,
-) -> tuple[Any, Any]:
+def maybe_start_managed_opd_teacher(args: Any, *, inference_manager_handle: Any) -> tuple[Any, Any]:
+    """Start the managed teacher(s) on the inference manager and inject their
+    routes.
+
+    Returns the shared placement group (or ``None``) and the teacher handle (a
+    list for MOPD), or ``None`` when no managed teacher is configured.
+    """
     if not is_managed_opd_teacher_enabled(args) or getattr(args, "debug_train_only", False):
         return None, None
 
     # ── Multi-teacher (MOPD) path: --opd-teacher-routes ────────────────────
     routes_json = getattr(args, "opd_teacher_routes", None)
     if routes_json is not None:
-        return _start_managed_multi_teacher(
-            args, routes_json, runtime_env=runtime_env, inference_manager_handle=inference_manager_handle
-        )
+        return _start_managed_multi_teacher(args, routes_json, inference_manager_handle=inference_manager_handle)
 
     # ── Single-teacher path: --teacher-hf-checkpoint ───────────────────────
     shared_pg = None
@@ -288,24 +286,16 @@ def maybe_start_managed_opd_teacher(
         f"gpus_per_replica={gpus_per_replica}, teacher_total_gpus={teacher_total_gpus}, "
         f"shared_pg={shared_pg_enabled}"
     )
-    teacher_kwargs = {
-        "num_replicas": num_replicas,
-        "gpus_per_replica": gpus_per_replica,
-        "pg": shared_pg,
-        "shared_pg": shared_pg_enabled,
-        "runtime_env": runtime_env,
-    }
-    if inference_manager_handle is not None:
-        teacher_kwargs["inference_manager_handle"] = inference_manager_handle
-    teacher_manager, urls = create_managed_opd_teacher_manager(args, **teacher_kwargs)
-    args.opd_teacher_engine_urls = list(urls)
+    teacher_manager, urls = create_managed_opd_teacher(
+        args,
+        num_replicas=num_replicas,
+        gpus_per_replica=gpus_per_replica,
+        inference_manager_handle=inference_manager_handle,
+        pg=shared_pg,
+        shared_pg=shared_pg_enabled,
+    )
     try:
-        if inference_manager_handle is None:
-            args.opd_teacher_gateway_url = _deploy_teacher_gateway({"teacher": teacher_manager})
-        else:
-            args.opd_teacher_gateway_url = _deploy_teacher_gateway(
-                {"teacher": teacher_manager}, inference_manager_handle=inference_manager_handle
-            )
+        args.opd_teacher_gateway_url = _deploy_teacher_gateway(inference_manager_handle)
     except Exception:
         shutdown_managed_opd_teacher(teacher_manager)
         raise
@@ -318,28 +308,12 @@ def maybe_start_managed_opd_teacher(
     return shared_pg, teacher_manager
 
 
-def _start_managed_multi_teacher(
-    args: Any,
-    routes_json: str,
-    *,
-    runtime_env: dict | None = None,
-    inference_manager_handle: Any | None = None,
-) -> tuple[Any, list]:
-    """Launch multiple managed teachers for MOPD and inject routes into args.
-
-    Each teacher (one per ``data_source``) gets an equal share of the 'teacher'
-    resource GPUs; that share is further split into replicas of TP size
-    ``--teacher-num-gpus-per-engine``. Every teacher's replica URLs are
-    collected into a list and written to
-    ``args.opd_teacher_routes_map[data_source]`` so the per-sample router
-    (``_pick_teacher_url``) can route by data_source and then round-robin
-    across that teacher's replicas.
-    """
-    import copy
-
-    import ray
-
-    routes_map: dict[str, str] = parse_opd_teacher_routes(routes_json)
+def _multi_teacher_layout(args: Any, routes_json: str) -> tuple[dict[str, str], int, int]:
+    """Validate the MOPD layout; return the routes, GPUs per teacher and GPUs
+    per replica."""
+    routes_map: dict[str, str] = json.loads(routes_json)
+    if not routes_map:
+        raise ValueError("--opd-teacher-routes must be a non-empty JSON object.")
 
     num_teachers = len(routes_map)
     _, total_teacher_gpus = args.resource["teacher"]
@@ -365,28 +339,94 @@ def _start_managed_multi_teacher(
             "include both 'actor' and 'rollout' in --resource. Dedicated teacher GPUs "
             "are no longer supported."
         )
+    check_teacher_colocate_layout(int(args.rollout_num_gpus), total_teacher_gpus, args.resource["actor"][1])
+    return routes_map, gpus_per_teacher, gpus_per_replica
+
+
+def managed_teacher_models(args: Any, pg: Any) -> list[tuple[Any, Any, dict[str, Any]]]:
+    """Describe every managed teacher for ``InferenceManager.create_role``.
+
+    ``pg`` is the shared actor placement group under colocate, else ``None``.
+    """
+    from relax.distributed.ray.teacher_manager import teacher_role_model
+
+    routes_json = getattr(args, "opd_teacher_routes", None)
+    if routes_json is None:
+        _, teacher_total_gpus = args.resource["teacher"]
+        gpus_per_replica = getattr(args, "teacher_num_gpus_per_engine", None) or teacher_total_gpus
+        if teacher_total_gpus % gpus_per_replica:
+            raise ValueError(
+                f"teacher GPUs in --resource ({teacher_total_gpus}) must be divisible by "
+                f"--teacher-num-gpus-per-engine ({gpus_per_replica})."
+            )
+        return [
+            teacher_role_model(
+                args, model_id="default", num_gpus=teacher_total_gpus, gpus_per_replica=gpus_per_replica, pg=pg
+            )
+        ]
+
+    return _multi_teacher_models(args, routes_json, pg)
+
+
+def _multi_teacher_models(args: Any, routes_json: str, pg: Any) -> list[tuple[Any, Any, dict[str, Any]]]:
+    from relax.distributed.ray.teacher_manager import teacher_role_model
+
+    routes_map, gpus_per_teacher, gpus_per_replica = _multi_teacher_layout(args, routes_json)
+    models = []
+    for index, (data_source, checkpoint) in enumerate(routes_map.items()):
+        teacher_args = copy.copy(args)
+        teacher_args.teacher_hf_checkpoint = checkpoint
+        models.append(
+            teacher_role_model(
+                teacher_args,
+                model_id=data_source,
+                num_gpus=gpus_per_teacher,
+                gpus_per_replica=gpus_per_replica,
+                pg=pg,
+                bundle_offset=index * gpus_per_teacher,
+                index=index,
+            )
+        )
+    return models
+
+
+def _start_managed_multi_teacher(
+    args: Any,
+    routes_json: str,
+    *,
+    inference_manager_handle: Any,
+) -> tuple[Any, list]:
+    """Launch multiple managed teachers for MOPD and inject routes into args.
+
+    Each teacher (one per ``data_source``) gets an equal share of the 'teacher'
+    resource GPUs; that share is further split into replicas of TP size
+    ``--teacher-num-gpus-per-engine``. Every teacher's replica URLs are
+    collected into a list and written to
+    ``args.opd_teacher_routes_map[data_source]`` so the per-sample router
+    (``_pick_teacher_url``) can route by data_source and then round-robin
+    across that teacher's replicas.
+    """
+    import ray
+
+    routes_map, gpus_per_teacher, gpus_per_replica = _multi_teacher_layout(args, routes_json)
+    num_teachers = len(routes_map)
+    total_teacher_gpus = num_teachers * gpus_per_teacher
 
     # MOPD is colocate-only: all teachers SHARE the actor/rollout placement group
     # (same as the single-teacher colocate path). During training the actor uses
     # all GPUs; during rollout student-rollout occupies bundles [0, rollout_gpus)
-    # and teacher_k occupies [rollout_gpus + k*gpus_per_teacher, +gpus_per_teacher).
-    # This requires rollout_gpus + total_teacher_gpus == actor_gpus. Both this
-    # placement-group import and TeacherManager's (below) pull in the full SGLang/
-    # transformers dependency chain, so they stay deferred until every ValueError
-    # check above has had a chance to short-circuit first.
+    # and teacher_k occupies [offset + k*gpus_per_teacher, +gpus_per_teacher),
+    # where offset is rollout_gpus for the split layout and 0 for the shared
+    # (deferred) one; see check_teacher_colocate_layout. The
+    # placement-group import pulls in the full SGLang/transformers dependency
+    # chain, so it stays deferred until every ValueError check above has had a
+    # chance to short-circuit first.
     from relax.core.service import create_placement_group
-    from relax.distributed.ray.inference_role import create_role_managers
+    from relax.distributed.ray.inference_manager import ModelHandle
+    from relax.engine.inference.types import Role
 
     actor_gpus = args.resource["actor"][1]
     rollout_gpus = int(args.rollout_num_gpus)
-    if rollout_gpus + total_teacher_gpus != actor_gpus:
-        raise ValueError(
-            f"MOPD colocate requires rollout_gpus + teacher_gpus == actor_gpus, but got "
-            f"rollout={rollout_gpus} + teacher={total_teacher_gpus} != actor={actor_gpus}. "
-            f"Teachers live inside the actor GPU pool (rollout at the front, teachers after "
-            f"it), so shrink --rollout-num-gpus to leave room, e.g. actor=16 -> "
-            f"--rollout-num-gpus 8 with resource['teacher'][1]=8."
-        )
 
     shared_pg = create_placement_group(
         num_gpus=actor_gpus,
@@ -394,7 +434,7 @@ def _start_managed_multi_teacher(
     )
     logger.info(
         f"[MOPD teacher] colocate mode: shared actor PG={actor_gpus} GPU, "
-        f"rollout={rollout_gpus}, teachers start at bundle {rollout_gpus} "
+        f"rollout={rollout_gpus}, teachers start at bundle {teacher_region_offset(args)} "
         f"({gpus_per_teacher} GPU/teacher)"
     )
     logger.info(
@@ -402,52 +442,15 @@ def _start_managed_multi_teacher(
         f"{gpus_per_replica} GPU(s)/replica, {gpus_per_teacher} GPU(s)/teacher, total={total_teacher_gpus}"
     )
 
-    pool_configs = {}
-    placement_requests = []
-    for index, (data_source, checkpoint) in enumerate(routes_map.items()):
-        teacher_args = copy.copy(args)
-        teacher_args.teacher_hf_checkpoint = checkpoint
-        pool_configs[data_source] = {
-            "args": (teacher_args,),
-            "kwargs": {
-                "num_replicas": gpus_per_teacher // gpus_per_replica,
-                "gpus_per_replica": gpus_per_replica,
-                "pg": shared_pg,
-                "shared_pg": True,
-                "bundle_offset": index * gpus_per_teacher,
-            },
-        }
-        placement_requests.append(
-            PlacementRequest(
-                group_id=f"teacher/{data_source}",
-                worker_type="regular",
-                num_gpus=gpus_per_teacher,
-                num_gpus_per_engine=gpus_per_replica,
-                num_gpus_per_node=getattr(args, "num_gpus_per_node", gpus_per_replica),
-                phase="teacher",
-                bundle_offset=rollout_gpus + index * gpus_per_teacher,
-            )
-        )
-    # Validate every teacher slice before any manager is spawned. The teacher
-    # adapters record the authoritative slices, so this check reserves nothing.
-    plan_placement(
-        inference_manager_handle or PlacementPlanner(),
-        tuple(placement_requests),
-        PlacementGroupView(tuple(shared_pg[1]), tuple(shared_pg[2]), PlacementOwner.CONTROLLER, identity=shared_pg[0]),
-        dry_run=True,
-    )
-    role_kwargs = {"runtime_env": runtime_env}
-    if inference_manager_handle is not None:
-        role_kwargs["task_manager_handle"] = inference_manager_handle
-    managers = create_role_managers(args, "teacher", pool_configs, **role_kwargs)
-    if inference_manager_handle is not None:
-        ray.get(inference_manager_handle.register_role.remote("teacher", next(iter(managers.values()))))
+    models = _multi_teacher_models(args, routes_json, shared_pg)
+    model_ids = ray.get(inference_manager_handle.create_role.remote(Role.TEACHER, models))
+    teacher_managers = [ModelHandle(inference_manager_handle, Role.TEACHER, model_id) for model_id in model_ids]
     if getattr(args, "offload_rollout", False):
-        ray.get([manager.offload.remote() for manager in managers.values()])
+        ray.get([manager.offload.remote() for manager in teacher_managers])
 
     url_routes: dict[str, list[str]] = {}
-    for data_source, teacher_manager in managers.items():
-        urls = list(ray.get(teacher_manager.get_urls.remote()))
+    for data_source in model_ids:
+        urls = list(ray.get(inference_manager_handle.call.remote(Role.TEACHER, data_source, "get_urls")))
         # Append /generate to match the route format expected by _pick_teacher_url.
         replica_urls = [(u if u.endswith("/generate") else u.rstrip("/") + "/generate") for u in urls]
         url_routes[data_source] = replica_urls
@@ -459,24 +462,16 @@ def _start_managed_multi_teacher(
     # Inject the routes map so per-sample routing works via _pick_teacher_url.
     args.opd_teacher_routes_map = url_routes
     try:
-        if inference_manager_handle is None:
-            args.opd_teacher_gateway_url = _deploy_teacher_gateway(managers)
-        else:
-            args.opd_teacher_gateway_url = _deploy_teacher_gateway(
-                managers, inference_manager_handle=inference_manager_handle
-            )
+        args.opd_teacher_gateway_url = _deploy_teacher_gateway(inference_manager_handle)
     except Exception:
-        shutdown_managed_opd_teacher(list(managers.values()))
+        shutdown_managed_opd_teacher(teacher_managers)
         raise
     opd_teacher_key = getattr(args, "opd_teacher_key", None) or "data_source"
     logger.info(f"[MOPD teacher] all teachers ready. key='{opd_teacher_key}', routes={list(url_routes.keys())}")
 
-    # Return the shared PG so the controller reuses it for actor/rollout. Second
-    # element is the list of managers for shutdown / offload-onload lock-step --
-    # start_multi_instance_managers returns a dict, so convert back to preserve
-    # this function's existing (pg, list[manager]) contract for callers that use
-    # isinstance(x, list) to normalize single- vs multi-teacher shapes.
-    return shared_pg, list(managers.values())
+    # Return the shared PG so the controller reuses it for actor/rollout, and
+    # one model per teacher for offload/onload lock-step with training.
+    return shared_pg, teacher_managers
 
 
 async def set_managed_opd_teacher_on_actor_service(actor_service: Any, teacher_manager: Any, args: Any) -> None:
@@ -495,7 +490,8 @@ def set_managed_opd_teacher_on_train_group(train_group: Any, teacher_manager: An
 
 
 def shutdown_managed_opd_teacher(teacher_manager: Any) -> None:
-    if teacher_manager is None:
+    """Remove the Teacher Gateway and close the teacher role on the manager."""
+    if not teacher_manager:
         return
 
     import ray
@@ -504,16 +500,13 @@ def shutdown_managed_opd_teacher(teacher_manager: Any) -> None:
     try:
         serve.delete("teacher_gateway")
     except Exception as exc:
-        logger.warning("Failed to remove Teacher Gateway: %s", exc)
-
-    # Support both single manager and list of managers (MOPD multi-teacher).
-    managers = teacher_manager if isinstance(teacher_manager, list) else [teacher_manager]
-    for mgr in managers:
-        try:
-            ray.get(mgr.shutdown.remote(), timeout=30)
-            logger.info("OPD teacher shut down.")
-        except Exception as e:
-            logger.warning(f"Failed to shut down OPD teacher: {e}")
+        logger.warning(f"Failed to remove Teacher Gateway: {exc}")
+    handle = teacher_manager[0] if isinstance(teacher_manager, list) else teacher_manager
+    try:
+        ray.get(handle.manager.shutdown_role.remote(handle.role), timeout=30)
+        logger.info("OPD teacher shut down.")
+    except Exception as e:
+        logger.warning(f"Failed to shut down OPD teacher: {e}")
 
 
 def has_managed_opd_teacher_manager(owner: Any) -> bool:
@@ -532,7 +525,9 @@ def append_managed_opd_teacher_offload_handle(handles: list[Any], owner: Any) ->
 
 def append_managed_opd_teacher_onload_handle(handles: list[Any], owner: Any) -> None:
     teacher_manager = getattr(owner, "teacher_manager", None)
-    if teacher_manager is None:
+    # A deferred teacher shares the rollout GPUs and wakes only for its scoring
+    # phase; loading it with the student would exhaust their memory.
+    if teacher_manager is None or deferred_opd_enabled(owner.args):
         return
     for mgr in teacher_manager if isinstance(teacher_manager, list) else [teacher_manager]:
         handles.append(mgr.onload.remote())
@@ -541,7 +536,7 @@ def append_managed_opd_teacher_onload_handle(handles: list[Any], owner: Any) -> 
 def validate_managed_opd_teacher_colocate_args(args: Any) -> None:
     # Applies to both single-teacher (--teacher-hf-checkpoint) and multi-teacher
     # MOPD (--opd-teacher-routes): teachers share the actor placement group, so the
-    # bundle-split constraint below (rollout + teacher == actor) holds for both.
+    # layout constraint below (split or shared, see check_teacher_colocate_layout) holds for both.
     if args.offload_train is None:
         args.offload_train = True
     if args.offload_rollout is None:
@@ -557,12 +552,14 @@ def validate_managed_opd_teacher_colocate_args(args: Any) -> None:
     if args.use_critic:
         actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
 
-    teacher_gpus = args.resource["teacher"][1]
-    if args.rollout_num_gpus + teacher_gpus != actor_total_gpus:
+    check_teacher_colocate_layout(int(args.rollout_num_gpus), int(args.resource["teacher"][1]), actor_total_gpus)
+    # A shared-bundle teacher only wakes in the deferred scoring stage, which the
+    # resident Agentic pipeline does not run; its inline prefill would wait on a
+    # teacher that stays offloaded.
+    if getattr(args, "use_agentic_rollout", False) and deferred_opd_enabled(args):
         raise ValueError(
-            "Managed OPD teacher colocate requires split bundles where "
-            "--rollout-num-gpus + resource['teacher'][1] equals actor total GPUs. "
-            f"Got rollout={args.rollout_num_gpus}, teacher={teacher_gpus}, actor total={actor_total_gpus}."
+            "Agentic rollout does not support a managed OPD teacher sharing the rollout GPUs (deferred scoring). "
+            "Use the split layout (--rollout-num-gpus + resource['teacher'][1] == actor GPUs)."
         )
 
 

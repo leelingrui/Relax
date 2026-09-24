@@ -23,21 +23,46 @@ try:
 
     from relax.distributed.ray.rollout import (
         EngineGroup,
+        RolloutEnginePool,
         RolloutServer,
     )
 
-    # Extract the original Python class from the Ray actor wrapper so we can
-    # create lightweight instances without calling the heavy __init__.
-    from relax.distributed.ray.rollout import RolloutManager as _RayRM
-
-    # Ray's ActorClass stores the original Python class at
-    # __ray_metadata__.modified_class (Ray 2.x).
-    _meta = getattr(_RayRM, "__ray_metadata__", None)
-    _OriginalRM = getattr(_meta, "modified_class", None) or _RayRM
     HAS_DEPS = True
 except ImportError:
     HAS_DEPS = False
-    _OriginalRM = None
+    RolloutEnginePool = None
+
+
+# ---------------------------------------------------------------------------
+# FakeOwnerHandle -- stands in for the task inference owner's actor handle.
+# ---------------------------------------------------------------------------
+class FakeOwnerHandle:
+    """Record every ``owner.<method>.remote(...)`` call and answer the few
+    whose results callers read.
+
+    The results are plain values, so tests patch ``ray.get`` to return its
+    argument unchanged.
+    """
+
+    def __init__(self, urls: dict | None = None) -> None:
+        self.calls: list[tuple] = []
+        self.urls = urls or {}
+
+    def __getattr__(self, name: str) -> SimpleNamespace:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return SimpleNamespace(remote=lambda *args, **kwargs: self._answer(name, args, kwargs))
+
+    def _answer(self, name: str, args: tuple, kwargs: dict):
+        self.calls.append((name, args, kwargs))
+        if name == "create_role":
+            return tuple(getattr(config, "name", config) for config, _, _ in args[1])
+        if name == "call" and args[2] == "get_urls":
+            return self.urls.get(args[1], [])
+        return None
+
+    def named(self, name: str) -> list[tuple]:
+        return [(args, kwargs) for called, args, kwargs in self.calls if called == name]
 
 
 # ---------------------------------------------------------------------------
@@ -213,17 +238,19 @@ def make_rollout_server(
 # Testable RolloutManager factory
 # ---------------------------------------------------------------------------
 def create_test_manager(args=None, servers=None):
-    """Create a ``RolloutManager`` instance for testing.
+    """Create a ``RolloutEnginePool`` instance for testing.
 
+    The pool owns the engines, placement and scaling state that these tests
+    exercise; the Ray actor shell (``RolloutManager``) only forwards to it.
     Bypasses ``__init__`` entirely and sets up the minimal state needed by the
     scaling methods.
     """
-    if _OriginalRM is None:
+    if RolloutEnginePool is None:
         pytest.skip("Cannot create test manager: dependencies missing")
     if args is None:
         args = make_mock_args()
 
-    manager = object.__new__(_OriginalRM)
+    manager = object.__new__(RolloutEnginePool)
     manager.args = args
     manager.servers = servers if servers is not None else {}
     manager._scale_out_requests = {}
@@ -251,30 +278,21 @@ def create_test_manager(args=None, servers=None):
     manager._port_cursors = {}
     manager._eviction_monitor_stop = None
     manager._eviction_monitor_thread = None
-    from relax.distributed.ray.inference_role import UnifiedServiceManager
-    from relax.distributed.ray.model_pool import ModelPool
-    from relax.distributed.ray.rollout import _RolloutPoolRuntime
-    from relax.engine.inference.capabilities import WeightSource
-    from relax.engine.inference.manager import InferenceManager
-    from relax.engine.inference.specs import ModelSpec
-    from relax.engine.inference.types import Role, RoutingSpec
+    from relax.distributed.ray.inference_manager import InferenceManager
+    from relax.engine.inference.config import ModelConfig
+    from relax.engine.inference.types import Role
 
     manager.status = None
-    manager.inference_manager = InferenceManager(Role.ROLLOUT)
-    pools = {}
+    manager._inference_sync_pending = False
+    manager.inference_manager = InferenceManager()
+    manager._planner = manager.inference_manager.placement
     for name, server in manager.servers.items():
-        manager.inference_manager.register_model(
-            ModelSpec(name, "test-checkpoint", weight_source=WeightSource.POLICY, allow_defer=True),
-            operation_id=f"register:{name}",
-        )
-        pools[name] = ModelPool.from_runtime(manager.inference_manager, name, _RolloutPoolRuntime(server))
-    manager.inference_manager.configure_routes(
-        RoutingSpec(default_model=next(iter(manager.servers)) if len(manager.servers) == 1 else None),
-        operation_id="routes",
-    )
-    manager.service_manager = UnifiedServiceManager(
-        Role.ROLLOUT, inference_manager=manager.inference_manager, pools=pools
-    )
+        server.model_name = name
+        server.model_spec = server.model_spec or ModelConfig(name, "test-checkpoint", elastic_enabled=True)
+        server.ready_gate = manager._serving
+    if manager.servers:
+        with patch.object(ray, "get", mock_ray_get):
+            manager.inference_manager.register(Role.ROLLOUT, manager.servers)
     return manager
 
 

@@ -1350,7 +1350,19 @@ def generate_rollout(
     # prefetched generation is almost always aborted by the next step's pause_generation and its
     # truncated samples would pollute the next rollout. Other modes keep the optimization.
     _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
-    if not args.fully_async and not _lora_adapter_mode:
+    # A prefetched batch advances the data-source cursor but lives only in this
+    # process. Keep checkpoint boundaries free of these unpersisted samples.
+    save_interval = getattr(args, "save_interval", None)
+    checkpoint_step = (
+        getattr(args, "save", None) is not None
+        and save_interval is not None
+        and (
+            getattr(args, "rotate_ckpt", False)
+            or (rollout_id + 1) % save_interval == 0
+            or rollout_id + 1 == args.num_rollout
+        )
+    )
+    if not args.fully_async and not _lora_adapter_mode and not checkpoint_step:
         state = GenerateState(args)
         state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
         logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")

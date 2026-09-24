@@ -16,17 +16,18 @@ import time
 from argparse import Namespace
 from itertools import cycle
 from typing import Any, List, Optional, Union
+from uuid import uuid4
 
 import httpx
 import ray
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from ray import serve
 from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
-from relax.distributed.ray.placement_group import create_genrm_managers
-from relax.engine.inference.discovery import new_manager_epoch
+from relax.distributed.ray.inference_manager import ModelHandle
+from relax.distributed.ray.placement_group import create_genrm_role
 from relax.engine.inference.types import Role
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
@@ -47,6 +48,9 @@ GENRM_SERVE_MAX_ONGOING_REQUESTS = Envs.GENRM_SERVE_MAX_ONGOING_REQUESTS
 # Sentinel instance key for the legacy single-model config (--genrm-model-path)
 # and for requests that don't pass a route_key.
 _DEFAULT_INSTANCE_KEY = "__default__"
+
+# Bound on aborting an engine request whose caller went away.
+_ABORT_TIMEOUT_S = 5.0
 
 
 class Message(BaseModel):
@@ -77,7 +81,7 @@ class GenerateResponse(BaseModel):
 
 
 class _EngineCacheState:
-    """Per-instance round-robin cache over a GenRMManager's live engine list.
+    """Per-instance round-robin cache over one GenRM model's live engine list.
 
     Isolated per route_key so a dead/rebuilt engine on one instance never
     perturbs another instance's cycle.
@@ -134,7 +138,7 @@ class GenRM(Base):
         config: Namespace,
         role: str,
         runtime_env: Optional[dict] = None,
-        inference_manager_handle: Any | None = None,
+        inference_manager_handle: Any = None,
     ) -> None:
         """Initialize GenRM service.
 
@@ -145,20 +149,28 @@ class GenRM(Base):
             config: Runtime configuration namespace.
             role: Role name (should be "genrm").
             runtime_env: Optional Ray runtime environment dict.
+            inference_manager_handle: The task's inference manager, which holds
+                every GenRM model's engines, state and lifecycle.
         """
         super().__init__()
         self.config = config
         self.healthy = healthy
         self.role = role
 
-        # {route_key: GenRMManager handle}. Single-instance configs (the legacy
-        # --genrm-model-path path) resolve to exactly {"__default__": manager}.
-        self.genrm_managers = create_genrm_managers(
-            config, pg, runtime_env=runtime_env, inference_manager_handle=inference_manager_handle
-        )
-        self._role_manager = next(iter(self.genrm_managers.values()))
-        self._manager_epoch = new_manager_epoch()
+        # {route_key: handle}. Every instance is one GenRM model on the inference
+        # manager; single-instance configs (the legacy --genrm-model-path path)
+        # resolve to exactly {"__default__": handle}.
+        self._inference_manager = inference_manager_handle
+        self.genrm_managers = {
+            key: ModelHandle(inference_manager_handle, Role.GENRM, key)
+            for key in create_genrm_role(config, pg, inference_manager_handle)
+        }
         self.instance_specs = config._genrm_instances_resolved
+        # Request defaults and template arguments are part of each model's
+        # registered configuration on the manager.
+        self.model_configs = {
+            key: ray.get(inference_manager_handle.model_config.remote(Role.GENRM, key)) for key in self.genrm_managers
+        }
 
         self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
         self._logger.info(f"GenRM service initialized successfully: instances={list(self.genrm_managers)}")
@@ -177,53 +189,6 @@ class GenRM(Base):
             key: load_tokenizer(spec["model_path"], trust_remote_code=True)
             for key, spec in self.instance_specs.items()
         }
-
-    @app.get("/engines")
-    async def get_engines(self, schema_version: int | None = None, status_filter: str | None = None) -> dict:
-        """Return v2 discovery, while retaining the legacy route surface."""
-        if schema_version != 2:
-            return {
-                "models": {
-                    key: {"router_ip": None, "router_port": None, "engine_groups": [], "total_engines": 0}
-                    for key in self.genrm_managers
-                },
-                "total_engines": 0,
-            }
-        if getattr(self, "_role_manager", None) is not None:
-            snapshot = await asyncio.to_thread(ray.get, self._role_manager.get_role_snapshot.remote())
-            return snapshot.to_dict(status_filter)
-        refs = [
-            manager.get_discovery_snapshot.remote(
-                role=Role.GENRM, model_id=key, allow_defer=True, status_filter=status_filter
-            )
-            for key, manager in self.genrm_managers.items()
-        ]
-        snapshots = await asyncio.to_thread(ray.get, refs)
-        if not snapshots:
-            return {
-                "schema_version": 2,
-                "role": Role.GENRM.value,
-                "manager_epoch": self._manager_epoch,
-                "topology_revision": 0,
-                "models": {},
-            }
-        return {
-            "schema_version": 2,
-            "role": Role.GENRM.value,
-            "manager_epoch": self._manager_epoch,
-            "topology_revision": max(snapshot.topology_revision for snapshot in snapshots),
-            "phase": None,
-            "routing": {
-                "default_model": next(iter(self.genrm_managers)) if len(self.genrm_managers) == 1 else None,
-                "route_key_to_model": {key: key for key in self.genrm_managers},
-                "config_version": 0,
-            },
-            "models": {model.model_id: model.to_dict() for snapshot in snapshots for model in snapshot.models},
-        }
-
-    async def get_role_snapshot(self) -> Any:
-        """Expose the shared role snapshot to the task inference owner."""
-        return await asyncio.to_thread(ray.get, self._role_manager.get_role_snapshot.remote())
 
     def run(self):
         """GenRM is a passive HTTP service, no background loop needed.
@@ -250,14 +215,43 @@ class GenRM(Base):
         Returns:
             GenerateResponse containing raw model response text
         """
+        key = self._resolve_instance_key(request.route_key)
+        request_id = await self._admit(key)
         try:
-            output = await self._call_engine(request.route_key, request.messages, request.sampling_params)
+            output = await self._call_engine(
+                request.route_key, request.messages, request.sampling_params, request_id=request_id
+            )
             response = output.get("text", "").strip()
             return GenerateResponse(response=response)
 
         except Exception as e:
             self._logger.error(f"GenRM generation failed (route_key={request.route_key}): {e}")
             raise
+        finally:
+            await self._complete(request_id)
+
+    async def _admit(self, key: str) -> str:
+        """Admit a direct request through the Manager, or refuse it with 503.
+
+        This endpoint calls the engines without the Gateway, so it records the
+        request itself: a sleeping or switching model is refused, and a drain
+        waits for every request admitted here.
+        """
+        try:
+            return await self._inference_manager.admit_request.remote(Role.GENRM, key, uuid4().hex)
+        except Exception as exc:
+            self._logger.warning(f"GenRM request to instance '{key}' is not admitted: {exc}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"GenRM instance '{key}' is not accepting requests",
+                headers={"Retry-After": "1"},
+            ) from exc
+
+    async def _complete(self, request_id: str) -> None:
+        try:
+            await self._inference_manager.complete_request.remote(request_id)
+        except Exception as exc:
+            self._logger.warning(f"Failed to complete GenRM request {request_id}: {exc}")
 
     def _resolve_instance_key(self, route_key: Optional[str]) -> str:
         if route_key is None and len(self.genrm_managers) == 1:
@@ -296,24 +290,22 @@ class GenRM(Base):
         tokenizer."""
         key = self._resolve_instance_key(route_key)
         messages = [message.model_dump() if isinstance(message, Message) else message for message in messages]
-        spec = self.instance_specs[key]
+        model_config = self.model_configs[key]
         # ensure plain list — some tokenizers return BatchEncoding which is not JSON-serializable
         # Tokenization (chat-template render + encode) is synchronous CPU work; run it in a
         # worker thread so it does not block this replica's event loop. Fast (Rust) tokenizers
         # release the GIL during encode, so concurrent requests tokenize in parallel instead of
         # serializing — without this a single replica throttles dispatch and starves the engines.
-        # Forward chat_template_kwargs from the instance's sampling_config through to
-        # the jinja template — e.g. `{"enable_thinking": false}` for Qwen3+ to
-        # suppress the default <think> block. Keys unused by the template are
-        # silently dropped by transformers, so this is safe across model families.
-        sampling_config = spec["sampling_config"]
-        chat_template_kwargs = sampling_config.get("chat_template_kwargs", {}) or {}
+        # Forward the model's chat_template_kwargs through to the jinja template
+        # — e.g. `{"enable_thinking": false}` for Qwen3+ to suppress the default
+        # <think> block. Keys unused by the template are silently dropped by
+        # transformers, so this is safe across model families.
         input_ids = await asyncio.to_thread(
             self.tokenizers[key].apply_chat_template,
             messages,
             tokenize=True,
             add_generation_prompt=True,
-            **chat_template_kwargs,
+            **model_config.chat_template_kwargs,
         )
 
         if not isinstance(input_ids, list):
@@ -323,14 +315,8 @@ class GenRM(Base):
                 else list(input_ids)
             )
 
-        # Merge per-request sampling params with default config
-        default_sampling = {
-            "temperature": sampling_config.get("temperature", 0.2),
-            "top_p": sampling_config.get("top_p", 1.0),
-            "top_k": sampling_config.get("top_k", -1),
-            "max_new_tokens": sampling_config.get("max_response_len", 1024),
-        }
-        # Override defaults with per-request params
+        # Per-request sampling params override the model's defaults
+        default_sampling = dict(model_config.sampling_defaults)
         if sampling_params:
             default_sampling.update(sampling_params)
 
@@ -340,12 +326,22 @@ class GenRM(Base):
         }
 
     async def _call_engine(
-        self, route_key: Optional[str], messages: list, sampling_params: Optional[dict] = None
+        self,
+        route_key: Optional[str],
+        messages: list,
+        sampling_params: Optional[dict] = None,
+        request_id: Optional[str] = None,
     ) -> dict:
         """Adapt messages once and call a live engine, retrying transient
-        failures."""
+        failures.
+
+        ``request_id`` becomes the engine rid, so a cancelled caller aborts the
+        engine request before its admission is completed.
+        """
         key, idx, host, port = self._pick_engine(route_key)
         payload = await self.prepare_generate_payload(key, messages, sampling_params)
+        if request_id is not None:
+            payload["rid"] = request_id
 
         # Retry transient resets (transport-level or 5xx) with short backoff so
         # bursty colocate contention doesn't surface as a 500; 4xx is a client bug
@@ -360,6 +356,8 @@ class GenRM(Base):
                 resp.raise_for_status()
                 break
             except asyncio.CancelledError:
+                if request_id is not None:
+                    await self._abort_engine_request(host, port, request_id)
                 raise
             except Exception as e:
                 status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
@@ -374,6 +372,14 @@ class GenRM(Base):
                     continue
                 raise
         return resp.json()
+
+    async def _abort_engine_request(self, host: str, port: int, request_id: str) -> None:
+        try:
+            await self._http_client.post(
+                f"http://{host}:{port}/abort_request", json={"rid": request_id}, timeout=_ABORT_TIMEOUT_S
+            )
+        except Exception as exc:
+            self._logger.warning(f"Abort of GenRM request {request_id} at {host}:{port} failed: {exc}")
 
     @app.get("/health")
     async def health(self) -> dict:
@@ -410,7 +416,7 @@ class GenRM(Base):
         return {"service": "genrm", "instances": instances}
 
     def get_genrm_manager(self, route_key: Optional[str] = None) -> Any:
-        """Get one GenRM manager by route key.
+        """Get one GenRM model handle by route key.
 
         Omitting ``route_key`` remains supported when exactly one instance is
         configured.
@@ -426,14 +432,3 @@ class GenRM(Base):
         """Offload genRM model weights from GPU, for every instance."""
         self._logger.info("GenRM offload requested")
         ray.get([m.offload.remote() for m in self.genrm_managers.values()])
-
-
-# ── Compatibility wrapper for old imports ─────────────────────────────────
-GENRM_ROLE = "genrm"
-
-
-def register_genrm(config, algo: dict) -> list[str]:
-    """Compatibility wrapper; optional-role wiring lives in ``relax.core``."""
-    from relax.core.optional_roles import register_genrm as _register_genrm
-
-    return _register_genrm(config, algo)

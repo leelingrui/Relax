@@ -14,10 +14,8 @@ The ledger is keyed by a *stable* placement-group identity rather than by
 and the receiving process therefore sees a distinct object for the same
 placement group.
 
-Phases model the deferred plans of the lifecycle coordinator: allocations in
-the same phase may never share GPUs, while different phases are expected to
-reuse one slice and are reported as contended so a coordinator can keep them
-mutually exclusive.
+Allocations in the same phase may never share GPUs; different phases may
+reuse one slice because the Manager runs them one at a time.
 """
 
 from dataclasses import dataclass, field
@@ -121,16 +119,6 @@ class PlacementRelease:
     placement_group_key: str
     slices: tuple[PlacementSlice, ...] = ()
     remove_placement_group: bool = False
-
-
-@dataclass(frozen=True)
-class PhaseContention:
-    """Phases that share GPUs and therefore must not be active together."""
-
-    placement_group_key: str
-    phases: tuple[str, ...]
-    group_ids: tuple[str, ...]
-    reserved_offsets: tuple[int, ...]
 
 
 class PlacementPlanner:
@@ -336,43 +324,3 @@ class PlacementPlanner:
             else:
                 groups = tuple(self._allocations.values())
             return tuple(entry[1] for group in groups for entry in group.values())
-
-    def contended_phases(self, placement_group: PlacementGroupView | None = None) -> tuple[PhaseContention, ...]:
-        """Report each set of allocations that different phases share.
-
-        This is the input the lifecycle coordinator needs to keep conflicting
-        roles off the same GPUs: every reported group must be activated one
-        phase at a time.
-        """
-        contentions: list[PhaseContention] = []
-        with self._lock:
-            keys = (placement_group.key,) if placement_group is not None else tuple(self._allocations)
-            for key in keys:
-                recorded = self._allocations.get(key, {})
-                for cluster in _overlapping_clusters(entry[1] for entry in recorded.values()):
-                    phases = tuple(sorted({item.phase for item in cluster}))
-                    if len(phases) < 2:
-                        continue
-                    contentions.append(
-                        PhaseContention(
-                            placement_group_key=key,
-                            phases=phases,
-                            group_ids=tuple(sorted(item.group_id for item in cluster)),
-                            reserved_offsets=tuple(sorted({item.reserved_offset for item in cluster})),
-                        )
-                    )
-        return tuple(contentions)
-
-
-def _overlapping_clusters(slices: Iterable[PlacementSlice]) -> list[list[PlacementSlice]]:
-    """Group slices into transitively overlapping bundle ranges."""
-    clusters: list[list[PlacementSlice]] = []
-    for item in sorted(slices, key=lambda value: (value.reserved_offset, value.reserved_size)):
-        reach = (
-            max((other.reserved_offset + other.reserved_size for other in clusters[-1]), default=0) if clusters else 0
-        )
-        if clusters and item.reserved_offset < reach:
-            clusters[-1].append(item)
-        else:
-            clusters.append([item])
-    return clusters

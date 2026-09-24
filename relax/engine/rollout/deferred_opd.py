@@ -43,7 +43,8 @@ def deferred_opd_active(args: Any) -> bool:
 
 
 def required_scoring_fields(opd_manager: Any) -> tuple[str, ...]:
-    """The training fields the scorer must produce for every eligible sample."""
+    """The training fields the scorer must produce for every eligible
+    sample."""
     return tuple(field for field in opd_manager.schema_opd_transfer_data() if field not in _GENERATION_OWNED_FIELDS)
 
 
@@ -107,8 +108,8 @@ class DeferredOpdSession:
     ) -> None:
         """Stand in for ``transfer_batch_to_data_system`` and stage instead.
 
-        Keeps the helper's signature so the step's publication points do not have
-        to know whether scoring is deferred.
+        Keeps the helper's signature so the step's publication points do not
+        have to know whether scoring is deferred.
         """
         del args, data_system_client
         if not batch_samples:
@@ -177,11 +178,10 @@ class DeferredOpdSession:
 
     async def _score_batch(self, samples: list[Sample]) -> tuple[Any, ...]:
         """Score one batch: teacher stage, optional student stage, assemble."""
-        from relax.engine.inference.phase_plans import PHASE_GENERATE, PHASE_TEACHER
-        from relax.engine.rollout.scoring_phase import async_activate_phase, async_scoring_phase
+        from relax.engine.inference.phase_plans import PHASE_TEACHER
+        from relax.engine.rollout.scoring_phase import async_reactivate_generation, async_scoring_phase
 
-        batch_id = f"{self.rollout_id}"
-        async with async_scoring_phase(self.args, PHASE_TEACHER, batch_id=batch_id):
+        async with async_scoring_phase(self.args, PHASE_TEACHER):
             await self.opd_manager.prepare_teacher_inputs(samples)
             results = await self.opd_manager.score_teacher(samples)
         failures = tuple(
@@ -197,14 +197,7 @@ class DeferredOpdSession:
         if self.opd_manager.needs_student_prefill:
             # The student was offloaded for the teacher, so this selection needs
             # its own activation stage before the second pass.
-            activated = await async_activate_phase(
-                PHASE_GENERATE, operation_id=f"student-prefill:{self.rollout_id}:{batch_id}"
-            )
-            if activated is not None and not activated.succeeded:
-                raise RuntimeError(
-                    f"Student reactivation for the second prefill failed: "
-                    f"step={activated.last_confirmed_step} error={activated.error}"
-                )
+            await async_reactivate_generation(self.args)
             await self.opd_manager.score_student_at_teacher(samples, None, self._encode_multimodal_inputs)
         self.opd_manager.assemble_transfer(samples)
         return ()

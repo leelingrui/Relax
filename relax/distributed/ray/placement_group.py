@@ -9,13 +9,6 @@ from relax.core.node_group_affinity import (
     require_control_plane_resource_on_node,
     with_control_plane_affinity,
 )
-from relax.distributed.ray.placement_ledger import plan_placement
-from relax.engine.inference.placement import (
-    PlacementGroupView,
-    PlacementOwner,
-    PlacementPlanner,
-    PlacementRequest,
-)
 from relax.utils.device import ray_get_device_ids
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
@@ -92,7 +85,7 @@ def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
     )
 
 
-def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
+def create_rollout_manager(args, pg, data_source=None, runtime_env=None, inference_manager_handle=None):
     from .rollout import RolloutManager
 
     # Get the head node ID to ensure RolloutManager runs on the head node
@@ -115,7 +108,7 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
                 ),
             },
         )
-    ).remote(args, pg, data_source=data_source)
+    ).remote(args, pg, data_source=data_source, inference_manager_handle=inference_manager_handle)
 
     # Add timeout protection to prevent indefinite blocking during initialization
     # The timeout is set to 120 seconds to allow sufficient time for:
@@ -159,122 +152,19 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     return rollout_manager, num_rollout_per_epoch
 
 
-def create_genrm_manager(args, pg, runtime_env=None, inference_manager_handle=None):
-    """Create and initialize a single GenRM manager (legacy single-instance
-    path).
-
-    Args:
-        args: Argument namespace containing genRM configuration
-        pg: Placement group for resource allocation
-        runtime_env: Optional runtime environment configuration
+def create_genrm_role(args, pg, inference_manager_handle) -> tuple[str, ...]:
+    """Start every GenRM instance declared by
+    ``args._genrm_instances_resolved`` as one model of the GenRM role on the
+    task's inference manager.
 
     Returns:
-        Initialized GenRM manager
+        The GenRM model IDs (route keys), in configuration order.
     """
-    from .inference_role import create_role_managers
+    from relax.distributed.ray.genrm import genrm_role_models
+    from relax.engine.inference.types import Role
 
-    # `name` (with no explicit namespace) lets user code inside other actors of
-    # the same Ray job look this up via ray.get_actor("relax_genrm_manager").
-    # Used by custom_reward_post_process_path when GenRM lifecycle is managed
-    # from userland. Only safe as a fixed, well-known name because this path
-    # is exclusively for the single-instance case (see create_genrm_managers).
-    role_kwargs = {"runtime_env": runtime_env, "actor_names": {"__default__": "relax_genrm_manager"}}
-    if inference_manager_handle is not None:
-        role_kwargs["task_manager_handle"] = inference_manager_handle
-    genrm_manager = create_role_managers(
-        args,
-        "genrm",
-        {"__default__": {"args": (args,), "kwargs": {"pg": pg}}},
-        **role_kwargs,
-    )["__default__"]
-
-    logger.info("GenRMManager initialized successfully")
-
-    # Offload if requested (for colocated mode)
-    if args.offload_rollout:
-        logger.info("Offloading GenRM engines (colocated mode)")
-        ray.get(genrm_manager.offload.remote())
-
-    return genrm_manager
-
-
-def create_genrm_managers(args, pg, runtime_env=None, inference_manager_handle=None):
-    """Create and initialize the GenRM manager(s) declared by
-    ``args._genrm_instances_resolved``.
-
-    Single-instance configs (the legacy --genrm-model-path path, normalized to
-    the sentinel key "__default__") go through ``create_genrm_manager`` so the
-    well-known Ray actor name "relax_genrm_manager" keeps working for userland
-    lookups. Multi-instance configs use CPU model pools in one role Manager;
-    named ``relax_genrm_manager_{key}`` actors only forward legacy calls.
-
-    Returns:
-        ``{route_key: manager_handle}``.
-    """
-    import copy
-
-    from .inference_role import create_role_managers
-
-    instance_specs = args._genrm_instances_resolved
-    if list(instance_specs.keys()) == ["__default__"]:
-        return {
-            "__default__": create_genrm_manager(
-                args, pg, runtime_env=runtime_env, inference_manager_handle=inference_manager_handle
-            )
-        }
-    pool_configs = {}
-    bundle_offset = 0
-    requests = []
-    # The adapters place their engines behind the rollout region under sync
-    # colocate, so the pre-flight check has to validate that same region.
-    region_offset = (
-        0 if args.fully_async or getattr(args, "_genrm_colocate_with_rollout", False) else args.rollout_num_gpus
-    )
-    for index, (key, spec) in enumerate(instance_specs.items()):
-        instance_args = copy.copy(args)
-        instance_args.genrm_model_path = spec["model_path"]
-        instance_args.genrm_num_gpus = spec["num_gpus"]
-        instance_args.genrm_num_gpus_per_engine = spec["num_gpus_per_engine"]
-        instance_args.genrm_engine_config = spec["engine_config"]
-        instance_args.genrm_sampling_config = spec["sampling_config"]
-        pool_configs[key] = {
-            "args": (instance_args,),
-            "kwargs": {"pg": pg, "bundle_offset": bundle_offset, "port_window_index": index},
-        }
-        requests.append(
-            PlacementRequest(
-                group_id=f"genrm/{key}",
-                worker_type="regular",
-                num_gpus=spec["num_gpus"],
-                num_gpus_per_engine=spec["num_gpus_per_engine"],
-                num_gpus_per_node=args.num_gpus_per_node,
-                phase="genrm",
-                bundle_offset=region_offset + bundle_offset,
-            )
-        )
-        bundle_offset += spec["num_gpus"]
-    # Validate the whole layout before anything is spawned. The adapters record
-    # the authoritative slices per replica, so this pre-flight check must not
-    # reserve anything itself.
-    plan_placement(
-        inference_manager_handle or PlacementPlanner(),
-        tuple(requests),
-        PlacementGroupView(tuple(pg[1]), tuple(pg[2]), PlacementOwner.CONTROLLER, identity=pg[0]),
-        dry_run=True,
-    )
-    role_kwargs = {
-        "runtime_env": runtime_env,
-        "actor_names": {key: f"relax_genrm_manager_{key}" for key in instance_specs},
-    }
-    if inference_manager_handle is not None:
-        role_kwargs["task_manager_handle"] = inference_manager_handle
-    managers = create_role_managers(
-        args,
-        "genrm",
-        pool_configs,
-        **role_kwargs,
-    )
+    model_ids = tuple(ray.get(inference_manager_handle.create_role.remote(Role.GENRM, genrm_role_models(args, pg))))
     if getattr(args, "offload_rollout", False):
-        ray.get([manager.offload.remote() for manager in managers.values()])
-    logger.info(f"GenRM managers initialized successfully: instances={list(managers.keys())}")
-    return managers
+        ray.get([inference_manager_handle.call.remote(Role.GENRM, key, "offload") for key in model_ids])
+    logger.info(f"GenRM models initialized successfully: instances={list(model_ids)}")
+    return model_ids

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Pure selection shared by discovery clients and Manager admission.
+"""Pure selection shared by the Gateway and direct discovery clients.
 
 Gateway callers must perform selection under Manager admission, not dispatch
 from a previously observed snapshot. No function here sends or retries
@@ -24,16 +24,19 @@ class RoutingError(ValueError):
 
 
 def resolve_model(snapshot: RoleSnapshot, *, model: str | None = None, route_key: str | None = None) -> ModelSnapshot:
-    """Resolve explicit model, explicit route key, then configured default."""
-    if model is not None:
-        selected = model
-    elif route_key is not None:
+    """Resolve explicit model, then route key mapping, then the default model.
+
+    An unmapped route key falls through to the default model; only a request
+    that none of the three resolves is rejected.
+    """
+    selected = model
+    if selected is None and route_key is not None:
         selected = dict(snapshot.routing.route_key_to_model).get(route_key)
-        if selected is None:
-            raise RoutingError("unknown_route", f"No model configured for route key {route_key!r}", status_code=400)
-    else:
+    if selected is None:
         selected = snapshot.routing.default_model
     if selected is None:
+        if route_key is not None:
+            raise RoutingError("unknown_route", f"No model configured for route key {route_key!r}", status_code=400)
         raise RoutingError("model_required", "No model or default model selected", status_code=400)
     for candidate in snapshot.models:
         if candidate.model_id == selected:
@@ -42,16 +45,25 @@ def resolve_model(snapshot: RoleSnapshot, *, model: str | None = None, route_key
 
 
 def select_target(model: ModelSnapshot, *, cursor: int = 0) -> RouteTarget:
-    """Select the model's Router endpoint.
+    """Select the model's Router, or else a READY direct-eligible replica.
 
-    Internal callers always use the Router. Replica addresses remain discovery
-    observations for external integrations and diagnostics, not request
-    targets.
+    A Router-routed model publishes a Router URL and no direct-eligible
+    replica; a direct-routed model the reverse. ``cursor`` rotates among the
+    eligible replicas and is ignored for a Router.
     """
     if cursor < 0:
         raise RoutingError("invalid_cursor", "Round-robin cursor must be non-negative", status_code=400)
     if not model.admission or model.state != LifecycleState.READY:
         raise RoutingError("unavailable", "Model is not accepting requests", status_code=503, model_id=model.model_id)
-    if not model.router_url:
-        raise RoutingError("unavailable", "Model router is unavailable", status_code=503, model_id=model.model_id)
-    return RouteTarget(model_id=model.model_id, base_url=model.router_url)
+    if model.router_url:
+        return RouteTarget(model_id=model.model_id, base_url=model.router_url)
+    eligible = [
+        replica
+        for replica in model.replicas
+        if replica.direct_eligible and replica.state == LifecycleState.READY and replica.base_url
+    ]
+    if not eligible:
+        raise RoutingError(
+            "unavailable", "Model has no Router or direct replica", status_code=503, model_id=model.model_id
+        )
+    return RouteTarget(model_id=model.model_id, base_url=eligible[cursor % len(eligible)].base_url)

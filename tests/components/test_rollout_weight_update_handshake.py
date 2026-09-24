@@ -27,7 +27,7 @@ from relax.components.rollout import Rollout as RolloutDeployment
 
 # ``Rollout`` is wrapped by ``@serve.deployment`` / ``@serve.ingress`` -- reach
 # the underlying class so we can build a plain shell instance.
-Rollout = RolloutDeployment.func_or_class
+Rollout = RolloutDeployment.func_or_class.__bases__[0]
 
 
 class _RemoteStub:

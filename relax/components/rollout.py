@@ -332,6 +332,7 @@ class Rollout(Base):
         config: Namespace,
         data_source: Optional[Any] = None,
         runtime_env: Optional[dict] = None,  # pyright: ignore[reportMissingTypeArgument]
+        inference_manager_handle: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -340,7 +341,11 @@ class Rollout(Base):
         tq.init(self.config.tq_config)
         self.data_system_client = tq.get_client()
         self.rollout_manager, self.num_rollout_per_epoch = create_rollout_manager(
-            config, pg, data_source=data_source, runtime_env=runtime_env
+            config,
+            pg,
+            data_source=data_source,
+            runtime_env=runtime_env,
+            inference_manager_handle=inference_manager_handle,
         )
         self.step = 0
         self.data_source = data_source
@@ -832,15 +837,7 @@ class Rollout(Base):
         )
 
     @app.get("/engines")
-    async def get_engines(
-        self,
-        model_name: Optional[str] = None,
-        schema_version: Optional[int] = None,
-        status_filter: Optional[str] = None,
-    ):
-        if schema_version == 2:
-            snapshot = await self.rollout_manager.get_discovery_snapshot.remote(model_name, status_filter)
-            return snapshot.to_dict(status_filter)
+    async def get_engines(self, model_name: Optional[str] = None, status_filter: Optional[str] = None):
         result = await self.rollout_manager.get_engines_info.remote(model_name, status_filter)
         return result
 

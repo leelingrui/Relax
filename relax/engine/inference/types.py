@@ -14,6 +14,20 @@ class Role(str, Enum):
     TEACHER = "teacher"
 
 
+class WeightSource(str, Enum):
+    # Loaded once from a checkpoint; never registers for dynamic updates.
+    STATIC = "static"
+    # Policy weights pushed by the trainer through DCS or its colocated path.
+    DCS = "dcs"
+
+
+class RouteMode(str, Enum):
+    # Requests go through the model's SGLang Router.
+    SGLANG_ROUTER = "sglang_router"
+    # Requests go straight to a READY, direct-eligible replica.
+    DIRECT = "direct"
+
+
 class LifecycleState(str, Enum):
     STARTING = "starting"
     READY = "ready"
@@ -24,28 +38,15 @@ class LifecycleState(str, Enum):
 
 
 @dataclass(frozen=True)
-class ModelRef:
-    """A model identity across roles: ``(role, model_id)``, never a path."""
-
-    role: Role
-    model_id: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "role", Role(self.role))
-        if not self.model_id:
-            raise ValueError("A model reference requires a model ID")
-
-    def __str__(self) -> str:
-        return f"{self.role.value}/{self.model_id}"
-
-
-@dataclass(frozen=True)
 class ReplicaSnapshot:
     # Stable logical replica identity; it survives replacement of the process.
     engine_id: str
     state: LifecycleState
     base_url: str | None = None
     weight_version: str | None = None
+    # Whether a client may send requests straight to this replica. Only a READY
+    # replica of a direct-routed model is eligible; the Manager enforces it.
+    direct_eligible: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Return the wire representation used by v2 discovery."""
@@ -54,6 +55,7 @@ class ReplicaSnapshot:
             "base_url": self.base_url,
             "state": self.state.value,
             "weight_version": self.weight_version,
+            "direct_eligible": self.direct_eligible,
         }
 
 
@@ -64,28 +66,32 @@ class ModelSnapshot:
     router_url: str | None = None
     state: LifecycleState | None = None
     admission: bool = False
-    # Whether this model may participate in the deferred inference workflow.
-    allow_defer: bool = False
-    # Whether this model may be accessed directly without the Router.
-    direct_eligible: bool = False
     required_weight_version: str | None = None
+    # PD prefill/decode workers as ``(worker_type, worker)``. Diagnostic only:
+    # requests use the Router, so these are never replicas or direct targets.
+    pd_workers: tuple[tuple[str, ReplicaSnapshot], ...] = ()
 
     def to_dict(self, status_filter: str | None = None) -> dict[str, Any]:
         if status_filter not in (None, "active", "dead"):
             raise ValueError("status_filter must be one of: active, dead")
-        replicas = [
-            replica
-            for replica in self.replicas
-            if status_filter is None or status_filter == ("dead" if replica.state == LifecycleState.DEAD else "active")
-        ]
+
+        def keep(replica: ReplicaSnapshot) -> bool:
+            return status_filter is None or status_filter == (
+                "dead" if replica.state == LifecycleState.DEAD else "active"
+            )
+
+        replicas = [replica for replica in self.replicas if keep(replica)]
         return {
             "state": self.state.value if self.state is not None else None,
             "admission": self.admission,
-            "allow_defer": self.allow_defer,
-            "direct_eligible": self.direct_eligible,
             "router_url": self.router_url,
             "required_weight_version": self.required_weight_version,
             "engines": [replica.to_dict() for replica in replicas],
+            "pd_workers": [
+                {"worker_type": worker_type, **worker.to_dict()}
+                for worker_type, worker in self.pd_workers
+                if keep(worker)
+            ],
         }
 
 
@@ -145,8 +151,6 @@ class RoleSnapshot:
             "models": {model.model_id: model.to_dict(status_filter) for model in self.models},
         }
 
-    to_v2_dict = to_dict
-
     def to_legacy_dict(self, status_filter: str | None = None) -> dict[str, Any]:
         """Project discovery to the legacy rollout ``/engines`` shape.
 
@@ -184,8 +188,6 @@ class RoleSnapshot:
             }
             total_engines += len(engines)
         return {"models": models, "total_engines": total_engines}
-
-    to_legacy_engines = to_legacy_dict
 
 
 @dataclass(frozen=True)
