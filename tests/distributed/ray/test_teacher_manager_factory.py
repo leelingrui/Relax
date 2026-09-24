@@ -10,10 +10,10 @@ from conftest import FakeOwnerHandle
 def owner(monkeypatch):
     import ray
 
-    from relax.distributed.ray import teacher_manager
+    from relax.engine.inference import config_adapters
 
     monkeypatch.setattr(ray, "get", lambda ref, **kwargs: ref)
-    monkeypatch.setattr(teacher_manager, "teacher_role_model", lambda args, **kwargs: ("teacher", None, kwargs))
+    monkeypatch.setattr(config_adapters, "teacher_role_model", lambda args, **kwargs: ("teacher", None, kwargs))
     return FakeOwnerHandle(urls={"default": ["http://teacher"]})
 
 

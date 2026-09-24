@@ -101,6 +101,7 @@ class InferenceManager:
         self._revision: dict[Role, int] = {}
         self._inflight: dict[str, tuple[Role, str]] = {}
         self._rollout_pool: Any = None
+        self._rollout_started = False
         # Loads (switch, onload, recover) run one at a time, owned by the
         # thread running them, and only once no conflicting role is resident.
         # A separate lock, because a waiting load must not block admission or
@@ -491,8 +492,15 @@ class InferenceManager:
 
         if self._rollout_pool is None:
             # The pool registers its servers once they are started.
+            self._rollout_started = False
             self._rollout_pool = RolloutEnginePool(args, placement_group, inference_manager=self)
         return self._rollout_pool.get_primary_router_address()
+
+    def begin_rollout(self) -> None:
+        """Record the first generation before enabling engine health
+        monitoring."""
+        self._rollout_started = True
+        self.rollout_operation("health_monitoring_resume")
 
     @ray.method(concurrency_group="rollout")
     def rollout_operation(self, method: str, /, *args: Any, **kwargs: Any) -> Any:
@@ -501,6 +509,8 @@ class InferenceManager:
             raise RuntimeError("The rollout engine pool has not been created on this manager")
         if method.startswith("_") or not callable(getattr(self._rollout_pool, method, None)):
             raise ValueError(f"Unsupported rollout pool method: {method}")
+        if method == "recover_rollout_engines":
+            kwargs["rollout_started"] = self._rollout_started
         result = getattr(self._rollout_pool, method)(*args, **kwargs)
         return asyncio.run(result) if asyncio.iscoroutine(result) else result
 
@@ -621,8 +631,8 @@ def validate_task_layout(args: Any) -> None:
     layout error in a later role fails the task before an earlier role holds
     GPUs.
     """
-    from relax.distributed.ray.genrm import genrm_role_models
     from relax.distributed.ray.rollout import placement_preview, rollout_role_models
+    from relax.engine.inference.config_adapters import genrm_role_models
     from relax.utils.opd.opd_utils import is_managed_opd_teacher_colocate, is_managed_opd_teacher_enabled
 
     resource = getattr(args, "resource", None) or {}

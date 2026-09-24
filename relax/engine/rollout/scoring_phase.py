@@ -37,9 +37,9 @@ _SCORER_ROLES = {
 
 def _task_inference_manager() -> Any:
     """Find the task InferenceManager from inside the rollout actor process."""
-    from relax.distributed.ray.rollout import get_local_rollout_manager
+    from relax.distributed.ray.rollout_worker import get_local_inference_manager
 
-    return getattr(get_local_rollout_manager(), "task_inference_manager", None)
+    return get_local_inference_manager()
 
 
 def _switch(deactivate: list[Role], activate: list[Role]) -> None:

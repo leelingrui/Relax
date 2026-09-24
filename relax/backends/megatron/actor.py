@@ -860,7 +860,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def _run_step_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
         is_sft = is_sft_mode(self.args)
-        has_rollout = getattr(self, "rollout_manager", None) is not None
+        has_rollout = getattr(self, "rollout_worker", None) is not None
 
         if not is_sft and dist.get_rank() != 0:
             return
@@ -974,7 +974,7 @@ class MegatronTrainRayActor(TrainRayActor):
             else:
                 dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
                 if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
-                    dynamic_size = ray.get(self.rollout_manager.get_dynamic_global_batch_size.remote())
+                    dynamic_size = ray.get(self.rollout_worker.get_dynamic_global_batch_size.remote())
                     batch_size = dynamic_size // dp_size
                     num_rollout_minis = 1
                 else:
@@ -1760,14 +1760,14 @@ class MegatronTrainRayActor(TrainRayActor):
             and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
         ):
             self.save_model(rollout_id, force_sync=is_train_done)
-        has_rollout = getattr(self, "rollout_manager", None) is not None
+        has_rollout = getattr(self, "rollout_worker", None) is not None
         if self._per_step_rollout:
             if self.args.offload_train:
                 self.sleep()
             if has_rollout:
                 self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
-        # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
+        # RL-only generative eval (uses SGLang via rollout_worker.eval). SFT
         # uses local eval/predict runner below.
         dist.barrier(group=get_gloo_group())
         self._run_step_evaluation(rollout_id)
@@ -2421,7 +2421,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if dist.get_rank(group=get_gloo_group()) == 0:
             # Close rollout admission until the new policy weights are published.
-            ray.get(self.rollout_manager.invalidate_inference_state.remote())
+            ray.get(self.inference_manager.rollout_operation.remote("invalidate_inference_state"))
 
         if self.args.offload_train:
             # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
@@ -2436,17 +2436,17 @@ class MegatronTrainRayActor(TrainRayActor):
             # model is static) is deferred to after the weight all-gather: in
             # colocate mode its static pool would collide with the all-gather's
             # temp buffers and OOM. See onload_kv below (post_sync_handles).
-            onload_handles = [self.rollout_manager.onload_weights.remote()]
+            onload_handles = [self.inference_manager.rollout_operation.remote("onload_weights")]
             append_managed_opd_teacher_onload_handle(onload_handles, self)
             ray.get(onload_handles)
 
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.recover_rollout_engines.remote())
+                ray.get(self.inference_manager.rollout_operation.remote("recover_rollout_engines"))
             dist.barrier(group=get_gloo_group())
 
         rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
-            self.rollout_manager.get_rollout_engines_and_lock.remote()
+            self.inference_manager.rollout_operation.remote("get_rollout_engines_and_lock")
         )
 
         # Disaggregate PPO tears down the actor↔rollout NCCL groups on sleep(),
@@ -2468,7 +2468,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
             dist.barrier(group=get_gloo_group())
             if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.clear_num_new_engines.remote())
+                ray.get(self.inference_manager.rollout_operation.remote("clear_num_new_engines"))
 
         with self._train_state_offloader.disable_during_update():
             print_memory("before update_weights")
@@ -2508,7 +2508,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_rollout and dist.get_rank() == 0:
             post_sync_handles = []
             if self._per_step_rollout:
-                post_sync_handles.append(self.rollout_manager.onload_kv.remote())
+                post_sync_handles.append(self.inference_manager.rollout_operation.remote("onload_kv"))
             if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
                 # A list of one or more GenRM manager handles (one per instance).
                 post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
@@ -2516,7 +2516,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(post_sync_handles)
 
         if dist.get_rank(group=get_gloo_group()) == 0:
-            ray.get(self.rollout_manager.complete_inference_weight_update.remote())
+            ray.get(self.inference_manager.rollout_operation.remote("complete_inference_weight_update"))
 
     @timer("wait update_weights_fully_async")
     def _check_services_health(self) -> tuple[bool, bool]:

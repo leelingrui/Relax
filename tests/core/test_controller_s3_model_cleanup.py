@@ -427,11 +427,11 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
         def __init__(self, role):
             self.role = role
 
-        async def get_rollout_manager(self):
+        async def get_rollout_worker(self):
             return object()
 
-        async def set_rollout_manager(self, _manager):
-            events.append("set_rollout_manager")
+        async def set_rollout_handles(self, _worker, _manager):
+            events.append("set_rollout_handles")
 
         def update_weights_fully_async(self):
             async def update():

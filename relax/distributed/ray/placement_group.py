@@ -85,17 +85,22 @@ def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
     )
 
 
-def create_rollout_manager(args, pg, data_source=None, runtime_env=None, inference_manager_handle=None):
-    from .rollout import RolloutManager
+def create_rollout_worker(args, pg, data_source=None, runtime_env=None, inference_manager_handle=None):
+    from .rollout_worker import RolloutWorker
 
-    # Get the head node ID to ensure RolloutManager runs on the head node
-    # This is critical because the Router binds to the SLIME_HOST_IP address,
-    # and other components expect the router to be accessible at the head node's IP
+    if inference_manager_handle is None:
+        raise ValueError("RolloutWorker requires the task inference manager handle")
+    # Validate the CPU host before starting any rollout engines.
     head_node_id = _get_head_node_id()
-    logger.info(f"Scheduling RolloutManager on head node: {head_node_id}")
+    logger.info(f"Scheduling RolloutWorker on head node: {head_node_id}")
     require_control_plane_resource_on_node(args, head_node_id)
 
-    rollout_manager = RolloutManager.options(
+    router = ray.get(inference_manager_handle.create_rollout_role.remote(args, pg))
+    if router["router_ip"] is not None:
+        args.sglang_router_ip = router["router_ip"]
+        args.sglang_router_port = router["router_port"]
+
+    rollout_worker = RolloutWorker.options(
         **with_control_plane_affinity(
             args,
             {
@@ -108,10 +113,7 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None, inferen
                 ),
             },
         )
-    ).remote(args, pg, data_source=data_source, inference_manager_handle=inference_manager_handle)
-
-    # Add timeout protection to prevent indefinite blocking during initialization
-    # The timeout is set to 120 seconds to allow sufficient time for:
+    ).remote(args, data_source=data_source, inference_manager_handle=inference_manager_handle)
 
     # Resolve num_rollout. Semantics:
     #   - both set         -> min(num_rollout, num_epoch * rollout_per_epoch)
@@ -124,14 +126,14 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None, inferen
     if getattr(args, "loss_type", None) == "sft":
         num_rollout_per_epoch = getattr(args, "num_rollout_per_epoch", None)
         logger.info(
-            f"RolloutManager initialized successfully (SFT mode). "
+            f"RolloutWorker initialized successfully (SFT mode). "
             f"num_rollout_per_epoch={num_rollout_per_epoch} (pre-resolved by controller)."
         )
     else:
         num_rollout_per_epoch = ray.get(
-            rollout_manager.get_num_rollout_per_epoch.remote(),
+            rollout_worker.get_num_rollout_per_epoch.remote(),
         )
-        logger.info(f"RolloutManager initialized successfully. num_rollout_per_epoch: {num_rollout_per_epoch}")
+        logger.info(f"RolloutWorker initialized successfully. num_rollout_per_epoch: {num_rollout_per_epoch}")
 
         args.num_rollout_per_epoch = num_rollout_per_epoch
         if args.num_epoch is not None:
@@ -143,13 +145,13 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None, inferen
         )
 
     if args.check_weight_update_equal:
-        ray.get(rollout_manager.check_weights.remote(action="snapshot"))
-        ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
+        ray.get(inference_manager_handle.rollout_operation.remote("check_weights", action="snapshot"))
+        ray.get(inference_manager_handle.rollout_operation.remote("check_weights", action="reset_tensors"))
 
     if args.offload_rollout:
-        ray.get(rollout_manager.offload.remote())
+        ray.get(inference_manager_handle.rollout_operation.remote("offload"))
 
-    return rollout_manager, num_rollout_per_epoch
+    return rollout_worker, num_rollout_per_epoch
 
 
 def create_genrm_role(args, pg, inference_manager_handle) -> tuple[str, ...]:
@@ -160,7 +162,7 @@ def create_genrm_role(args, pg, inference_manager_handle) -> tuple[str, ...]:
     Returns:
         The GenRM model IDs (route keys), in configuration order.
     """
-    from relax.distributed.ray.genrm import genrm_role_models
+    from relax.engine.inference.config_adapters import genrm_role_models
     from relax.engine.inference.types import Role
 
     model_ids = tuple(ray.get(inference_manager_handle.create_role.remote(Role.GENRM, genrm_role_models(args, pg))))

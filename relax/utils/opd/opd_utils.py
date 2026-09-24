@@ -206,7 +206,7 @@ def create_managed_opd_teacher(
     import ray
 
     from relax.distributed.ray.inference_manager import ModelHandle
-    from relax.distributed.ray.teacher_manager import teacher_role_model
+    from relax.engine.inference.config_adapters import teacher_role_model
     from relax.engine.inference.types import Role
 
     model = teacher_role_model(
@@ -348,7 +348,7 @@ def managed_teacher_models(args: Any, pg: Any) -> list[tuple[Any, Any, dict[str,
 
     ``pg`` is the shared actor placement group under colocate, else ``None``.
     """
-    from relax.distributed.ray.teacher_manager import teacher_role_model
+    from relax.engine.inference.config_adapters import teacher_role_model
 
     routes_json = getattr(args, "opd_teacher_routes", None)
     if routes_json is None:
@@ -369,7 +369,7 @@ def managed_teacher_models(args: Any, pg: Any) -> list[tuple[Any, Any, dict[str,
 
 
 def _multi_teacher_models(args: Any, routes_json: str, pg: Any) -> list[tuple[Any, Any, dict[str, Any]]]:
-    from relax.distributed.ray.teacher_manager import teacher_role_model
+    from relax.engine.inference.config_adapters import teacher_role_model
 
     routes_map, gpus_per_teacher, gpus_per_replica = _multi_teacher_layout(args, routes_json)
     models = []

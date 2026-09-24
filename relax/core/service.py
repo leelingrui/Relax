@@ -199,11 +199,11 @@ class Service:
         self._task_ref = self.handle.run.remote()
         return self._task_ref
 
-    async def set_rollout_manager(self, rollout_manager: Any) -> None:
-        await self.handle.set_rollout_manager.remote(rollout_manager)
+    async def set_rollout_handles(self, rollout_worker: Any, inference_manager: Any) -> None:
+        await self.handle.set_rollout_handles.remote(rollout_worker, inference_manager)
 
-    async def get_rollout_manager(self) -> Any:
-        return await self.handle.get_rollout_manager.remote()
+    async def get_rollout_worker(self) -> Any:
+        return await self.handle.get_rollout_worker.remote()
 
     async def set_barriers(self, *, rollout: Any = None, peers: Any = None) -> None:
         await self.handle.set_barriers.remote(rollout=rollout, peers=peers)

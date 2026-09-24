@@ -60,8 +60,8 @@ def create_data_source_actor(config: Namespace, data_source_cls: Any) -> Any:
     return actor_cls.options(**with_control_plane_affinity(config)).remote(config)
 
 
-def _needs_rollout_manager_setup(serve_dict: dict) -> bool:
-    """Skip rollout_manager wiring in SFT-only mode (no rollout role)."""
+def _needs_rollout_worker_setup(serve_dict: dict) -> bool:
+    """Skip rollout_worker wiring in SFT-only mode (no rollout role)."""
     return ROLES.rollout in serve_dict
 
 
@@ -875,11 +875,13 @@ class Controller:
                     self.config,
                 )
 
-                # Always set rollout_manager for both sync and async modes
+                # Always set rollout_worker for both sync and async modes
                 # (needed for scaled-out engine weight sync in fully_async mode)
-                if _needs_rollout_manager_setup(self.serve_dict) and ROLES.actor in self.serve_dict:
-                    rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
-                    await self.serve_dict[ROLES.actor].set_rollout_manager(rollout_manager)
+                if _needs_rollout_worker_setup(self.serve_dict) and ROLES.actor in self.serve_dict:
+                    rollout_worker = await self.serve_dict[ROLES.rollout].get_rollout_worker()
+                    await self.serve_dict[ROLES.actor].set_rollout_handles(
+                        rollout_worker, self._inference_manager_handle
+                    )
 
                     # Colocate wiring topology:
                     #   - actor.rollout_barrier: always, so wake_up doesn't
@@ -890,7 +892,7 @@ class Controller:
                     # In fully_async / hybrid nothing is wired and every
                     # barrier-guarded site short-circuits.
                     if _is_colocate(self.config):
-                        rollout_barrier = RolloutOffloadBarrier(rollout_manager, logger=logger)
+                        rollout_barrier = RolloutOffloadBarrier(self._inference_manager_handle, logger=logger)
                         actor_set_kwargs: dict[str, Any] = {"rollout": rollout_barrier}
                         if ROLES.critic in self.serve_dict:
                             critic_handle = self.serve_dict[ROLES.critic].handle
@@ -997,15 +999,6 @@ class Controller:
         """
         logger.info("Controller shutting down — cleaning up engine processes...")
         self.stop_health_check()
-
-        # Shut down rollout engines via RolloutManager.dispose()
-        if ROLES.rollout in self.serve_dict:
-            try:
-                rollout_manager = run(self.serve_dict[ROLES.rollout].get_rollout_manager())
-                ray.get(rollout_manager.dispose.remote(), timeout=30)
-                logger.info("RolloutManager disposed — SGLang engines shut down.")
-            except Exception as e:
-                logger.warning(f"Failed to dispose RolloutManager: {e}")
 
         shutdown_managed_opd_teacher(self._teacher_manager)
         # The inference manager owns every remaining engine and the Routers it

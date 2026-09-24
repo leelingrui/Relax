@@ -18,7 +18,6 @@ from typing import Any, Callable, Optional
 import numpy as np
 import ray
 import requests
-import transfer_queue as tq
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
@@ -41,7 +40,6 @@ from relax.engine.inference.placement import (
     PlacementSlice,
 )
 from relax.engine.inference.types import LifecycleState, ModelSnapshot, ReplicaSnapshot, Role, WeightSource
-from relax.engine.rollout.workload import RolloutWorkload
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
 from relax.utils.env import Envs
@@ -66,7 +64,6 @@ from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
 from relax.utils.s3_model_loader import build_runai_streamer_env_for_load
 from relax.utils.scale_utils import PrecheckProbeCategory, ScaleOutFailure, ScaleOutFailureCategory
-from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_eval_summary_jsonl,
     save_rollout_result_jsonl,
@@ -987,61 +984,13 @@ class RolloutServer:
         )
 
 
-# In-process singleton set inside RolloutManager.__init__. Only meaningful
-# from code running inside the RolloutManager actor's own process (e.g., a
-# custom_reward_post_process function loaded there). Cross-process access
-# must go through the Ray handle.
-_LOCAL_ROLLOUT_MANAGER: "RolloutManager | None" = None
-
-
-class _ManagerInferencePort:
-    """Adapts the rollout engine pool to :class:`RolloutInferencePort`.
-
-    The workload reaches the engines only through this object, never through
-    ``RolloutServer``/``EngineGroup`` handles.
-    """
-
-    def __init__(self, manager: "RolloutManager") -> None:
-        self._manager = manager
-
-    async def resume_health_monitoring(self) -> None:
-        await self._manager._engine_async("health_monitoring_resume")
-
-    async def inject_ci_fault(self) -> None:
-        await self._manager._engine_async("inject_ci_fault")
-
-    async def onload_kv(self) -> None:
-        await self._manager.onload_kv()
-
-    def router_base_url(self, model_name: str = "default") -> str:
-        args = self._manager.args
-        return f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
-
-
-def get_local_rollout_manager() -> "RolloutManager":
-    # Read via sys.modules to defend against the case where an importer of
-    # this module gets a different module-object namespace than the one
-    # RolloutManager.__init__ wrote into (cloudpickle can create parallel
-    # namespaces when materializing @ray.remote classes in workers).
-    import sys as _sys
-
-    mgr = getattr(_sys.modules[__name__], "_LOCAL_ROLLOUT_MANAGER", None)
-    if mgr is None:
-        raise RuntimeError(
-            "get_local_rollout_manager() called outside the RolloutManager "
-            "actor process, or before it finished __init__. "
-            f"module_id={id(_sys.modules[__name__])}, pid={os.getpid()}"
-        )
-    return mgr
-
-
 class RolloutEnginePool:
     """Engine pool for the rollout role: creation, placement, health, weight
     sync, elastic scale-out/scale-in and shutdown.
 
     Holds every engine actor handle and every GPU resource the rollout role
     owns.  The generation workload never touches this object directly;
-    :class:`RolloutManager` forwards the calls.
+    :class:`InferenceManager` owns this pool and dispatches engine operations.
     """
 
     # Scale-out weight-sync tunables; see relax.utils.env.Envs for semantics/defaults.
@@ -4399,308 +4348,6 @@ class RolloutEnginePool:
                     group.eviction_requested = False
                 if completed and group.lifecycle_status is EngineGroupLifecycle.DRAINING:
                     group.lifecycle_status = EngineGroupLifecycle.ACTIVE
-
-
-@ray.remote(
-    concurrency_groups={
-        "health_monitoring": 1,
-        "scale_out": 1,
-        "scale_in": 1,
-        "scale_coordination": 1,
-        "recover_rollout_engines": 1,
-    }
-)
-class RolloutManager:
-    """Ray actor entry point for the rollout role.
-
-    Generation, evaluation and the data plumbing live in
-    :class:`~relax.engine.rollout.workload.RolloutWorkload`; every GPU
-    engine lives in :class:`RolloutEnginePool`.  This class owns neither:
-    it only wires them together and exposes the Ray method surface.
-    """
-
-    def __init__(self, args, pg, data_source=None, inference_manager_handle=None):
-        self.args = args
-        self.pg = pg
-
-        init_tracking(args, primary=False)
-        # The engine pool builds its HTTP client in the owner's process;
-        # generation runs here, so this process needs one of its own. The call
-        # is idempotent and only builds a client the first time.
-        init_http_client(args)
-
-        tq.init(self.args.tq_config)
-        self.workload = RolloutWorkload(args, data_source, tq.get_client(), _ManagerInferencePort(self))
-
-        if self.args.use_agentic_rollout:
-            from relax.agentic.rollout import init_agentic_resident_pipeline
-
-            init_agentic_resident_pipeline(self.args, self.data_source, self.data_system_client)
-
-        # The task owner creates and holds the engines in its own process, so
-        # this actor cannot start without it.
-        if inference_manager_handle is None:
-            raise ValueError(
-                "RolloutManager requires the task inference manager handle: "
-                "the rollout engines live in the owner's process."
-            )
-        self.task_inference_manager = inference_manager_handle
-        router = ray.get(inference_manager_handle.create_rollout_role.remote(args, pg))
-        if router["router_ip"] is not None:
-            args.sglang_router_ip = router["router_ip"]
-            args.sglang_router_port = router["router_port"]
-
-        # In-process singleton so user code running inside this actor (notably
-        # custom_reward_post_process_func loaded and invoked on the rollout
-        # actor's event loop) can call offload()/onload() directly without a
-        # self-remote call that would deadlock.
-        # We must write into sys.modules[__name__] explicitly: when Ray/cloudpickle
-        # reconstructs the @ray.remote class in the worker, __init__.__globals__
-        # can be a namespace distinct from sys.modules['relax.distributed.ray.rollout'],
-        # so a plain `global _LOCAL_ROLLOUT_MANAGER` write becomes invisible to
-        # any code that imports the module the normal way.
-        import sys as _sys
-
-        _sys.modules[__name__]._LOCAL_ROLLOUT_MANAGER = self
-
-    # ===================== RolloutWorkload delegation =====================
-    #
-    # Generation, evaluation, the data source and the queue client belong to
-    # ``self.workload``; this manager only owns the engine pool. The
-    # forwarders below keep the Ray actor's public method names stable for
-    # existing callers (RolloutService, SFT predict, the training actors).
-
-    @property
-    def data_source(self):
-        return self.workload.data_source
-
-    @property
-    def data_system_client(self):
-        return self.workload.data_system_client
-
-    @property
-    def rollout_id(self) -> int:
-        return self.workload.rollout_id
-
-    @property
-    def generate_rollout(self):
-        return self.workload.generate_rollout
-
-    @property
-    def eval_generate_rollout(self):
-        return self.workload.eval_generate_rollout
-
-    @property
-    def custom_reward_post_process_func(self):
-        return self.workload.custom_reward_post_process_func
-
-    @property
-    def custom_convert_samples_to_train_data_func(self):
-        return self.workload.custom_convert_samples_to_train_data_func
-
-    @property
-    def tokenizer(self):
-        return self.workload.tokenizer
-
-    def reload_function_by_name(self, module_name: str) -> dict:
-        return self.workload.reload_function_by_name(module_name)
-
-    def reload_all_functions(self) -> dict:
-        return self.workload.reload_all_functions()
-
-    def reload_module(self, module_name: str, module_path: str | None = None) -> dict:
-        return self.workload.reload_module(module_name, module_path)
-
-    def get_loaded_modules(self) -> dict:
-        return self.workload.get_loaded_modules()
-
-    def get_loaded_functions_info(self) -> dict:
-        return self.workload.get_loaded_functions_info()
-
-    def get_dynamic_global_batch_size(self):
-        return self.workload.get_dynamic_global_batch_size()
-
-    def get_num_rollout_per_epoch(self):
-        return self.workload.get_num_rollout_per_epoch()
-
-    async def generate(self, rollout_id):
-        await self.workload.generate(rollout_id)
-
-    async def eval(self, rollout_id):
-        await self.workload.eval(rollout_id)
-
-    async def run_predict(self, train_step: int) -> None:
-        await self.workload.run_predict(train_step)
-
-    async def generate_predict(
-        self,
-        prompts: list[str],
-        multimodal_inputs_list: list[dict | None] | None = None,
-    ) -> list[str]:
-        return await self.workload.generate_predict(prompts, multimodal_inputs_list)
-
-    async def save(self, rollout_id):
-        await self.workload.save(rollout_id)
-
-    async def load(self, rollout_id=None):
-        await self.workload.load(rollout_id)
-
-    def set_train_parallel_config(self, config: dict):
-        self.workload.set_train_parallel_config(config)
-
-    # ===================== Engine pool delegation =====================
-    #
-    # Every GPU engine, placement group and lock belongs to the engine pool,
-    # which the task owner holds in its own process. The forwarders below keep
-    # this Ray actor's method names and concurrency groups stable for existing
-    # callers; this actor never holds an engine handle of its own.
-
-    def _engine(self, method: str, /, *args: Any, **kwargs: Any) -> Any:
-        """Run one engine-pool operation in the owner's process.
-
-        Blocking: callers on the event loop must use :meth:`_engine_async`
-        instead, or a slow owner-side operation stalls generation.
-        """
-        return ray.get(self.task_inference_manager.rollout_operation.remote(method, *args, **kwargs))
-
-    async def _engine_async(self, method: str, /, *args: Any, **kwargs: Any) -> Any:
-        return await self.task_inference_manager.rollout_operation.remote(method, *args, **kwargs)
-
-    def dispose(self):
-        return ray.get(self.task_inference_manager.shutdown_role.remote(Role.ROLLOUT))
-
-    def get_rollout_engines_and_lock(self, model_name: str | None = None):
-        return self._engine("get_rollout_engines_and_lock", model_name)
-
-    def get_weight_sync_lock(self):
-        return self._engine("get_weight_sync_lock")
-
-    async def offload(self):
-        return await self._engine_async("offload")
-
-    async def onload(self, tags: list[str] | None = None):
-        return await self._engine_async("onload", tags)
-
-    async def onload_weights(self):
-        return await self._engine_async("onload_weights")
-
-    async def onload_kv(self):
-        return await self._engine_async("onload_kv")
-
-    def get_status(self):
-        return self._engine("get_status")
-
-    @ray.method(concurrency_group="recover_rollout_engines")
-    def recover_rollout_engines(self, model_name: str | None = None):
-        return self._engine("recover_rollout_engines", model_name, rollout_started=self.workload.rollout_id != -1)
-
-    def clear_num_new_engines(self, model_name: str | None = None):
-        return self._engine("clear_num_new_engines", model_name)
-
-    @ray.method(concurrency_group="health_monitoring")
-    def health_monitoring_pause(self) -> None:
-        return self._engine("health_monitoring_pause")
-
-    @ray.method(concurrency_group="health_monitoring")
-    def health_monitoring_resume(self) -> None:
-        return self._engine("health_monitoring_resume")
-
-    async def check_weights(self, action: str):
-        return await self._engine_async("check_weights", action)
-
-    @ray.method(concurrency_group="health_monitoring")
-    def set_force_unhealthy(self, engine_id: int) -> None:
-        return self._engine("set_force_unhealthy", engine_id)
-
-    @ray.method(concurrency_group="scale_coordination")
-    def create_scale_out_request(
-        self,
-        model_name: str = "default",
-        num_replicas: int = 0,
-        engine_urls: Optional[list[str]] = None,
-        timeout_secs: Optional[float] = None,
-    ) -> dict:
-        return self._engine("create_scale_out_request", model_name, num_replicas, engine_urls, timeout_secs)
-
-    @ray.method(concurrency_group="scale_out")
-    async def execute_scale_out(self, request_id: str) -> None:
-        return await self._engine_async("execute_scale_out", request_id)
-
-    @ray.method(concurrency_group="scale_out")
-    def get_scale_out_status(self, request_id: str) -> Optional[dict]:
-        return self._engine("get_scale_out_status", request_id)
-
-    @ray.method(concurrency_group="scale_out")
-    def cancel_scale_out(self, request_id: str) -> Optional[dict]:
-        return self._engine("cancel_scale_out", request_id)
-
-    def get_router_address(self, model_name: str = "default") -> dict:
-        return self._engine("get_router_address", model_name)
-
-    @ray.method(concurrency_group="scale_out")
-    def get_engines_info(self, model_name: Optional[str] = None, status_filter: Optional[str] = None) -> dict:
-        return self._engine("get_engines_info", model_name, status_filter)
-
-    def invalidate_inference_state(self) -> None:
-        return self._engine("invalidate_inference_state")
-
-    def complete_inference_weight_update(self) -> None:
-        return self._engine("complete_inference_weight_update")
-
-    def refresh_inference_state(self) -> None:
-        return self._engine("refresh_inference_state")
-
-    @ray.method(concurrency_group="scale_out")
-    def list_all_scale_out_requests(
-        self, model_name: Optional[str] = None, status_filter: Optional[str] = None
-    ) -> list[dict]:
-        return self._engine("list_all_scale_out_requests", model_name, status_filter)
-
-    @ray.method(concurrency_group="scale_out")
-    async def cancel_all_scale_out_requests(
-        self, model_name: Optional[str] = None, status_filter: Optional[str] = None, dry_run: bool = False
-    ) -> dict:
-        return await self._engine_async("cancel_all_scale_out_requests", model_name, status_filter, dry_run)
-
-    @ray.method(concurrency_group="scale_in")
-    def set_weight_updating(self, is_updating: bool) -> bool:
-        return self._engine("set_weight_updating", is_updating)
-
-    @ray.method(concurrency_group="scale_in")
-    async def sync_weights_for_scaled_out_engines(
-        self,
-        model_name: str = "default",
-        timeout: float = 180.0,
-    ) -> dict:
-        return await self._engine_async("sync_weights_for_scaled_out_engines", model_name, timeout)
-
-    @ray.method(concurrency_group="scale_coordination")
-    def create_scale_in_request(
-        self,
-        model_name: str = "default",
-        num_replicas: int = 0,
-        engine_urls: Optional[list] = None,
-        timeout_secs: Optional[float] = None,
-        force: bool = False,
-        dry_run: bool = False,
-    ) -> dict:
-        return self._engine(
-            "create_scale_in_request", model_name, num_replicas, engine_urls, timeout_secs, force, dry_run
-        )
-
-    @ray.method(concurrency_group="scale_in")
-    async def execute_scale_in(self, request_id: str) -> None:
-        return await self._engine_async("execute_scale_in", request_id)
-
-    @ray.method(concurrency_group="scale_in")
-    def get_scale_in_status(self, request_id: str) -> Optional[dict]:
-        return self._engine("get_scale_in_status", request_id)
-
-    @ray.method(concurrency_group="scale_in")
-    def list_all_scale_in_requests(
-        self, model_name: Optional[str] = None, status_filter: Optional[str] = None
-    ) -> list[dict]:
-        return self._engine("list_all_scale_in_requests", model_name, status_filter)
 
 
 def _allocate_rollout_engine_addr_and_ports_external(args, rollout_engines):

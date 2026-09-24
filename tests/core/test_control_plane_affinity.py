@@ -87,19 +87,19 @@ def test_rollout_data_source_requests_stable_cpu(monkeypatch, tmp_path):
     assert captured["config"] is args
 
 
-def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkeypatch, tmp_path):
+def test_rollout_worker_keeps_node_affinity_and_requests_matching_marker(monkeypatch, tmp_path):
     captured = {}
     node_id = "a" * 56
-    rollout_module = ModuleType("relax.distributed.ray.rollout")
+    rollout_module = ModuleType("relax.distributed.ray.rollout_worker")
 
-    class FakeRolloutManager(_FakeActorClass):
+    class FakeRolloutWorker(_FakeActorClass):
         @classmethod
         def options(cls, **options):
             captured["options"] = options
             return cls
 
-    rollout_module.RolloutManager = FakeRolloutManager
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", rollout_module)
+    rollout_module.RolloutWorker = FakeRolloutWorker
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout_worker", rollout_module)
     monkeypatch.setattr(placement_group_module, "_get_head_node_id", lambda: node_id)
     monkeypatch.setattr(
         placement_group_module.ray,
@@ -114,7 +114,11 @@ def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkey
         offload_rollout=False,
     )
 
-    placement_group_module.create_rollout_manager(args, "pg", runtime_env={"env_vars": {"A": "B"}})
+    owner = SimpleNamespace(create_rollout_role=SimpleNamespace(remote=lambda *a: {"router_ip": None}))
+    monkeypatch.setattr(placement_group_module.ray, "get", lambda value: value)
+    placement_group_module.create_rollout_worker(
+        args, "pg", runtime_env={"env_vars": {"A": "B"}}, inference_manager_handle=owner
+    )
 
     assert captured["options"]["resources"] == {"stable_cpu": 1}
     assert captured["options"]["num_cpus"] == 1

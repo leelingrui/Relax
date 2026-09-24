@@ -52,10 +52,10 @@ def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monke
     )
     owner = FakeOwnerHandle(urls={"math": ["http://math"], "code": ["http://code/generate"]})
     monkeypatch.setattr(ray, "get", lambda ref, **kwargs: ref)
-    from relax.distributed.ray import teacher_manager
+    from relax.engine.inference import config_adapters
 
     monkeypatch.setattr(
-        teacher_manager,
+        config_adapters,
         "teacher_role_model",
         lambda args, **kwargs: (Namespace(name=kwargs["model_id"], path=args.teacher_hf_checkpoint), None, kwargs),
     )

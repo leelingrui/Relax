@@ -26,24 +26,24 @@ import ray
 
 
 class RolloutOffloadBarrier:
-    """Poll the rollout manager until SGLang has offloaded."""
+    """Poll the inference manager until SGLang has offloaded."""
 
     def __init__(
         self,
-        rollout_manager: Any,
+        inference_manager: Any,
         poll_interval: float = 1.0,
         logger: Optional[logging.Logger] = None,
     ) -> None:
-        self._rollout_manager = rollout_manager
+        self._inference_manager = inference_manager
         self._poll_interval = poll_interval
         self._logger = logger
 
     async def wait_offloaded(self) -> None:
-        while ray.get(self._rollout_manager.get_status.remote()) == "onload":
+        while ray.get(self._inference_manager.rollout_operation.remote("get_status")) == "onload":
             await asyncio.sleep(self._poll_interval)
 
     def wait_offloaded_sync(self) -> None:
-        while ray.get(self._rollout_manager.get_status.remote()) == "onload":
+        while ray.get(self._inference_manager.rollout_operation.remote("get_status")) == "onload":
             time.sleep(self._poll_interval)
 
 
