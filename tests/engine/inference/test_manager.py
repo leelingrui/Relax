@@ -216,9 +216,11 @@ def test_manager_switch_times_out_while_another_scorer_holds_the_gpus() -> None:
 
 
 def test_manager_switch_rejects_activating_two_conflicting_roles() -> None:
-    manager, _ = _shared()
-    with pytest.raises(ValueError, match="cannot be active together"):
-        manager.switch([], [Role.GENRM, Role.TEACHER], timeout=0.01)
+    manager, pools = _shared()
+    for roles in ([Role.ROLLOUT, Role.GENRM], [Role.ROLLOUT, Role.TEACHER], [Role.GENRM, Role.TEACHER]):
+        with pytest.raises(ValueError, match="cannot be active together"):
+            manager.switch([], roles, timeout=0.01)
+    assert not any(pool.onloaded for pool in pools.values())
 
 
 def test_manager_switch_reactivates_the_resident_scorer() -> None:
@@ -322,3 +324,68 @@ def test_manager_split_roles_load_without_waiting() -> None:
     manager.onload(Role.GENRM, "judge")
     manager.onload(Role.ROLLOUT, "policy")
     assert judge.onloaded and policy.onloaded
+
+
+def test_manager_failed_offload_keeps_the_gpus_held() -> None:
+    manager, pools = _shared()
+    manager.switch([], [Role.GENRM], timeout=0.01)
+    pools["genrm"].offload = lambda: (_ for _ in ()).throw(RuntimeError("release failed"))
+
+    with pytest.raises(RuntimeError, match="release failed"):
+        manager.offload(Role.GENRM, "judge")
+
+    # DEAD, but the memory may still be held.
+    assert manager.snapshot(Role.GENRM).models[0].state == LifecycleState.DEAD
+    with pytest.raises(TimeoutError, match="genrm"):
+        manager.switch([], [Role.TEACHER], timeout=0.01)
+    assert not pools["teacher"].onloaded
+
+
+def test_manager_shutdown_releases_the_gpus_only_once_it_completes() -> None:
+    manager, pools = _shared()
+    manager.switch([], [Role.GENRM], timeout=0.01)
+    stopping, stopped = threading.Event(), threading.Event()
+
+    def shutdown(planner) -> None:
+        stopping.set()
+        stopped.wait(5.0)
+
+    pools["genrm"].shutdown = shutdown
+    closer = _start(manager.shutdown, Role.GENRM, "judge")
+    assert stopping.wait(5.0)
+    waiter = _start(manager.switch, [], [Role.TEACHER], 5.0)
+    assert waiter.is_alive() and not pools["teacher"].onloaded
+
+    stopped.set()
+    closer.join(5.0)
+    waiter.join(5.0)
+    assert not waiter.is_alive() and pools["teacher"].onloaded
+
+
+def test_manager_failed_shutdown_keeps_the_gpus_held() -> None:
+    manager, pools = _shared()
+    manager.switch([], [Role.GENRM], timeout=0.01)
+    pools["genrm"].shutdown = lambda planner: (_ for _ in ()).throw(RuntimeError("kill failed"))
+
+    with pytest.raises(RuntimeError, match="kill failed"):
+        manager.shutdown(Role.GENRM, "judge")
+    with pytest.raises(TimeoutError, match="genrm"):
+        manager.switch([], [Role.TEACHER], timeout=0.01)
+
+
+def test_manager_weights_only_onload_holds_the_gpus() -> None:
+    manager, pools = _shared()
+    rollout = pools["rollout"]
+
+    def onload(tags=None) -> None:
+        # Like the engine pool, only a KV-cache onload reports the model loaded.
+        rollout.onloaded = tags is None
+
+    rollout.onload = onload
+    manager.onload(Role.ROLLOUT, "policy", ["weights"])
+
+    assert manager.snapshot(Role.ROLLOUT).models[0].state == LifecycleState.SLEEPING
+    with pytest.raises(TimeoutError, match="rollout"):
+        manager.switch([], [Role.TEACHER], timeout=0.01)
+    manager.switch([Role.ROLLOUT], [Role.TEACHER], timeout=0.01)
+    assert pools["teacher"].onloaded

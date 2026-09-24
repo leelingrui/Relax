@@ -45,11 +45,6 @@ SWITCH_DRAIN_TIMEOUT_S = 600.0
 
 _LIFECYCLE_METHODS = frozenset({"onload", "offload", "recover", "health_check", "shutdown"})
 _QUERY_METHODS = frozenset({"get_urls", "get_engine_hosts_ports"})
-# States in which a model holds no GPU memory.
-_RELEASED = (LifecycleState.SLEEPING, LifecycleState.DEAD)
-# A waiting load re-checks residency this often, for releases it is not told
-# about (an engine the health monitor found dead).
-_GPU_WAIT_POLL_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -86,6 +81,11 @@ class _Model:
     pool: Any
     snapshot: ModelSnapshot
     lock: RLock = field(default_factory=RLock)
+    # Whether the model may hold GPU memory. Lifecycle state cannot tell:
+    # DEAD is published before a failed offload or a shutdown has released
+    # anything, and a weights-only onload reports SLEEPING. Set before every
+    # load and cleared only once an offload or shutdown has succeeded.
+    resident: bool = True
 
 
 class InferenceManager:
@@ -280,6 +280,7 @@ class InferenceManager:
         with self._loading([role]):
             entry = self._model(role, model_id)
             with entry.lock:
+                entry.resident = True
                 self.set_state(role, model_id, LifecycleState.ONLOADING)
                 try:
                     entry.pool.onload(tags)
@@ -296,6 +297,7 @@ class InferenceManager:
                 except Exception:
                     self.set_state(role, model_id, LifecycleState.DEAD)
                     raise
+                entry.resident = False
                 self.set_state(role, model_id, LifecycleState.SLEEPING)
         finally:
             # A load waiting for these GPUs re-checks now.
@@ -308,6 +310,7 @@ class InferenceManager:
         with self._loading([role]):
             entry = self._model(role, model_id)
             with entry.lock:
+                entry.resident = True
                 self.set_state(role, model_id, LifecycleState.STARTING)
                 try:
                     entry.pool.recover()
@@ -327,6 +330,7 @@ class InferenceManager:
             self.set_state(role, model_id, LifecycleState.DEAD)
             try:
                 entry.pool.shutdown(self.placement)
+                entry.resident = False
             finally:
                 # Stopping engines reports a topology change; the model stays DEAD.
                 self.set_state(role, model_id, LifecycleState.DEAD)
@@ -394,7 +398,7 @@ class InferenceManager:
                     raise TimeoutError(
                         f"GPUs for {[role.value for role in roles]} still held by {holders} after {timeout}s"
                     )
-                self._gpus_changed.wait(min(remaining, _GPU_WAIT_POLL_S))
+                self._gpus_changed.wait(remaining)
             self._gpu_owner = get_ident()
         try:
             yield
@@ -426,7 +430,7 @@ class InferenceManager:
     def _resident(self, role: Role) -> bool:
         with self._lock:
             models = tuple(self._models.get(role, {}).values())
-        return any(model.snapshot.state not in _RELEASED for model in models)
+        return any(model.resident for model in models)
 
     def _blockers(self, roles: Sequence[Role], released: Sequence[Role]) -> list[Role]:
         with self._lock:
