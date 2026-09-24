@@ -761,10 +761,13 @@ class RolloutServer:
         """Release memory occupation across all groups (concurrent)."""
         if self.static and not self.onloaded:
             return []
-        self.onloaded = False
         if self.static:
+            # Stay onloaded until the release succeeds, so a retry after a
+            # failed release is not skipped as already offloaded.
             self._retire(self._call_heads("release_memory_occupation"))
+            self.onloaded = False
             return []
+        self.onloaded = False
         handles = []
         for g in self.engine_groups:
             handles.extend(g.offload())

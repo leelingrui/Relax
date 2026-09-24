@@ -107,6 +107,33 @@ def test_static_server_offload_and_onload_are_idempotent(patch_ray_get: Any) -> 
     assert server.observe().state == LifecycleState.READY
 
 
+def test_static_server_retries_offload_after_a_failed_release(patch_ray_get: Any, monkeypatch: Any) -> None:
+    engine = _observed_engine(None)
+    server = make_rollout_server(engine_groups=[make_engine_group(engines=[engine])])
+    server.static = True
+    server.model_spec = ModelConfig("default", "ckpt", weight_source=WeightSource.STATIC)
+    server.onloaded = True
+    engine.release_memory_occupation.remote.return_value = AwaitableValue(RuntimeError("busy"))
+    get = ray.get
+
+    def checked_get(ref: Any, **kwargs: Any) -> Any:
+        result = get(ref, **kwargs)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(ray, "get", checked_get)
+
+    with pytest.raises(RuntimeError, match="busy"):
+        server.offload()
+    # The memory is still held, so the retry releases it again.
+    engine.release_memory_occupation.remote.return_value = AwaitableValue(None)
+    server.offload()
+
+    assert engine.release_memory_occupation.remote.call_count == 2
+    assert server.observe().state == LifecycleState.SLEEPING
+
+
 def test_policy_weights_onload_retires_dead_engine_before_recovery(patch_ray_get: Any, monkeypatch: Any) -> None:
     dead, healthy, rebuilt = [_observed_engine() for _ in range(3)]
     dead.resume_memory_occupation.remote.return_value = AwaitableValue(ConnectionError("server exited"))

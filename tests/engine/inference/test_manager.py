@@ -389,3 +389,33 @@ def test_manager_weights_only_onload_holds_the_gpus() -> None:
         manager.switch([], [Role.TEACHER], timeout=0.01)
     manager.switch([Role.ROLLOUT], [Role.TEACHER], timeout=0.01)
     assert pools["teacher"].onloaded
+
+
+def test_manager_failed_role_shutdown_keeps_the_gpus_held() -> None:
+    manager, pools = _shared()
+    manager.switch([], [Role.GENRM], timeout=0.01)
+    stop = pools["genrm"].shutdown
+    pools["genrm"].shutdown = lambda planner: (_ for _ in ()).throw(RuntimeError("kill failed"))
+
+    with pytest.raises(RuntimeError, match="genrm"):
+        manager.shutdown_role(Role.GENRM)
+    assert "genrm" in manager.roles()
+    with pytest.raises(TimeoutError, match="genrm"):
+        manager.switch([], [Role.TEACHER], timeout=0.01)
+
+    pools["genrm"].shutdown = stop
+    manager.shutdown_role(Role.GENRM)
+    assert "genrm" not in manager.roles()
+    manager.switch([], [Role.TEACHER], timeout=0.01)
+    assert pools["teacher"].onloaded
+
+
+def test_manager_role_shutdown_retry_stops_only_the_failed_models() -> None:
+    judge, backup = FakePool("judge"), FakePool("backup")
+    manager = _manager(genrm={"judge": judge, "backup": backup})
+    backup.shutdown = lambda planner: (_ for _ in ()).throw(RuntimeError("kill failed"))
+
+    with pytest.raises(RuntimeError):
+        manager.shutdown_role(Role.GENRM)
+    assert manager.model_ids(Role.GENRM) == ("backup",)
+    assert judge.calls == ["shutdown"]

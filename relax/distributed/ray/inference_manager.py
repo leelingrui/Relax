@@ -544,22 +544,28 @@ class InferenceManager:
         if role is Role.ROLLOUT and self._rollout_pool is not None:
             self._rollout_pool.stop_monitors()
             self._rollout_pool = None
-        errors = []
+        errors = {}
         for model_id in self.model_ids(role):
             try:
                 self.shutdown(role, model_id)
             except Exception as exc:
-                errors.append(exc)
+                errors[model_id] = exc
         with self._lock:
-            self._models.pop(role, None)
-            self._routing.pop(role, None)
-            self._revision.pop(role, None)
+            if errors:
+                # A model that failed to stop may still hold its GPUs: keep it
+                # registered so conflicting loads keep waiting, and a retry
+                # shuts down only what is left.
+                self._models[role] = {k: v for k, v in self._models[role].items() if k in errors}
+            else:
+                self._models.pop(role, None)
+                self._routing.pop(role, None)
+                self._revision.pop(role, None)
         if not self._models:
             from relax.distributed.ray.rollout import stop_launched_routers
 
             stop_launched_routers()
         if errors:
-            raise RuntimeError(f"Failed to shut down inference role {role.value}") from errors[0]
+            raise RuntimeError(f"Failed to shut down inference role {role.value}") from next(iter(errors.values()))
 
     def shutdown_all(self) -> None:
         errors = []
