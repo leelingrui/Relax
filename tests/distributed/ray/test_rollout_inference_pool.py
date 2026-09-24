@@ -250,3 +250,39 @@ def test_engine_recovery_still_drops_an_engine_whose_shutdown_timed_out(patch_ra
     _, group, _ = _stopping_group(ray.exceptions.GetTimeoutError("timed out"))
     group.shutdown_engines({0})
     assert group.all_engines == [None]
+
+
+def _static_server(*engines: Any) -> Any:
+    group = make_engine_group(engines=list(engines))
+    server = make_rollout_server(engine_groups=[group])
+    server.static = True
+    server.onloaded = True
+    server.model_spec = ModelConfig("judge", "ckpt", weight_source=WeightSource.STATIC)
+    return server, group
+
+
+def _timed_out_release(stop: Any) -> tuple[Any, Any, Any, Any]:
+    hung, healthy = make_mock_engine(), make_mock_engine()
+    hung.release_memory_occupation.remote.return_value = AwaitableValue(ray.exceptions.GetTimeoutError("timed out"))
+    hung.shutdown.remote.return_value = AwaitableValue(stop)
+    healthy.release_memory_occupation.remote.return_value = AwaitableValue(None)
+    server, group = _static_server(hung, healthy)
+    return server, group, hung, healthy
+
+
+def test_static_offload_fails_while_a_timed_out_release_may_hold_gpus(patch_ray_get: Any, monkeypatch: Any) -> None:
+    kill = _raising_get(monkeypatch)
+    server, group, hung, healthy = _timed_out_release(ray.exceptions.GetTimeoutError("shutdown timed out"))
+
+    with pytest.raises(RuntimeError, match="may still hold GPU memory"):
+        server.offload()
+    assert group.all_engines == [hung, healthy] and server.onloaded
+    kill.assert_not_called()
+
+
+def test_static_offload_retires_a_timed_out_release_once_shut_down(patch_ray_get: Any, monkeypatch: Any) -> None:
+    _raising_get(monkeypatch)
+    server, group, _, healthy = _timed_out_release(None)
+
+    server.offload()
+    assert group.all_engines == [None, healthy] and not server.onloaded

@@ -780,8 +780,10 @@ class RolloutServer:
             return []
         if self.static:
             # Stay onloaded until the release succeeds, so a retry after a
-            # failed release is not skipped as already offloaded.
-            self._retire(self._call_heads("release_memory_occupation"))
+            # failed release is not skipped as already offloaded. An engine
+            # whose release timed out is retired as dead but may still hold
+            # the GPUs, so the offload fails unless its shutdown is confirmed.
+            self._retire(self._call_heads("release_memory_occupation"), strict=True)
             self.onloaded = False
             return []
         self.onloaded = False
@@ -845,9 +847,17 @@ class RolloutServer:
                 dead.append((g, i))
         return dead
 
-    def _retire(self, dead: list[tuple[EngineGroup, int]]) -> None:
+    def _retire(self, dead: list[tuple[EngineGroup, int]], *, strict: bool = False) -> None:
+        """Shut down dead engines; ``strict`` as in
+        :meth:`EngineGroup.shutdown_engines`, raising once all were tried."""
+        errors = []
         for g, i in dead:
-            g.shutdown_engines(set(range(i, i + g.nodes_per_engine)))
+            try:
+                g.shutdown_engines(set(range(i, i + g.nodes_per_engine)), strict=strict)
+            except RuntimeError as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
 
     def _rebuild(self) -> frozenset:
         """Rebuild dead engines of a fault-tolerant static pool; return
