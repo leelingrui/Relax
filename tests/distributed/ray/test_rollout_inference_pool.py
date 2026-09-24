@@ -286,3 +286,26 @@ def test_static_offload_retires_a_timed_out_release_once_shut_down(patch_ray_get
 
     server.offload()
     assert group.all_engines == [None, healthy] and not server.onloaded
+
+
+@pytest.mark.parametrize("static", [True, False])
+def test_onload_keeps_a_timed_out_engine_instead_of_rebuilding_on_its_gpus(
+    patch_ray_get: Any, monkeypatch: Any, static: bool
+) -> None:
+    kill = _raising_get(monkeypatch)
+    hung, healthy = make_mock_engine(), make_mock_engine()
+    hung.resume_memory_occupation.remote.return_value = AwaitableValue(TimeoutError("resume timed out"))
+    hung.shutdown.remote.return_value = AwaitableValue(TimeoutError("shutdown timed out"))
+    healthy.resume_memory_occupation.remote.return_value = AwaitableValue(None)
+    server, group = _static_server(hung, healthy)
+    server.static = static
+    server.onloaded = False
+    server.model_spec = ModelConfig("judge", "ckpt", fault_tolerance_enabled=True)
+    server.recover = MagicMock()
+
+    # Serving degraded beats failing the onload; nothing starts on the hung engine's GPUs.
+    server.onload(None if static else ["weights"])
+
+    assert group.all_engines == [hung, healthy]
+    server.recover.assert_not_called()
+    kill.assert_not_called()

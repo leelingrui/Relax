@@ -783,7 +783,7 @@ class RolloutServer:
             # failed release is not skipped as already offloaded. An engine
             # whose release timed out is retired as dead but may still hold
             # the GPUs, so the offload fails unless its shutdown is confirmed.
-            self._retire(self._call_heads("release_memory_occupation"), strict=True)
+            self._retire(self._call_heads("release_memory_occupation"))
             self.onloaded = False
             return []
         self.onloaded = False
@@ -804,7 +804,7 @@ class RolloutServer:
             rebuilt = self._rebuild()
             dead = self._call_heads("resume_memory_occupation", skip=rebuilt, tags=tags)
             if dead:
-                self._retire(dead)
+                self._retire(dead, degrade=True)
                 self._rebuild()
             result = []
         elif (
@@ -814,7 +814,7 @@ class RolloutServer:
         ):
             # Monitoring is paused while asleep. Retire dead handles here so
             # the following recovery can rebuild and reconnect weight sync.
-            self._retire(self._call_heads("resume_memory_occupation", tags=tags))
+            self._retire(self._call_heads("resume_memory_occupation", tags=tags), degrade=True)
             result = []
         else:
             handles = []
@@ -847,17 +847,26 @@ class RolloutServer:
                 dead.append((g, i))
         return dead
 
-    def _retire(self, dead: list[tuple[EngineGroup, int]], *, strict: bool = False) -> None:
-        """Shut down dead engines; ``strict`` as in
-        :meth:`EngineGroup.shutdown_engines`, raising once all were tried."""
+    def _retire(self, dead: list[tuple[EngineGroup, int]], *, degrade: bool = False) -> None:
+        """Shut down engines that failed or timed out, trying all before
+        raising.
+
+        An engine whose shutdown is not confirmed may still hold its GPUs, so
+        it keeps its handle (see :meth:`EngineGroup.shutdown_engines`) and no
+        engine is rebuilt on top of it. With ``degrade`` the pool logs that and
+        serves with the rest; a later offload retries the shutdown.
+        """
         errors = []
         for g, i in dead:
             try:
-                g.shutdown_engines(set(range(i, i + g.nodes_per_engine)), strict=strict)
+                g.shutdown_engines(set(range(i, i + g.nodes_per_engine)), strict=True)
             except RuntimeError as exc:
                 errors.append(exc)
-        if errors:
+        if not errors:
+            return
+        if not degrade:
             raise errors[0]
+        logger.error(f"[{self.model_name}] continuing without engines that may still hold GPUs: {errors}")
 
     def _rebuild(self) -> frozenset:
         """Rebuild dead engines of a fault-tolerant static pool; return
