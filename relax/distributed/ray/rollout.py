@@ -571,20 +571,29 @@ class EngineGroup:
                 failed_indices.add(i)
         return failed_indices
 
-    def shutdown_engines(self, indices: set[int]) -> None:
+    def shutdown_engines(self, indices: set[int], *, strict: bool = False) -> None:
         """Shutdown engines at the given indices.
 
         This removes the engines from the group and unregisters them from
-        router and DCS.
+        router and DCS. With ``strict``, an engine whose SGLang processes may
+        still hold GPU memory (its shutdown failed while the actor was alive,
+        or it could not be killed) keeps its handle, and a RuntimeError is
+        raised once the rest are shut down. It is then not killed: only its own
+        shutdown can stop those processes, so a retry can still free them.
         """
         self.notify_topology_change()
+        failed = []
         for i in indices:
             engine = self.all_engines[i]
             if engine is not None:
+                released = True
                 try:
                     ray.get(engine.shutdown.remote(), timeout=10)
                 except Exception as e:
                     logger.warning(f"Failed to shutdown engine {i}: {e}")
+                    # A dead actor cannot stop its processes any more; a live
+                    # one that failed or timed out may not have.
+                    released = not strict or isinstance(e, ray.exceptions.RayActorError)
                 try:
                     ray.get(engine.unregister_dcs.remote(), timeout=10)
                 except Exception as e:
@@ -593,12 +602,20 @@ class EngineGroup:
                     ray.get(engine.unregister_from_router.remote(), timeout=10)
                 except Exception as e:
                     logger.warning(f"Failed to unregister engine {i} from router: {e}")
+                if not released:
+                    failed.append(i)
+                    continue
                 try:
                     ray.kill(engine)
                 except Exception as e:
                     logger.warning(f"Failed to kill engine {i}: {e}")
+                    if strict:
+                        failed.append(i)
+                        continue
             self.all_engines[i] = None
             logger.info(f"Shutdown engine at index {i}")
+        if failed:
+            raise RuntimeError(f"Engines {sorted(failed)} may still hold GPU memory after shutdown")
 
 
 @dataclasses.dataclass
@@ -867,7 +884,7 @@ class RolloutServer:
     def shutdown(self, planner: PlacementPlanner | None = None) -> None:
         """Stop every engine and give back the placement this server holds."""
         for g in self.engine_groups:
-            g.shutdown_engines(set(range(len(g.all_engines))))
+            g.shutdown_engines(set(range(len(g.all_engines))), strict=True)
             if planner is not None and g.placement is not None:
                 if planner.release(g.placement).remove_placement_group:
                     from ray.util.placement_group import remove_placement_group

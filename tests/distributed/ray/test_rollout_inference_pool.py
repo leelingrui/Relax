@@ -183,3 +183,70 @@ def test_policy_onload_other_paths_still_propagate_failure(
     server.model_spec = ModelConfig("default", "ckpt", fault_tolerance_enabled=fault_tolerance)
     with pytest.raises(ConnectionError, match="server exited"):
         server.onload(tags=tags)
+
+
+def _raising_get(monkeypatch: Any) -> MagicMock:
+    """Make ``ray.get`` raise returned exceptions and stub ``ray.kill``."""
+    get = ray.get
+
+    def checked_get(ref: Any, **kwargs: Any) -> Any:
+        result = get(ref, **kwargs)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(ray, "get", checked_get)
+    kill = MagicMock()
+    monkeypatch.setattr(ray, "kill", kill)
+    return kill
+
+
+def _stopping_group(*results: Any) -> tuple[Any, Any, list[Any]]:
+    engines = [make_mock_engine() for _ in results]
+    for engine, result in zip(engines, results, strict=True):
+        engine.shutdown.remote.return_value = AwaitableValue(result)
+    group = make_engine_group(engines=engines)
+    group.placement = object()
+    return make_rollout_server(engine_groups=[group]), group, engines
+
+
+def test_server_shutdown_keeps_an_engine_whose_shutdown_timed_out(patch_ray_get: Any, monkeypatch: Any) -> None:
+    kill = _raising_get(monkeypatch)
+    server, group, (hung, healthy) = _stopping_group(ray.exceptions.GetTimeoutError("timed out"), None)
+    planner = MagicMock()
+
+    with pytest.raises(RuntimeError, match="may still hold GPU memory"):
+        server.shutdown(planner)
+
+    # Killing the actor would orphan the SGLang processes holding the GPUs.
+    assert group.all_engines == [hung, None]
+    kill.assert_called_once_with(healthy)
+    planner.release.assert_not_called()
+
+
+def test_server_shutdown_keeps_an_engine_that_could_not_be_killed(patch_ray_get: Any, monkeypatch: Any) -> None:
+    kill = _raising_get(monkeypatch)
+    kill.side_effect = RuntimeError("GCS unavailable")
+    server, group, (engine,) = _stopping_group(None)
+
+    with pytest.raises(RuntimeError, match="may still hold GPU memory"):
+        server.shutdown(MagicMock())
+    assert group.all_engines == [engine]
+
+
+def test_server_shutdown_accepts_an_already_dead_engine(patch_ray_get: Any, monkeypatch: Any) -> None:
+    _raising_get(monkeypatch)
+    server, group, _ = _stopping_group(ray.exceptions.RayActorError())
+    planner = MagicMock()
+    planner.release.return_value.remove_placement_group = False
+
+    server.shutdown(planner)
+    assert group.all_engines == [None]
+    planner.release.assert_called_once_with(group.placement)
+
+
+def test_engine_recovery_still_drops_an_engine_whose_shutdown_timed_out(patch_ray_get: Any, monkeypatch: Any) -> None:
+    _raising_get(monkeypatch)
+    _, group, _ = _stopping_group(ray.exceptions.GetTimeoutError("timed out"))
+    group.shutdown_engines({0})
+    assert group.all_engines == [None]
