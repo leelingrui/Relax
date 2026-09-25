@@ -1124,7 +1124,12 @@ class SGLangEngine(RayActor):
         from sglang.srt.constants import GPU_MEMORY_ALL_TYPES
 
         self._released_memory = set(GPU_MEMORY_ALL_TYPES)
-        if self.role == Role.GENRM:
+        if self.role in (Role.GENRM, Role.TEACHER):
+            if self.node_rank == 0:
+                deadline = time.monotonic() + _GENRM_OFFLOAD_DRAIN_TIMEOUT_S
+                self._pause_generation_for_offload(deadline)
+            if self.node_rank == 0 and not self.unregister_from_router(wait_for_removal=True):
+                raise RuntimeError(f"Cannot offload {self.role.value} while its Router worker is still registered")
             return self._release_genrm_memory_occupation()
         self.flush_cache()
         return self._make_request("release_memory_occupation")
@@ -1136,14 +1141,17 @@ class SGLangEngine(RayActor):
             {"tags": tags},
         )
         self._released_memory = set() if tags is None else getattr(self, "_released_memory", set()) - set(tags)
-        # Re-open admission that the GenRM release closed via
+        # Re-open admission that the GenRM/teacher release closed via
         # /pause_generation. Only after a full resume (weights + KV cache back):
-        # GenRM always full-resumes, but the ``not tags`` guard prevents
+        # Static models normally full-resume, but the ``not tags`` guard prevents
         # re-enabling generation before KV cache exists if a partial
         # (weights-only) resume is ever introduced. Not swallowed — if the
-        # engine stays paused, GenRM silently stops serving, so fail loudly.
-        if self.role == Role.GENRM and self.node_rank == 0 and not tags:
+        # engine stays paused, the model silently stops serving, so fail loudly.
+        if self.role in (Role.GENRM, Role.TEACHER) and self.node_rank == 0 and not tags:
             self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+            if not self.register_to_router():
+                self.pause_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+                raise RuntimeError(f"Cannot register resumed {self.role.value} engine with its Router")
         return result
 
     def check_weights(self, action: str):
@@ -1419,7 +1427,15 @@ class SGLangEngine(RayActor):
                         parsed = json.loads(line)
                         break
                     except json.JSONDecodeError:
-                        continue
+                        # NCCL writes to stderr concurrently with the probe's
+                        # stdout, so its last log line can prefix the JSON.
+                        json_start = line.find('{"device_id":')
+                        if json_start >= 0:
+                            try:
+                                parsed = json.loads(line[json_start:])
+                                break
+                            except json.JSONDecodeError:
+                                pass
                 # Category is derived from structured signals only: the manager
                 # deadline, the subprocess exit code, and its JSON — never by
                 # scanning the NCCL log text.
@@ -1525,22 +1541,21 @@ class SGLangEngine(RayActor):
             run(self.checkpoint_engine_client.unregister())
 
     def _release_genrm_memory_occupation(self):
-        # GenRM is colocated on the training GPUs, so it must offload at the
-        # rollout->train transition. Two failure modes are defended against here:
+        # Static inference models can be offloaded while their raw SGLang ports
+        # remain reachable. Two failure modes are defended against here:
         #
         # 1. Admission race. SGLang's release_memory_occupation asserts the
         #    scheduler is idle (``_is_no_request``); a straggler agentic
         #    /generate admitted between our flush and the release crashes the
-        #    scheduler. relax has no hard barrier guaranteeing all agentic
-        #    sessions are quiesced before offload, so /pause_generation
+        #    scheduler. Even after Manager admission closes, raw ports can
+        #    receive requests, so /pause_generation
         #    (mode="abort", the default) is issued first: it stops the scheduler
         #    from admitting new requests for the whole offloaded window AND
         #    aborts everything in flight. Admission is re-opened by
         #    continue_generation in resume_memory_occupation, after weights + KV
         #    cache are back. We still abort on each retry as a fallback in case
-        #    the pause did not take (best-effort). Safe because the batch's
-        #    reward/judge is already computed by offload time — no in-flight
-        #    GenRM request needs to survive.
+        #    the pause did not take (best-effort). The lifecycle manager has
+        #    already drained admitted requests before offloading.
         #
         # 2. Unbounded hang. Every HTTP call must have a timeout and the whole
         #    drain must be bounded by a wall-clock deadline. Otherwise a wedged
@@ -1552,7 +1567,7 @@ class SGLangEngine(RayActor):
             connect_errors = 0
             while True:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("Timeout while draining GenRM before release.")
+                    raise TimeoutError(f"Timeout while draining {self.role.value} before release.")
                 self.abort_requests(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
                 try:
                     resp = requests.get(
@@ -1569,17 +1584,17 @@ class SGLangEngine(RayActor):
                     connect_errors += 1
                     logger.warning(
                         f"Cannot reach {self.server_host}:{self.server_port}/flush_cache while "
-                        f"draining GenRM ({connect_errors}/{_MAX_CONSECUTIVE_CONNECT_ERRORS}): {e}"
+                        f"draining {self.role.value} ({connect_errors}/{_MAX_CONSECUTIVE_CONNECT_ERRORS}): {e}"
                     )
                     if connect_errors >= _MAX_CONSECUTIVE_CONNECT_ERRORS:
                         raise ConnectionError(
-                            f"GenRM engine {self.server_host}:{self.server_port} unreachable while "
+                            f"{self.role.value} engine {self.server_host}:{self.server_port} unreachable while "
                             f"draining before release ({connect_errors} consecutive connection "
                             f"errors) — the server process is most likely dead."
                         ) from e
                 except Exception as e:  # noqa: BLE001
                     connect_errors = 0
-                    logger.info(f"Error flushing GenRM cache: {e}")
+                    logger.info(f"Error flushing {self.role.value} cache: {e}")
                 time.sleep(1)
         return self._make_request("release_memory_occupation", timeout=_GENRM_OFFLOAD_RELEASE_TIMEOUT_S)
 
@@ -1594,7 +1609,7 @@ class SGLangEngine(RayActor):
         try:
             self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
+            logger.warning(f"{self.role.value} pause_generation before offload failed (continuing to drain): {e}")
 
 
 def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:

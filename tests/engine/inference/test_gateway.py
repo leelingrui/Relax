@@ -91,6 +91,31 @@ async def test_gateway_reuses_discovery_routing_and_rejects_unavailable_models()
 
 
 @pytest.mark.asyncio
+async def test_gateway_admission_race_returns_retryable_503_without_forwarding() -> None:
+    owner = _owner(lambda: _snapshot(role=Role.TEACHER))
+
+    async def reject(*_args):
+        raise RuntimeError("model offloaded after snapshot")
+
+    owner.admit_request.remote = reject
+    gateway = InferenceGateway(Role.TEACHER, manager_handle=owner)
+
+    def upstream(_request):
+        pytest.fail("rejected requests must not reach the offloaded engine")
+
+    await gateway._client.aclose()
+    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    try:
+        response = await gateway.proxy(_request({"model": "model-a", "input_ids": [1]}), "generate")
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "1"
+        assert json.loads(response.body)["error"]["code"] == "unavailable"
+        assert not owner.inflight
+    finally:
+        await gateway.close()
+
+
+@pytest.mark.asyncio
 async def test_gateway_never_uses_replica_url_when_router_is_missing() -> None:
     snapshot = _snapshot()
     model = replace(

@@ -31,6 +31,7 @@ from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.inference_manager import create_inference_manager
+from relax.engine.inference.types import LifecycleState, Role
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -921,7 +922,28 @@ class Controller:
                         handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async())
                     if ROLES.reference in self.serve_dict:
                         handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async())
-                    [await handle for handle in handles]
+                    update_refs = await asyncio.gather(*handles)
+                    await asyncio.gather(*(ref for ref in update_refs if ref is not None))
+                    if ROLES.rollout in self.serve_dict:
+                        await self._inference_manager_handle.rollout_operation.remote(
+                            "complete_inference_weight_update"
+                        )
+                        snapshot = await self._inference_manager_handle.snapshot.remote(Role.ROLLOUT)
+                        unready = [
+                            {
+                                "model": model.model_id,
+                                "state": model.state.value,
+                                "admission": model.admission,
+                                "versions": [
+                                    (replica.engine_id, replica.weight_version, replica.state.value)
+                                    for replica in model.replicas
+                                ],
+                            }
+                            for model in snapshot.models
+                            if model.state != LifecycleState.READY or not model.admission
+                        ]
+                        if unready:
+                            raise RuntimeError(f"Rollout is not ready after initial weight sync: {unready}")
                 if ROLES.actor in self.serve_dict:
                     step = await self.serve_dict[ROLES.actor].get_step()
                     for service in self.serve_dict.values():

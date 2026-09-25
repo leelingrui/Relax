@@ -177,7 +177,10 @@ class InferenceGateway:
                 exc.status_code, str(exc.detail), code="unavailable" if exc.status_code == 503 else "routing_error"
             )
 
-        request_id = await self._admit(request, model_id)
+        try:
+            request_id = await self._admit(request, model_id)
+        except HTTPException as exc:
+            return _json_error(exc.status_code, str(exc.detail), code="unavailable")
         rid = request_id
         response: Response | None = None
         finished = False
@@ -224,7 +227,11 @@ class InferenceGateway:
             return await self._manager_call("admit_request", self.role, model_id, request_id)
         except Exception as exc:
             self._logger.warning("Inference request admission failed: %s", exc)
-            raise HTTPException(status_code=503, detail="Inference request is not admitted") from exc
+            raise HTTPException(
+                status_code=503,
+                detail="Inference request is not admitted",
+                headers={"Retry-After": "1"},
+            ) from exc
 
     async def _abort_upstream(self, target: str, request_id: str | None) -> None:
         """Send an abort for ``request_id`` to the workers behind ``target``.
