@@ -12,9 +12,10 @@ from ray import serve
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from relax.components.inference_gateway import InferenceGatewayDeployment
+from relax.components.inference_gateway import delete_gateway, deploy_gateway, gateway_deployment_name
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.placement_group import InfoActor, sort_key
+from relax.engine.inference.types import Role
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_ray_accelerator_kwargs, get_serve_url, recovery_load_path
@@ -68,9 +69,11 @@ class Service:
         self._task_ref: Optional[Any] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
-        self._gateway_enabled = role in {"rollout", "genrm"}
+        # Every inference role is fronted by its Gateway; the Teacher has no
+        # Service backend and deploys the same Gateway on its own.
+        self._gateway_enabled = role in {item.value for item in Role}
         self._backend_name = f"{role}_backend" if self._gateway_enabled else role
-        self._gateway_name = f"{role}_gateway" if self._gateway_enabled else None
+        self._gateway_name = gateway_deployment_name(role) if self._gateway_enabled else None
         if actor_rollout_pgs is not None:
             pgs = actor_rollout_pgs
         elif num_gpus == 0:
@@ -123,13 +126,12 @@ class Service:
         backend_prefix = f"/{self.role}/backend" if self._gateway_enabled else f"/{self.role}"
         self.handle = serve.run(self.service, name=self._backend_name, route_prefix=backend_prefix)
         if self._gateway_enabled:
-            gateway = InferenceGatewayDeployment.bind(
+            deploy_gateway(
                 self.role,
                 manager_handle=self.inference_manager_handle,
                 upstream_url=get_serve_url(backend_prefix),
                 genrm_backend_handle=self.handle if self.role == "genrm" else None,
             )
-            serve.run(gateway, name=self._gateway_name, route_prefix=f"/{self.role}")
             logger.info(f"[{self.role}] CPU InferenceGateway deployed at /{self.role}; backend={backend_prefix}")
 
     def _start_heartbeat(self) -> None:
@@ -266,7 +268,7 @@ class Service:
         try:
             serve.delete(self._backend_name)
             if self._gateway_enabled:
-                serve.delete(self._gateway_name)
+                delete_gateway(self.role)
             logger.info(f"[{self.role}] Ray Serve deployment(s) deleted")
         except Exception as e:
             logger.warning(f"[{self.role}] Failed to delete Ray Serve deployment: {e}")

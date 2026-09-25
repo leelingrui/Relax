@@ -19,6 +19,7 @@ from relax.components.base import Base
 from relax.components.inference_gateway import GATEWAY_REQUEST_HEADER
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_worker
+from relax.engine.inference.types import Role
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 
@@ -460,7 +461,7 @@ class Rollout(Base):
                 try:
                     await self.rollout_worker.generate.remote(rollout_id=local_step)
                     if self.config.offload_rollout:
-                        await self.inference_manager.rollout_operation.remote("offload")
+                        await self.inference_manager.deactivate.remote(Role.ROLLOUT)
                 except Exception as e:
                     error_msg = f"Rollout generation failed at step {local_step}: {type(e).__name__}: {str(e)}"
                     self._logger.exception(error_msg)

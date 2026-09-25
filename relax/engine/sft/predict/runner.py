@@ -126,6 +126,8 @@ async def handle_predict(rollout, train_step: int) -> dict[str, Any]:
         # skip here.
         if getattr(rollout.config, "loss_type", None) == "sft" and rollout.config.offload_rollout:
             try:
-                await rollout.inference_manager.rollout_operation.remote("offload")
+                from relax.engine.inference.types import Role
+
+                await rollout.inference_manager.deactivate.remote(Role.ROLLOUT)
             except Exception as exc:
                 rollout._logger.warning(f"Post-predict offload failed at step {train_step}: {exc}")

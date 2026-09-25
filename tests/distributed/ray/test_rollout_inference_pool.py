@@ -19,7 +19,7 @@ from conftest import (
 if HAS_DEPS:
     import ray
 
-    from relax.engine.inference.config import ModelConfig
+    from relax.engine.inference.config import InferenceModelSpec
     from relax.engine.inference.types import LifecycleState, Role, WeightSource
 
 
@@ -92,7 +92,7 @@ def test_static_server_offload_and_onload_are_idempotent(patch_ray_get: Any) -> 
     engine = _observed_engine(None)
     server = make_rollout_server(engine_groups=[make_engine_group(engines=[engine])])
     server.static = True
-    server.model_spec = ModelConfig("default", "ckpt", weight_source=WeightSource.STATIC)
+    server.model_spec = InferenceModelSpec("default", "ckpt", weight_source=WeightSource.STATIC)
     engine.release_memory_occupation.remote.return_value = AwaitableValue(None)
     engine.resume_memory_occupation.remote.return_value = AwaitableValue(None)
 
@@ -111,7 +111,7 @@ def test_static_server_retries_offload_after_a_failed_release(patch_ray_get: Any
     engine = _observed_engine(None)
     server = make_rollout_server(engine_groups=[make_engine_group(engines=[engine])])
     server.static = True
-    server.model_spec = ModelConfig("default", "ckpt", weight_source=WeightSource.STATIC)
+    server.model_spec = InferenceModelSpec("default", "ckpt", weight_source=WeightSource.STATIC)
     server.onloaded = True
     engine.release_memory_occupation.remote.return_value = AwaitableValue(RuntimeError("busy"))
     get = ray.get
@@ -141,7 +141,7 @@ def test_policy_weights_onload_retires_dead_engine_before_recovery(patch_ray_get
     group.pg = object()
     group.args.offload_rollout = True
     server = make_rollout_server(engine_groups=[group])
-    server.model_spec = ModelConfig("default", "ckpt", fault_tolerance_enabled=True)
+    server.model_spec = InferenceModelSpec("default", "ckpt", fault_tolerance_enabled=True)
     server.onloaded = False
     get = ray.get
 
@@ -180,7 +180,7 @@ def test_policy_onload_other_paths_still_propagate_failure(
     group = make_engine_group()
     group.onload = MagicMock(side_effect=ConnectionError("server exited"))
     server = make_rollout_server(engine_groups=[group])
-    server.model_spec = ModelConfig("default", "ckpt", fault_tolerance_enabled=fault_tolerance)
+    server.model_spec = InferenceModelSpec("default", "ckpt", fault_tolerance_enabled=fault_tolerance)
     with pytest.raises(ConnectionError, match="server exited"):
         server.onload(tags=tags)
 
@@ -257,7 +257,7 @@ def _static_server(*engines: Any) -> Any:
     server = make_rollout_server(engine_groups=[group])
     server.static = True
     server.onloaded = True
-    server.model_spec = ModelConfig("judge", "ckpt", weight_source=WeightSource.STATIC)
+    server.model_spec = InferenceModelSpec("judge", "ckpt", weight_source=WeightSource.STATIC)
     return server, group
 
 
@@ -300,7 +300,7 @@ def test_onload_keeps_a_timed_out_engine_instead_of_rebuilding_on_its_gpus(
     server, group = _static_server(hung, healthy)
     server.static = static
     server.onloaded = False
-    server.model_spec = ModelConfig("judge", "ckpt", fault_tolerance_enabled=True)
+    server.model_spec = InferenceModelSpec("judge", "ckpt", fault_tolerance_enabled=True)
     server.recover = MagicMock()
 
     # Serving degraded beats failing the onload; nothing starts on the hung engine's GPUs.

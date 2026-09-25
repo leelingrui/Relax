@@ -925,7 +925,7 @@ class MegatronTrainRayActor(TrainRayActor):
             pre_train_offload_handles = []
             if self.genrm_manager is not None:
                 # A list of one or more GenRM manager handles (one per instance).
-                pre_train_offload_handles.extend(m.offload.remote() for m in self.genrm_manager)
+                pre_train_offload_handles.extend(m.deactivate.remote() for m in self.genrm_manager)
             append_managed_opd_teacher_offload_handle(pre_train_offload_handles, self)
             if pre_train_offload_handles:
                 ray.get(pre_train_offload_handles)
@@ -2436,7 +2436,11 @@ class MegatronTrainRayActor(TrainRayActor):
             # model is static) is deferred to after the weight all-gather: in
             # colocate mode its static pool would collide with the all-gather's
             # temp buffers and OOM. See onload_kv below (post_sync_handles).
-            onload_handles = [self.inference_manager.rollout_operation.remote("onload_weights")]
+            from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+
+            from relax.engine.inference.types import Role
+
+            onload_handles = [self.inference_manager.activate.remote(Role.ROLLOUT, tags=[GPU_MEMORY_TYPE_WEIGHTS])]
             append_managed_opd_teacher_onload_handle(onload_handles, self)
             ray.get(onload_handles)
 
@@ -2506,12 +2510,20 @@ class MegatronTrainRayActor(TrainRayActor):
         # onloading GenRM here (it must stay offloaded for rollout to have
         # all GPUs during generate in shared-bundles mode).
         if self.args.offload_rollout and dist.get_rank() == 0:
+            from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
+
+            from relax.engine.inference.types import Role
+
             post_sync_handles = []
             if self._per_step_rollout:
-                post_sync_handles.append(self.inference_manager.rollout_operation.remote("onload_kv"))
+                post_sync_handles.append(
+                    self.inference_manager.activate.remote(
+                        Role.ROLLOUT, tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
+                    )
+                )
             if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
                 # A list of one or more GenRM manager handles (one per instance).
-                post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
+                post_sync_handles.extend(m.activate.remote() for m in self.genrm_manager)
             if post_sync_handles:
                 ray.get(post_sync_handles)
 

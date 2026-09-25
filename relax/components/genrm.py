@@ -169,7 +169,7 @@ class GenRM(Base):
         # Request defaults and template arguments are part of each model's
         # registered configuration on the manager.
         self.model_configs = {
-            key: ray.get(inference_manager_handle.model_config.remote(Role.GENRM, key)) for key in self.genrm_managers
+            key: ray.get(inference_manager_handle.model_spec.remote(Role.GENRM, key)) for key in self.genrm_managers
         }
 
         self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
@@ -426,9 +426,9 @@ class GenRM(Base):
     def onload(self) -> None:
         """Load genRM model weights to GPU, for every instance."""
         self._logger.info("GenRM onload requested")
-        ray.get([m.onload.remote() for m in self.genrm_managers.values()])
+        ray.get([m.activate.remote() for m in self.genrm_managers.values()])
 
     def offload(self) -> None:
         """Offload genRM model weights from GPU, for every instance."""
         self._logger.info("GenRM offload requested")
-        ray.get([m.offload.remote() for m in self.genrm_managers.values()])
+        ray.get([m.deactivate.remote() for m in self.genrm_managers.values()])

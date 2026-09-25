@@ -198,7 +198,7 @@ def test_genrm_instances_become_models_of_one_role(monkeypatch, tmp_path):
     assert [placement["bundle_offset"] for _, _, placement in models] == [0, 1]
     assert len({placement["base_port"] for _, _, placement in models}) == 2
     assert models[0][1].genrm_model_path == "/model"
-    assert [call[1] for call in calls[1:]] == [("genrm", "quality", "offload"), ("genrm", "safety", "offload")]
+    assert [call[1] for call in calls[1:]] == [("genrm", "quality", "deactivate"), ("genrm", "safety", "deactivate")]
 
 
 def test_dcs_proxy_requests_stable_cpu(monkeypatch, tmp_path):

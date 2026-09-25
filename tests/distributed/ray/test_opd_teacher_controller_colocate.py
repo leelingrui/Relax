@@ -12,6 +12,7 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
     core_service.create_placement_group = lambda *args, **kwargs: full_pg
     monkeypatch.setitem(sys.modules, "relax.core.service", core_service)
 
+    from relax.components import inference_gateway
     from relax.utils.opd import opd_utils
 
     captured = {}
@@ -33,7 +34,7 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
         return ("teacher-model",), ["http://teacher/generate"]
 
     monkeypatch.setattr(opd_utils, "create_managed_opd_teacher", fake_create_teacher)
-    monkeypatch.setattr(opd_utils, "_deploy_teacher_gateway", lambda owner: "http://gateway/teacher")
+    monkeypatch.setattr(inference_gateway, "deploy_gateway", lambda role, manager_handle: "http://gateway/teacher")
 
     config = Namespace(
         use_opd=True,

@@ -411,4 +411,44 @@ class InferenceGatewayDeployment(InferenceGateway):
         return await self.proxy_backend(request, path)
 
 
-__all__ = ["InferenceGateway", "InferenceGatewayDeployment", "gateway_app"]
+def gateway_deployment_name(role: str | Role) -> str:
+    return f"{Role(role).value}_gateway"
+
+
+def deploy_gateway(
+    role: str | Role,
+    *,
+    manager_handle: Any,
+    upstream_url: str | None = None,
+    genrm_backend_handle: Any | None = None,
+) -> str:
+    """Deploy the role's Gateway at ``/<role>`` and return its URL.
+
+    The one way every inference role (Rollout, GenRM, Teacher) gets its
+    ingress, whether or not a Service backend sits behind it.
+    """
+    from relax.utils.utils import get_serve_url
+
+    role = Role(role)
+    gateway = InferenceGatewayDeployment.bind(
+        role.value,
+        manager_handle=manager_handle,
+        upstream_url=upstream_url,
+        genrm_backend_handle=genrm_backend_handle,
+    )
+    serve.run(gateway, name=gateway_deployment_name(role), route_prefix=f"/{role.value}")
+    return get_serve_url(f"/{role.value}")
+
+
+def delete_gateway(role: str | Role) -> None:
+    serve.delete(gateway_deployment_name(role))
+
+
+__all__ = [
+    "InferenceGateway",
+    "InferenceGatewayDeployment",
+    "delete_gateway",
+    "deploy_gateway",
+    "gateway_app",
+    "gateway_deployment_name",
+]

@@ -26,7 +26,8 @@ import ray
 
 
 class RolloutOffloadBarrier:
-    """Poll the inference manager until SGLang has offloaded."""
+    """Poll the lifecycle coordinator until generation has released its
+    GPUs."""
 
     def __init__(
         self,
@@ -39,11 +40,11 @@ class RolloutOffloadBarrier:
         self._logger = logger
 
     async def wait_offloaded(self) -> None:
-        while ray.get(self._inference_manager.rollout_operation.remote("get_status")) == "onload":
+        while not ray.get(self._inference_manager.rollout_released.remote()):
             await asyncio.sleep(self._poll_interval)
 
     def wait_offloaded_sync(self) -> None:
-        while ray.get(self._inference_manager.rollout_operation.remote("get_status")) == "onload":
+        while not ray.get(self._inference_manager.rollout_released.remote()):
             time.sleep(self._poll_interval)
 
 

@@ -7,7 +7,7 @@ import copy
 from typing import Any
 
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
-from relax.engine.inference.config import EngineGroupConfig, ModelConfig
+from relax.engine.inference.config import EngineGroupSpec, InferenceModelSpec
 from relax.engine.inference.phase_plans import PHASE_GENRM, PHASE_TEACHER, placement_phase
 from relax.engine.inference.types import WeightSource
 from relax.utils.env import Envs
@@ -44,7 +44,7 @@ def genrm_engine_env(args: Any) -> dict[str, str]:
     return env_vars
 
 
-def genrm_role_models(args: Any, pg: Any) -> list[tuple[ModelConfig, Any, dict[str, Any]]]:
+def genrm_role_models(args: Any, pg: Any) -> list[tuple[InferenceModelSpec, Any, dict[str, Any]]]:
     """Describe every GenRM instance for ``InferenceManager.create_role``.
 
     Under sync colocate the instances sit behind the rollout region of the
@@ -62,11 +62,11 @@ def genrm_role_models(args: Any, pg: Any) -> list[tuple[ModelConfig, Any, dict[s
         engine_args.genrm_num_gpus_per_engine = spec["num_gpus_per_engine"]
         engine_args.genrm_engine_config = spec["engine_config"]
         sampling_config = spec["sampling_config"] or {}
-        config = ModelConfig(
+        config = InferenceModelSpec(
             key,
             spec["model_path"],
             engine_groups=[
-                EngineGroupConfig(
+                EngineGroupSpec(
                     "regular", spec["num_gpus"], spec["num_gpus_per_engine"], dict(spec["engine_config"] or {})
                 )
             ],
@@ -126,7 +126,7 @@ def teacher_role_model(
     pg: Any = None,
     bundle_offset: int = 0,
     index: int = 0,
-) -> tuple[ModelConfig, Any, dict[str, Any]]:
+) -> tuple[InferenceModelSpec, Any, dict[str, Any]]:
     """Describe one teacher for ``InferenceManager.create_role``.
 
     With ``pg`` the teacher sits in the shared actor placement group at
@@ -140,10 +140,10 @@ def teacher_role_model(
     overrides = build_teacher_overrides(args, colocate_sync=pg is not None)
     engine_args = build_teacher_engine_args(args, overrides)
     engine_args.use_slime_router = False
-    config = ModelConfig(
+    config = InferenceModelSpec(
         model_id,
         overrides["model_path"],
-        engine_groups=[EngineGroupConfig("regular", num_gpus, gpus_per_replica, dict(overrides))],
+        engine_groups=[EngineGroupSpec("regular", num_gpus, gpus_per_replica, dict(overrides))],
         weight_source=WeightSource.STATIC,
         env_vars=_build_teacher_engine_env(args),
         fault_tolerance_enabled=True,

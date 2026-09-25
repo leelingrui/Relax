@@ -223,20 +223,9 @@ def create_managed_opd_teacher(
 
     if shared_pg and getattr(args, "offload_rollout", False):
         logger.info("[OPD teacher] Offloading teacher engines before actor init")
-        ray.get(teacher_manager.offload.remote())
+        ray.get(teacher_manager.deactivate.remote())
 
     return teacher_manager, urls
-
-
-def _deploy_teacher_gateway(inference_manager_handle: Any) -> str:
-    from ray import serve
-
-    from relax.components.inference_gateway import InferenceGatewayDeployment
-    from relax.utils.utils import get_serve_url
-
-    gateway = InferenceGatewayDeployment.bind("teacher", manager_handle=inference_manager_handle)
-    serve.run(gateway, name="teacher_gateway", route_prefix="/teacher")
-    return get_serve_url("/teacher")
 
 
 def maybe_start_managed_opd_teacher(args: Any, *, inference_manager_handle: Any) -> tuple[Any, Any]:
@@ -294,17 +283,16 @@ def maybe_start_managed_opd_teacher(args: Any, *, inference_manager_handle: Any)
         pg=shared_pg,
         shared_pg=shared_pg_enabled,
     )
+    from relax.components.inference_gateway import deploy_gateway
+    from relax.engine.inference.types import Role
+
     try:
-        args.opd_teacher_gateway_url = _deploy_teacher_gateway(inference_manager_handle)
+        args.opd_teacher_gateway_url = deploy_gateway(Role.TEACHER, manager_handle=inference_manager_handle)
     except Exception:
         shutdown_managed_opd_teacher(teacher_manager)
         raise
     args.opd_teacher_url = f"{args.opd_teacher_gateway_url}/generate"
-    args.opd_teacher_urls = [args.opd_teacher_url]
-    logger.info(
-        f"[OPD teacher] injected opd_teacher_url={args.opd_teacher_url} "
-        f"opd_teacher_urls={args.opd_teacher_urls} ({len(urls)} replica(s))"
-    )
+    logger.info(f"[OPD teacher] injected opd_teacher_url={args.opd_teacher_url} ({len(urls)} replica(s) behind it)")
     return shared_pg, teacher_manager
 
 
@@ -400,11 +388,10 @@ def _start_managed_multi_teacher(
 
     Each teacher (one per ``data_source``) gets an equal share of the 'teacher'
     resource GPUs; that share is further split into replicas of TP size
-    ``--teacher-num-gpus-per-engine``. Every teacher's replica URLs are
-    collected into a list and written to
-    ``args.opd_teacher_routes_map[data_source]`` so the per-sample router
-    (``_pick_teacher_url``) can route by data_source and then round-robin
-    across that teacher's replicas.
+    ``--teacher-num-gpus-per-engine``. Requests reach them only through the
+    Teacher Gateway, which maps a sample's ``data_source`` (sent as
+    ``route_key``) to the teacher's model and spreads the load across its
+    replicas; ``args.opd_teacher_route_keys`` lists the keys it serves.
     """
     import ray
 
@@ -421,6 +408,7 @@ def _start_managed_multi_teacher(
     # placement-group import pulls in the full SGLang/transformers dependency
     # chain, so it stays deferred until every ValueError check above has had a
     # chance to short-circuit first.
+    from relax.components.inference_gateway import deploy_gateway
     from relax.core.service import create_placement_group
     from relax.distributed.ray.inference_manager import ModelHandle
     from relax.engine.inference.types import Role
@@ -446,28 +434,25 @@ def _start_managed_multi_teacher(
     model_ids = ray.get(inference_manager_handle.create_role.remote(Role.TEACHER, models))
     teacher_managers = [ModelHandle(inference_manager_handle, Role.TEACHER, model_id) for model_id in model_ids]
     if getattr(args, "offload_rollout", False):
-        ray.get([manager.offload.remote() for manager in teacher_managers])
+        ray.get([manager.deactivate.remote() for manager in teacher_managers])
 
-    url_routes: dict[str, list[str]] = {}
     for data_source in model_ids:
-        urls = list(ray.get(inference_manager_handle.call.remote(Role.TEACHER, data_source, "get_urls")))
-        # Append /generate to match the route format expected by _pick_teacher_url.
-        replica_urls = [(u if u.endswith("/generate") else u.rstrip("/") + "/generate") for u in urls]
-        url_routes[data_source] = replica_urls
         logger.info(
             f"[MOPD teacher] '{data_source}' → {routes_map[data_source]} "
-            f"({len(replica_urls)} replica(s), {gpus_per_replica} GPU(s) each) → {replica_urls}"
+            f"({gpus_per_teacher // gpus_per_replica} replica(s), {gpus_per_replica} GPU(s) each)"
         )
 
-    # Inject the routes map so per-sample routing works via _pick_teacher_url.
-    args.opd_teacher_routes_map = url_routes
     try:
-        args.opd_teacher_gateway_url = _deploy_teacher_gateway(inference_manager_handle)
+        args.opd_teacher_gateway_url = deploy_gateway(Role.TEACHER, manager_handle=inference_manager_handle)
     except Exception:
         shutdown_managed_opd_teacher(teacher_managers)
         raise
+    args.opd_teacher_route_keys = tuple(model_ids)
     opd_teacher_key = getattr(args, "opd_teacher_key", None) or "data_source"
-    logger.info(f"[MOPD teacher] all teachers ready. key='{opd_teacher_key}', routes={list(url_routes.keys())}")
+    logger.info(
+        f"[MOPD teacher] all teachers ready behind {args.opd_teacher_gateway_url}. "
+        f"key='{opd_teacher_key}', routes={list(model_ids)}"
+    )
 
     # Return the shared PG so the controller reuses it for actor/rollout, and
     # one model per teacher for offload/onload lock-step with training.
@@ -495,15 +480,17 @@ def shutdown_managed_opd_teacher(teacher_manager: Any) -> None:
         return
 
     import ray
-    from ray import serve
+
+    from relax.components.inference_gateway import delete_gateway
+    from relax.engine.inference.types import Role
 
     try:
-        serve.delete("teacher_gateway")
+        delete_gateway(Role.TEACHER)
     except Exception as exc:
         logger.warning(f"Failed to remove Teacher Gateway: {exc}")
     handle = teacher_manager[0] if isinstance(teacher_manager, list) else teacher_manager
     try:
-        ray.get(handle.manager.shutdown_role.remote(handle.role), timeout=30)
+        ray.get(handle.manager.shutdown.remote(handle.role), timeout=30)
         logger.info("OPD teacher shut down.")
     except Exception as e:
         logger.warning(f"Failed to shut down OPD teacher: {e}")
@@ -520,7 +507,7 @@ def append_managed_opd_teacher_offload_handle(handles: list[Any], owner: Any) ->
         return
     # Colocate multi-teacher stores a list; single-teacher stores one manager.
     for mgr in teacher_manager if isinstance(teacher_manager, list) else [teacher_manager]:
-        handles.append(mgr.offload.remote())
+        handles.append(mgr.deactivate.remote())
 
 
 def append_managed_opd_teacher_onload_handle(handles: list[Any], owner: Any) -> None:
@@ -530,7 +517,7 @@ def append_managed_opd_teacher_onload_handle(handles: list[Any], owner: Any) -> 
     if teacher_manager is None or deferred_opd_enabled(owner.args):
         return
     for mgr in teacher_manager if isinstance(teacher_manager, list) else [teacher_manager]:
-        handles.append(mgr.onload.remote())
+        handles.append(mgr.activate.remote())
 
 
 def validate_managed_opd_teacher_colocate_args(args: Any) -> None:
@@ -876,10 +863,10 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
             )
 
         # --opd-teacher-routes: JSON map {data_source: HF checkpoint path} for
-        # Relax-managed multi-teacher MOPD. The runtime URL map
-        # (args.opd_teacher_routes_map) is populated at launch by
+        # Relax-managed multi-teacher MOPD. The Gateway route keys
+        # (args.opd_teacher_route_keys) are set at launch by
         # _start_managed_multi_teacher; here we only validate the spec.
-        args.opd_teacher_routes_map = None
+        args.opd_teacher_route_keys = None
         opd_teacher_routes = getattr(args, "opd_teacher_routes", None)
         if opd_teacher_routes is not None:
             try:

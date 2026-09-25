@@ -149,7 +149,9 @@ def create_rollout_worker(args, pg, data_source=None, runtime_env=None, inferenc
         ray.get(inference_manager_handle.rollout_operation.remote("check_weights", action="reset_tensors"))
 
     if args.offload_rollout:
-        ray.get(inference_manager_handle.rollout_operation.remote("offload"))
+        from relax.engine.inference.types import Role
+
+        ray.get(inference_manager_handle.deactivate.remote(Role.ROLLOUT))
 
     return rollout_worker, num_rollout_per_epoch
 
@@ -167,6 +169,6 @@ def create_genrm_role(args, pg, inference_manager_handle) -> tuple[str, ...]:
 
     model_ids = tuple(ray.get(inference_manager_handle.create_role.remote(Role.GENRM, genrm_role_models(args, pg))))
     if getattr(args, "offload_rollout", False):
-        ray.get([inference_manager_handle.call.remote(Role.GENRM, key, "offload") for key in model_ids])
+        ray.get([inference_manager_handle.call.remote(Role.GENRM, key, "deactivate") for key in model_ids])
     logger.info(f"GenRM models initialized successfully: instances={list(model_ids)}")
     return model_ids

@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
-from relax.engine.inference.types import RouteMode, RoutingSpec, WeightSource
+from relax.engine.inference.types import DeploymentMode, Role, RouteMode, RoutingSpec, WeightSource, WorkloadType
 
 
 @dataclass(frozen=True)
@@ -42,9 +42,9 @@ def replicas_from_slots(
 
 
 @dataclass(frozen=True)
-class EngineGroupSpec:
-    """Runtime topology only; deployment parameters live in
-    EngineGroupConfig."""
+class EngineGroupTopology:
+    """Runtime topology of an engine group; deployment parameters live in
+    EngineGroupSpec."""
 
     group_id: str
     replicas: tuple[ReplicaSpec, ...]
@@ -66,12 +66,12 @@ def validate_routes(routing: RoutingSpec, model_names: set[str]) -> None:
 
 
 @dataclass
-class EngineGroupConfig:
+class EngineGroupSpec:
     worker_type: str
     num_gpus: int
     num_gpus_per_engine: int | None = None
     overrides: dict[str, Any] = field(default_factory=dict)
-    topology: EngineGroupSpec | None = None
+    topology: EngineGroupTopology | None = None
 
     def __post_init__(self) -> None:
         valid_types = {"regular", "prefill", "decode", "placeholder"}
@@ -82,11 +82,11 @@ class EngineGroupConfig:
 
 
 @dataclass
-class ModelConfig:
+class InferenceModelSpec:
     name: str
     model_path: str | None = None
     num_gpus_per_engine: int | None = None
-    engine_groups: list[EngineGroupConfig] = field(default_factory=list)
+    engine_groups: list[EngineGroupSpec] = field(default_factory=list)
     weight_source: WeightSource = WeightSource.DCS
     route_mode: RouteMode = RouteMode.SGLANG_ROUTER
     # Request defaults a role applies when it builds an engine payload itself
@@ -121,6 +121,10 @@ class ModelConfig:
         return self.weight_source != WeightSource.STATIC
 
     @property
+    def needs_dcs(self) -> bool:
+        return self.weight_source == WeightSource.DCS
+
+    @property
     def needs_router(self) -> bool:
         return self.route_mode == RouteMode.SGLANG_ROUTER
 
@@ -135,7 +139,7 @@ class ModelConfig:
                 group.num_gpus_per_engine = default_gpus
             group.overrides.setdefault("model_path", self.model_path)
 
-    def resolved(self, args: Any) -> ModelConfig:
+    def resolved(self, args: Any) -> InferenceModelSpec:
         """Resolve once, then attach topology without a second configuration
         representation."""
         model = deepcopy(self)
@@ -159,7 +163,7 @@ class ModelConfig:
             # but still consumes its slot range, because the runtime advances
             # the engine offset over it too.
             replicas = replicas_from_slots(model.name, 0 if placeholder else slots, nodes, first_slot=first_slot)
-            group.topology = EngineGroupSpec(group_id, replicas)
+            group.topology = EngineGroupTopology(group_id, replicas)
             first_slot += slots
         return model
 
@@ -172,9 +176,38 @@ class ModelConfig:
         return sum(group.num_gpus for group in self.engine_groups)
 
 
+@dataclass(frozen=True)
+class DeploymentSpec:
+    """How a role's engines share GPUs with training and other roles."""
+
+    mode: DeploymentMode
+    # The phase in which the role holds its GPUs.
+    phase: str
+
+
+@dataclass(frozen=True)
+class InferenceRoleSpec:
+    """One inference role of a task: its workload, deployment and models."""
+
+    role: Role
+    workload: WorkloadType
+    deployment: DeploymentSpec
+    routing: RoutingSpec
+    models: tuple[InferenceModelSpec, ...]
+    # Whether discovery publishes replica URLs; without them clients go
+    # through the Gateway.
+    expose_engine_urls: bool = True
+
+    def __post_init__(self) -> None:
+        names = [model.name for model in self.models]
+        if not names or len(set(names)) != len(names):
+            raise ValueError(f"Role {self.role.value} needs uniquely named models")
+        validate_routes(self.routing, set(names))
+
+
 @dataclass
 class SglangConfig:
-    models: list[ModelConfig]
+    models: list[InferenceModelSpec]
 
     @staticmethod
     def from_yaml(path: str) -> SglangConfig:
@@ -185,11 +218,11 @@ class SglangConfig:
         assert "sglang" in data, "sglang config must have a 'sglang' key"
         return SglangConfig(
             models=[
-                ModelConfig(
+                InferenceModelSpec(
                     name=model["name"],
                     model_path=model.get("model_path"),
                     num_gpus_per_engine=model.get("num_gpus_per_engine"),
-                    engine_groups=[EngineGroupConfig(**g) for g in model.get("engine_groups", [])],
+                    engine_groups=[EngineGroupSpec(**g) for g in model.get("engine_groups", [])],
                 )
                 for model in data["sglang"]
             ]
@@ -202,11 +235,11 @@ class SglangConfig:
         assert decode_gpus > 0, f"No decode GPUs: total {args.rollout_num_gpus}, prefill {prefill_gpus}"
         return SglangConfig(
             [
-                ModelConfig(
+                InferenceModelSpec(
                     "default",
                     engine_groups=[
-                        EngineGroupConfig("prefill", prefill_gpus),
-                        EngineGroupConfig("decode", decode_gpus),
+                        EngineGroupSpec("prefill", prefill_gpus),
+                        EngineGroupSpec("decode", decode_gpus),
                     ],
                 )
             ]

@@ -1030,7 +1030,7 @@ def _deferred_pipeline(monkeypatch, *, fail: bool = False):
         published.append((rollout_id, sum(len(group) for group in batch_samples), is_last))
 
     monkeypatch.setattr(rollout_mod, "_transfer_batch_to_data_system", record_publish)
-    monkeypatch.setattr(scoring_phase, "_switch", lambda deactivate, activate: calls.append(f"switch:{activate}"))
+    monkeypatch.setattr(scoring_phase, "_transition", lambda action, phase_id: calls.append(f"{action}:{phase_id}"))
 
     pipeline = object.__new__(AgenticResidentPipeline)
     pipeline.args = args
@@ -1080,8 +1080,6 @@ async def test_agentic_rollout_deferred_opd_stages_until_close(monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_agentic_rollout_deferred_opd_pauses_before_scoring(monkeypatch) -> None:
-    from relax.engine.inference.types import Role
-
     pipeline, context, calls, _ = _deferred_pipeline(monkeypatch)
     for group_index in range(2):
         pipeline._finalized_groups.append(_scorable_group(group_index))
@@ -1089,7 +1087,7 @@ async def test_agentic_rollout_deferred_opd_pauses_before_scoring(monkeypatch) -
 
     await pipeline._close_rollout_step(context)
 
-    assert calls == ["pause", f"switch:{[Role.TEACHER]}", "score_teacher", "switch:[]", "publish"]
+    assert calls == ["pause", "enter:teacher", "score_teacher", "leave:teacher", "publish"]
 
 
 @pytest.mark.asyncio
@@ -1125,27 +1123,26 @@ async def test_agentic_rollout_deferred_opd_cancelled_close_never_publishes_afte
         await asyncio.sleep(0)
     assert published == []
     # The teacher was released before shutdown returned.
-    assert calls[-1] == "switch:[]"
+    assert calls[-1] == "leave:teacher"
 
 
 @pytest.mark.asyncio
 async def test_scoring_phase_cancelled_enter_still_releases_the_teacher(monkeypatch) -> None:
     import threading
 
-    from relax.engine.inference.types import Role
     from relax.engine.rollout import scoring_phase
 
-    switches: list[list[Role]] = []
+    transitions: list[str] = []
     entering = threading.Event()
     finish_enter = threading.Event()
 
-    def blocking_switch(deactivate, activate):
-        if activate:
+    def blocking_transition(action, phase_id):
+        if action == "enter":
             entering.set()
             finish_enter.wait(timeout=5)
-        switches.append(activate)
+        transitions.append(f"{action}:{phase_id}")
 
-    monkeypatch.setattr(scoring_phase, "_switch", blocking_switch)
+    monkeypatch.setattr(scoring_phase, "_transition", blocking_transition)
     args = _deferred_opd_args()
 
     async def enter_phase() -> None:
@@ -1158,4 +1155,4 @@ async def test_scoring_phase_cancelled_enter_still_releases_the_teacher(monkeypa
     finish_enter.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert switches == [[Role.TEACHER], []]
+    assert transitions == ["enter:teacher", "leave:teacher"]

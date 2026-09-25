@@ -1398,9 +1398,11 @@ class FSDPTrainRayActor(TrainRayActor):
             import ray
             from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 
+            from relax.engine.inference.types import Role
+
             onload_error = None
             try:
-                ray.get(self.inference_manager.rollout_operation.remote("onload", tags=[GPU_MEMORY_TYPE_WEIGHTS]))
+                ray.get(self.inference_manager.activate.remote(Role.ROLLOUT, tags=[GPU_MEMORY_TYPE_WEIGHTS]))
             except Exception as exc:
                 onload_error = f"{type(exc).__name__}: {exc}"
             _raise_weight_sync_errors(
@@ -1478,9 +1480,11 @@ class FSDPTrainRayActor(TrainRayActor):
         if offload_engine:
             import ray
 
+            from relax.engine.inference.types import Role
+
             onload_error = None
             try:
-                ray.get(self.inference_manager.rollout_operation.remote("onload"))
+                ray.get(self.inference_manager.activate.remote(Role.ROLLOUT))
             except Exception as exc:
                 onload_error = f"{type(exc).__name__}: {exc}"
             _raise_weight_sync_errors(

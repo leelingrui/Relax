@@ -39,7 +39,11 @@ class _InferencePort:
         await self.manager.rollout_operation.remote("inject_ci_fault")
 
     async def onload_kv(self) -> None:
-        await self.manager.rollout_operation.remote("onload_kv")
+        from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
+
+        from relax.engine.inference.types import Role
+
+        await self.manager.activate.remote(Role.ROLLOUT, tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
 
     def router_base_url(self, model_name: str = "default") -> str:
         return f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"

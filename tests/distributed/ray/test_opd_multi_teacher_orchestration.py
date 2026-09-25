@@ -9,9 +9,9 @@ from conftest import FakeOwnerHandle
 
 
 def _install_fake_gateway(monkeypatch):
-    from relax.utils.opd import opd_utils
+    from relax.components import inference_gateway
 
-    monkeypatch.setattr(opd_utils, "_deploy_teacher_gateway", lambda owner: "http://gateway/teacher")
+    monkeypatch.setattr(inference_gateway, "deploy_gateway", lambda role, manager_handle: "http://gateway/teacher")
 
 
 def _base_args(**overrides):
@@ -78,10 +78,8 @@ def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monke
     assert configs["math"][0].path == "/ckpt/math"
     assert configs["math"][1]["pg"] == full_pg
 
-    assert args.opd_teacher_routes_map == {
-        "math": ["http://math/generate"],
-        "code": ["http://code/generate"],
-    }
+    assert args.opd_teacher_gateway_url == "http://gateway/teacher"
+    assert args.opd_teacher_route_keys == ("math", "code")
 
 
 def test_multi_teacher_requires_colocate(monkeypatch):

@@ -128,7 +128,7 @@ async def test_gateway_rotates_across_direct_eligible_replicas() -> None:
         await gateway.close()
 
 
-def _request(payload: dict) -> Request:
+def _request(payload: dict, headers: tuple[tuple[bytes, bytes], ...] = ()) -> Request:
     body = json.dumps(payload).encode()
 
     async def receive():
@@ -140,10 +140,35 @@ def _request(payload: dict) -> Request:
             "method": "POST",
             "path": "/generate",
             "query_string": b"",
-            "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())],
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                *headers,
+            ],
         },
         receive,
     )
+
+
+@pytest.mark.asyncio
+async def test_gateway_teacher_forwards_the_router_routing_key() -> None:
+    gateway = InferenceGateway(Role.TEACHER, manager_handle=_owner(lambda: _snapshot(role=Role.TEACHER)))
+    sent = []
+
+    def upstream(request):
+        sent.append(request.headers.get("x-smg-routing-key"))
+        return httpx.Response(200, json={"meta_info": {}})
+
+    await gateway._client.aclose()
+    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    try:
+        request = _request({"input_ids": [1], "model": "model-a"}, ((b"x-smg-routing-key", b"7"),))
+        response = await gateway.proxy(request, "generate")
+        assert response.status_code == 200
+        # The teacher Router pins a GRPO group to one replica by this key.
+        assert sent == ["7"]
+    finally:
+        await gateway.close()
 
 
 @pytest.mark.asyncio
