@@ -31,6 +31,7 @@ from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.inference_manager import create_inference_manager
+from relax.engine.inference.types import LifecycleState, Role
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -60,8 +61,8 @@ def create_data_source_actor(config: Namespace, data_source_cls: Any) -> Any:
     return actor_cls.options(**with_control_plane_affinity(config)).remote(config)
 
 
-def _needs_rollout_manager_setup(serve_dict: dict) -> bool:
-    """Skip rollout_manager wiring in SFT-only mode (no rollout role)."""
+def _needs_rollout_worker_setup(serve_dict: dict) -> bool:
+    """Skip rollout_worker wiring in SFT-only mode (no rollout role)."""
     return ROLES.rollout in serve_dict
 
 
@@ -875,11 +876,13 @@ class Controller:
                     self.config,
                 )
 
-                # Always set rollout_manager for both sync and async modes
+                # Always set rollout_worker for both sync and async modes
                 # (needed for scaled-out engine weight sync in fully_async mode)
-                if _needs_rollout_manager_setup(self.serve_dict) and ROLES.actor in self.serve_dict:
-                    rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
-                    await self.serve_dict[ROLES.actor].set_rollout_manager(rollout_manager)
+                if _needs_rollout_worker_setup(self.serve_dict) and ROLES.actor in self.serve_dict:
+                    rollout_worker = await self.serve_dict[ROLES.rollout].get_rollout_worker()
+                    await self.serve_dict[ROLES.actor].set_rollout_handles(
+                        rollout_worker, self._inference_manager_handle
+                    )
 
                     # Colocate wiring topology:
                     #   - actor.rollout_barrier: always, so wake_up doesn't
@@ -890,7 +893,7 @@ class Controller:
                     # In fully_async / hybrid nothing is wired and every
                     # barrier-guarded site short-circuits.
                     if _is_colocate(self.config):
-                        rollout_barrier = RolloutOffloadBarrier(rollout_manager, logger=logger)
+                        rollout_barrier = RolloutOffloadBarrier(self._inference_manager_handle, logger=logger)
                         actor_set_kwargs: dict[str, Any] = {"rollout": rollout_barrier}
                         if ROLES.critic in self.serve_dict:
                             critic_handle = self.serve_dict[ROLES.critic].handle
@@ -919,7 +922,28 @@ class Controller:
                         handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async())
                     if ROLES.reference in self.serve_dict:
                         handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async())
-                    [await handle for handle in handles]
+                    update_refs = await asyncio.gather(*handles)
+                    await asyncio.gather(*(ref for ref in update_refs if ref is not None))
+                    if ROLES.rollout in self.serve_dict:
+                        await self._inference_manager_handle.rollout_operation.remote(
+                            "complete_inference_weight_update"
+                        )
+                        snapshot = await self._inference_manager_handle.snapshot.remote(Role.ROLLOUT)
+                        unready = [
+                            {
+                                "model": model.model_id,
+                                "state": model.state.value,
+                                "admission": model.admission,
+                                "versions": [
+                                    (replica.engine_id, replica.weight_version, replica.state.value)
+                                    for replica in model.replicas
+                                ],
+                            }
+                            for model in snapshot.models
+                            if model.state != LifecycleState.READY or not model.admission
+                        ]
+                        if unready:
+                            raise RuntimeError(f"Rollout is not ready after initial weight sync: {unready}")
                 if ROLES.actor in self.serve_dict:
                     step = await self.serve_dict[ROLES.actor].get_step()
                     for service in self.serve_dict.values():
@@ -997,15 +1021,6 @@ class Controller:
         """
         logger.info("Controller shutting down — cleaning up engine processes...")
         self.stop_health_check()
-
-        # Shut down rollout engines via RolloutManager.dispose()
-        if ROLES.rollout in self.serve_dict:
-            try:
-                rollout_manager = run(self.serve_dict[ROLES.rollout].get_rollout_manager())
-                ray.get(rollout_manager.dispose.remote(), timeout=30)
-                logger.info("RolloutManager disposed — SGLang engines shut down.")
-            except Exception as e:
-                logger.warning(f"Failed to dispose RolloutManager: {e}")
 
         shutdown_managed_opd_teacher(self._teacher_manager)
         # The inference manager owns every remaining engine and the Routers it
@@ -1256,8 +1271,13 @@ class Controller:
                     logger.warning(f"[Global Restart] Failed to delete application '{app_name}': {e}")
 
         if self._inference_manager_handle is not None:
-            ray.get(self._inference_manager_handle.shutdown_all.remote())
-            logger.info("[Global Restart] Inference engines and owned routers shut down")
+            # A failed stop (stuck engine, dead manager) must not abort recovery:
+            # ray.shutdown() below still reclaims the GPUs.
+            try:
+                ray.get(self._inference_manager_handle.shutdown_all.remote())
+                logger.info("[Global Restart] Inference engines and owned routers shut down")
+            except Exception as e:
+                logger.warning(f"[Global Restart] Failed to shut down the inference manager: {e}")
 
         self.serve_dict.clear()
         logger.info("[Global Restart] All service references cleared")

@@ -14,6 +14,31 @@ class Role(str, Enum):
     TEACHER = "teacher"
 
 
+class WorkloadType(str, Enum):
+    # Policy generation whose samples feed training.
+    ROLLOUT = "rollout"
+    # Reward scoring of finished samples (GenRM).
+    REWARD = "reward"
+    # Teacher log-probabilities for on-policy distillation.
+    DISTILLATION = "distillation"
+
+
+WORKLOAD_BY_ROLE = {
+    Role.ROLLOUT: WorkloadType.ROLLOUT,
+    Role.GENRM: WorkloadType.REWARD,
+    Role.TEACHER: WorkloadType.DISTILLATION,
+}
+
+
+class DeploymentMode(str, Enum):
+    # The role's engines run in a placement group of their own.
+    DECOUPLED = "decoupled"
+    # A slice of the shared actor placement group that no other role uses.
+    SPLIT = "split"
+    # Bundles shared with generation, used in a phase of its own.
+    DEFER = "defer"
+
+
 class WeightSource(str, Enum):
     # Loaded once from a checkpoint; never registers for dynamic updates.
     STATIC = "static"

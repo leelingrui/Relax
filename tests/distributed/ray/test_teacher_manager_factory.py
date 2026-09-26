@@ -10,10 +10,10 @@ from conftest import FakeOwnerHandle
 def owner(monkeypatch):
     import ray
 
-    from relax.distributed.ray import teacher_manager
+    from relax.engine.inference import config_adapters
 
     monkeypatch.setattr(ray, "get", lambda ref, **kwargs: ref)
-    monkeypatch.setattr(teacher_manager, "teacher_role_model", lambda args, **kwargs: ("teacher", None, kwargs))
+    monkeypatch.setattr(config_adapters, "teacher_role_model", lambda args, **kwargs: ("teacher", None, kwargs))
     return FakeOwnerHandle(urls={"default": ["http://teacher"]})
 
 
@@ -33,7 +33,7 @@ def test_create_managed_opd_teacher_offloads_shared_pg_teacher(owner):
     ((create_args, _),) = owner.named("create_role")
     assert create_args[0] == Role.TEACHER
     assert create_args[1][0][2]["pg"] is pg
-    assert [args[2] for args, _ in owner.named("call")] == ["get_urls", "offload"]
+    assert [args[2] for args, _ in owner.named("call")] == ["get_urls", "deactivate"]
 
 
 def test_create_managed_opd_teacher_keeps_a_dedicated_teacher_loaded(owner):

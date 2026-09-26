@@ -385,3 +385,23 @@ def test_placement_planner_replans_a_released_group_id():
     (second,) = planner.plan((_request("rollout/group-0", num_gpus=2, bundle_offset=0),), view)
 
     assert second.reserved_size == 2
+
+
+def test_model_placement_aggregates_slices_and_marks_deferred_models() -> None:
+    from relax.engine.inference.placement import ModelPlacement
+
+    planner = PlacementPlanner()
+    view = PlacementGroupView((0, 1, 2, 3), (10, 11, 12, 13), PlacementOwner.CONTROLLER, identity="shared")
+    requests = [
+        PlacementRequest("teacher/t/group-0", "regular", 2, 1, 4, "teacher", 0),
+        PlacementRequest("teacher/t/group-1", "regular", 2, 1, 4, "teacher", 2),
+    ]
+    placement = ModelPlacement.from_slices(planner.plan(requests, view), shared_phase="inference")
+    assert placement.pg_owner is PlacementOwner.CONTROLLER
+    assert (placement.bundle_indices, placement.gpu_ids) == ((0, 1, 2, 3), (10, 11, 12, 13))
+    assert (placement.activation_group, placement.activation_phase) == (view.key, "teacher")
+
+    split = planner.plan([PlacementRequest("genrm/j/group-0", "regular", 2, 1, 4, "inference", 0)], view)
+    assert ModelPlacement.from_slices(split, shared_phase="inference").activation_group is None
+    with pytest.raises(ValueError, match="one phase"):
+        ModelPlacement.from_slices([*split, *planner.allocations(view)[:1]], shared_phase="inference")

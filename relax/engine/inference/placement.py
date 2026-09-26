@@ -108,6 +108,41 @@ class PlacementSlice:
 
 
 @dataclass(frozen=True)
+class ModelPlacement:
+    """Where one model's engines run, aggregated over its group slices.
+
+    ``activation_group`` names the GPUs the model takes turns on (its placement
+    group) and ``activation_phase`` the phase it holds them in; both are
+    ``None`` for a model that never yields its GPUs to another role.
+    """
+
+    pg_owner: PlacementOwner
+    bundle_indices: tuple[int, ...]
+    gpu_ids: tuple[int, ...]
+    activation_group: str | None
+    activation_phase: str | None
+
+    @classmethod
+    def from_slices(cls, slices: Sequence[PlacementSlice], *, shared_phase: str) -> "ModelPlacement":
+        """Aggregate a model's startup slices; ``shared_phase`` is the phase in
+        which roles keep their GPUs instead of taking turns."""
+        if not slices:
+            raise ValueError("A model placement needs at least one slice")
+        phases = {item.phase for item in slices}
+        if len(phases) != 1:
+            raise ValueError(f"A model must be placed in one phase, got {sorted(phases)}")
+        phase = phases.pop()
+        deferred = phase != shared_phase
+        return cls(
+            pg_owner=slices[0].owner,
+            bundle_indices=tuple(index for item in slices for index in item.bundle_indices),
+            gpu_ids=tuple(gpu for item in slices for gpu in item.gpu_ids),
+            activation_group=slices[0].placement_group_key if deferred else None,
+            activation_phase=phase if deferred else None,
+        )
+
+
+@dataclass(frozen=True)
 class PlacementRelease:
     """The outcome of releasing ledger entries.
 

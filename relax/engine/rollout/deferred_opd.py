@@ -10,9 +10,10 @@ offloading it while requests are still in flight would abort them.
 Token selections that need a second pass on the student get an explicit follow-up
 stage, because the student was deliberately put to sleep for the teacher.
 
-The immediate path is untouched: when deferred scoring is off, or for the resident
-Agentic pipeline which scores inside its own group loop, no session is created and
-``OpdManager.prefill`` keeps running inline.
+The immediate path is untouched: when deferred scoring is off, no session is
+created and ``OpdManager.prefill`` keeps running inline. The resident Agentic
+pipeline stages its own transfer batches into the same session and flushes them
+when its step closes.
 """
 
 from typing import Any
@@ -34,10 +35,6 @@ def deferred_opd_active(args: Any) -> bool:
     from relax.engine.rollout.on_policy_distillation import is_opd_enabled
 
     if not is_opd_enabled(args):
-        return False
-    if getattr(args, "use_agentic_rollout", False):
-        # The resident Agentic pipeline owns its own group lifecycle and scores
-        # inside it; staging there would need its transfer domain, not this one.
         return False
     return deferred_opd_enabled(args)
 
@@ -105,21 +102,46 @@ class DeferredOpdSession:
         rollout_id: int,
         data_system_client: Any,
         is_last: bool = False,
+        scoring_ids: Any = None,
     ) -> None:
         """Stand in for ``transfer_batch_to_data_system`` and stage instead.
 
         Keeps the helper's signature so the step's publication points do not
-        have to know whether scoring is deferred.
+        have to know whether scoring is deferred. ``scoring_ids`` follows the
+        flattened sample order when training indices are not unique.
         """
         del args, data_system_client
-        if not batch_samples:
-            return
-        flat = _flatten(batch_samples)
+        flat = _flatten(batch_samples) if batch_samples else []
         if not flat:
+            self._stage_empty_batch(batch_count, rollout_id, is_last)
             return
         batch_id = f"{rollout_id}:{batch_count}:{len(self._staged)}"
-        self._staged.append((batch_id, batch_samples, flat, batch_count, rollout_id, is_last))
+        self._staged.append((batch_id, batch_samples, flat, batch_count, rollout_id, is_last, scoring_ids))
         logger.info(f"Staged deferred batch {batch_id} with {len(flat)} samples; publication waits for scoring")
+
+    def _stage_empty_batch(self, batch_count: int, rollout_id: int, is_last: bool) -> None:
+        """Keep an empty batch's end-of-stream marker; there is nothing else to
+        stage.
+
+        A streaming partition only closes on ``is_last``. The last staged batch
+        of the same rollout publishes last, so it carries the marker instead.
+        """
+        if not is_last:
+            logger.warning(f"Deferred OPD got an empty batch {batch_count} for rollout {rollout_id}; nothing staged")
+            return
+        for index in range(len(self._staged) - 1, -1, -1):
+            staged = self._staged[index]
+            if staged[4] == rollout_id:
+                self._staged[index] = (*staged[:5], True, *staged[6:])
+                logger.warning(
+                    f"Deferred OPD got an empty last batch {batch_count} for rollout {rollout_id}; "
+                    f"batch {staged[0]} now closes the partition"
+                )
+                return
+        logger.error(
+            f"Deferred OPD got an empty last batch {batch_count} for rollout {rollout_id} with no staged batch "
+            f"to close train_{rollout_id}; a streaming trainer will wait for an end-of-stream that never comes"
+        )
 
     @property
     def staged_batches(self) -> int:
@@ -136,7 +158,7 @@ class DeferredOpdSession:
         are never coming.
         """
         staged, self._staged = self._staged, []
-        for batch_id, payload, flat, batch_count, rollout_id, is_last in staged:
+        for batch_id, payload, flat, batch_count, rollout_id, is_last, scoring_ids in staged:
             batch_ref = seal_batch(
                 self.args,
                 flat,
@@ -144,6 +166,7 @@ class DeferredOpdSession:
                 rollout_id=rollout_id,
                 required_fields=self._required,
                 policy_version=str(getattr(self.args, "_opd_policy_version", "") or "") or None,
+                scoring_ids=scoring_ids,
             )
             handle = self.executor.submit_deferred(
                 batch_ref,
@@ -156,18 +179,36 @@ class DeferredOpdSession:
                 is_last=is_last,
             )
 
-            async def publish(published_payload: Any, published_is_last: bool, count: int = batch_count) -> None:
+            # Bind this batch's loop values: a timed-out wait must not let a slow
+            # batch publish under the next iteration's rollout_id.
+            async def publish(
+                published_payload: Any,
+                published_is_last: bool,
+                count: int = batch_count,
+                published_rollout_id: int = rollout_id,
+            ) -> None:
                 await self._publish(
                     self.args,
                     published_payload,
                     count,
-                    rollout_id,
+                    published_rollout_id,
                     self.data_system_client,
                     is_last=published_is_last,
                 )
 
-            self.executor.start(handle, score=self._score_batch, publish=publish)
-            result = await self.executor.wait_deferred(handle)
+            identities = tuple(ref.identity for ref in batch_ref.samples)
+
+            async def score(samples: list[Sample], ids: tuple[Any, ...] = identities) -> tuple[Any, ...]:
+                return await self._score_batch(samples, ids)
+
+            self.executor.start(handle, score=score, publish=publish)
+            try:
+                result = await self.executor.wait_deferred(handle)
+            except BaseException:
+                # The executor task is shielded from this waiter; stop it so a
+                # cancelled step cannot publish later.
+                await self.cancel()
+                raise
             if result.state is not DeferredState.COMPLETED:
                 raise RuntimeError(
                     f"Deferred OPD batch {batch_id} did not publish: state={result.state.value} "
@@ -176,7 +217,13 @@ class DeferredOpdSession:
                 )
             logger.info(f"Deferred batch {batch_id} published {result.published} samples after scoring")
 
-    async def _score_batch(self, samples: list[Sample]) -> tuple[Any, ...]:
+    async def cancel(self) -> None:
+        """Drop staged batches and stop any batch still scoring or
+        publishing."""
+        self._staged.clear()
+        await self.executor.cancel()
+
+    async def _score_batch(self, samples: list[Sample], identities: tuple[Any, ...]) -> tuple[Any, ...]:
         """Score one batch: teacher stage, optional student stage, assemble."""
         from relax.engine.inference.phase_plans import PHASE_TEACHER
         from relax.engine.rollout.scoring_phase import async_reactivate_generation, async_scoring_phase
@@ -185,8 +232,8 @@ class DeferredOpdSession:
             await self.opd_manager.prepare_teacher_inputs(samples)
             results = await self.opd_manager.score_teacher(samples)
         failures = tuple(
-            sample.index
-            for sample, ok in zip(samples, results, strict=True)
+            identity
+            for identity, sample, ok in zip(identities, samples, results, strict=True)
             if not ok and int(sample.response_length or 0) > 0
         )
         if failures:

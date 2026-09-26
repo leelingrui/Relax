@@ -75,7 +75,7 @@ class InferenceGateway:
         manager_handle: Any,
         upstream_url: str | None = None,
         genrm_backend_handle: Any | None = None,
-        timeout: float = 1800.0,
+        timeout: float | None = None,
     ) -> None:
         if manager_handle is None:
             raise ValueError("InferenceGateway requires the task inference manager handle")
@@ -99,10 +99,21 @@ class InferenceGateway:
     async def _resolve_target(self, payload: Mapping[str, Any] | None = None) -> tuple[str, str]:
         snapshot = await self._snapshot()
         payload = payload or {}
+        requested = payload.get("model")
+        # OpenAI clients send the served model's real name (e.g. "Qwen3-8B"), which the
+        # router used to accept. A single-model role keeps serving it through its
+        # default model; only a multi-model role must be named exactly.
+        if (
+            requested is not None
+            and len(snapshot.models) == 1
+            and snapshot.routing.default_model is not None
+            and requested != snapshot.models[0].model_id
+        ):
+            requested = None
         try:
             model = resolve_model(
                 snapshot,
-                model=payload.get("model"),
+                model=requested,
                 route_key=payload.get("route_key"),
             )
             return select_target(model, cursor=next(self._cursor)).base_url.rstrip("/"), model.model_id
@@ -177,7 +188,10 @@ class InferenceGateway:
                 exc.status_code, str(exc.detail), code="unavailable" if exc.status_code == 503 else "routing_error"
             )
 
-        request_id = await self._admit(request, model_id)
+        try:
+            request_id = await self._admit(request, model_id)
+        except HTTPException as exc:
+            return _json_error(exc.status_code, str(exc.detail), code="unavailable")
         rid = request_id
         response: Response | None = None
         finished = False
@@ -224,7 +238,11 @@ class InferenceGateway:
             return await self._manager_call("admit_request", self.role, model_id, request_id)
         except Exception as exc:
             self._logger.warning("Inference request admission failed: %s", exc)
-            raise HTTPException(status_code=503, detail="Inference request is not admitted") from exc
+            raise HTTPException(
+                status_code=503,
+                detail="Inference request is not admitted",
+                headers={"Retry-After": "1"},
+            ) from exc
 
     async def _abort_upstream(self, target: str, request_id: str | None) -> None:
         """Send an abort for ``request_id`` to the workers behind ``target``.
@@ -411,4 +429,44 @@ class InferenceGatewayDeployment(InferenceGateway):
         return await self.proxy_backend(request, path)
 
 
-__all__ = ["InferenceGateway", "InferenceGatewayDeployment", "gateway_app"]
+def gateway_deployment_name(role: str | Role) -> str:
+    return f"{Role(role).value}_gateway"
+
+
+def deploy_gateway(
+    role: str | Role,
+    *,
+    manager_handle: Any,
+    upstream_url: str | None = None,
+    genrm_backend_handle: Any | None = None,
+) -> str:
+    """Deploy the role's Gateway at ``/<role>`` and return its URL.
+
+    The one way every inference role (Rollout, GenRM, Teacher) gets its
+    ingress, whether or not a Service backend sits behind it.
+    """
+    from relax.utils.utils import get_serve_url
+
+    role = Role(role)
+    gateway = InferenceGatewayDeployment.bind(
+        role.value,
+        manager_handle=manager_handle,
+        upstream_url=upstream_url,
+        genrm_backend_handle=genrm_backend_handle,
+    )
+    serve.run(gateway, name=gateway_deployment_name(role), route_prefix=f"/{role.value}")
+    return get_serve_url(f"/{role.value}")
+
+
+def delete_gateway(role: str | Role) -> None:
+    serve.delete(gateway_deployment_name(role))
+
+
+__all__ = [
+    "InferenceGateway",
+    "InferenceGatewayDeployment",
+    "delete_gateway",
+    "deploy_gateway",
+    "gateway_app",
+    "gateway_deployment_name",
+]

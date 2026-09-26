@@ -11,7 +11,14 @@ import pytest
 from starlette.requests import Request
 
 from relax.components.inference_gateway import InferenceGateway
-from relax.engine.inference.types import LifecycleState, ModelSnapshot, ReplicaSnapshot, Role, RoleSnapshot
+from relax.engine.inference.types import (
+    LifecycleState,
+    ModelSnapshot,
+    ReplicaSnapshot,
+    Role,
+    RoleSnapshot,
+    RoutingSpec,
+)
 
 
 def _snapshot(*, role: Role = Role.ROLLOUT, state: LifecycleState = LifecycleState.READY, admission: bool = True):
@@ -91,6 +98,51 @@ async def test_gateway_reuses_discovery_routing_and_rejects_unavailable_models()
 
 
 @pytest.mark.asyncio
+async def test_gateway_single_model_role_serves_any_openai_model_name() -> None:
+    """A single-model role registers as "default"; OpenAI clients send the real
+    name and must keep being served, while a multi-model role stays strict."""
+    single = replace(_snapshot(), routing=RoutingSpec(default_model="model-a"))
+    second = replace(single.models[0], model_id="model-b")
+    multi = replace(single, models=(*single.models, second))
+    single_gateway = InferenceGateway(Role.ROLLOUT, manager_handle=_owner(lambda: single))
+    multi_gateway = InferenceGateway(Role.ROLLOUT, manager_handle=_owner(lambda: multi))
+    try:
+        assert await single_gateway._resolve_target({"model": "Qwen3-8B"}) == ("http://router", "model-a")
+        with pytest.raises(Exception) as error:
+            await multi_gateway._target({"model": "Qwen3-8B"})
+        assert error.value.status_code == 400
+        assert error.value.detail["code"] == "unknown_model"
+    finally:
+        await single_gateway.close()
+        await multi_gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_admission_race_returns_retryable_503_without_forwarding() -> None:
+    owner = _owner(lambda: _snapshot(role=Role.TEACHER))
+
+    async def reject(*_args):
+        raise RuntimeError("model offloaded after snapshot")
+
+    owner.admit_request.remote = reject
+    gateway = InferenceGateway(Role.TEACHER, manager_handle=owner)
+
+    def upstream(_request):
+        pytest.fail("rejected requests must not reach the offloaded engine")
+
+    await gateway._client.aclose()
+    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    try:
+        response = await gateway.proxy(_request({"model": "model-a", "input_ids": [1]}), "generate")
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "1"
+        assert json.loads(response.body)["error"]["code"] == "unavailable"
+        assert not owner.inflight
+    finally:
+        await gateway.close()
+
+
+@pytest.mark.asyncio
 async def test_gateway_never_uses_replica_url_when_router_is_missing() -> None:
     snapshot = _snapshot()
     model = replace(
@@ -128,7 +180,7 @@ async def test_gateway_rotates_across_direct_eligible_replicas() -> None:
         await gateway.close()
 
 
-def _request(payload: dict) -> Request:
+def _request(payload: dict, headers: tuple[tuple[bytes, bytes], ...] = ()) -> Request:
     body = json.dumps(payload).encode()
 
     async def receive():
@@ -140,10 +192,35 @@ def _request(payload: dict) -> Request:
             "method": "POST",
             "path": "/generate",
             "query_string": b"",
-            "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())],
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                *headers,
+            ],
         },
         receive,
     )
+
+
+@pytest.mark.asyncio
+async def test_gateway_teacher_forwards_the_router_routing_key() -> None:
+    gateway = InferenceGateway(Role.TEACHER, manager_handle=_owner(lambda: _snapshot(role=Role.TEACHER)))
+    sent = []
+
+    def upstream(request):
+        sent.append(request.headers.get("x-smg-routing-key"))
+        return httpx.Response(200, json={"meta_info": {}})
+
+    await gateway._client.aclose()
+    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    try:
+        request = _request({"input_ids": [1], "model": "model-a"}, ((b"x-smg-routing-key", b"7"),))
+        response = await gateway.proxy(request, "generate")
+        assert response.status_code == 200
+        # The teacher Router pins a GRPO group to one replica by this key.
+        assert sent == ["7"]
+    finally:
+        await gateway.close()
 
 
 @pytest.mark.asyncio

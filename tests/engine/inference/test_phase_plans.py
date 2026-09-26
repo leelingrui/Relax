@@ -11,6 +11,7 @@ from relax.engine.inference.phase_plans import (
     PHASE_GENERATE,
     PHASE_GENRM,
     PHASE_TEACHER,
+    deferred_genrm_enabled,
     deferred_opd_enabled,
     placement_phase,
     reject_shared_co_resident,
@@ -76,8 +77,24 @@ def test_managed_teacher_defers_only_when_it_shares_the_rollout_bundles():
 def test_inline_genrm_occupies_the_generation_phase():
     inline = build_args(_genrm_instances_resolved={"a": {}})
     assert placement_phase(inline, PHASE_GENRM) == PHASE_GENERATE
-    deferred = build_args(_genrm_instances_resolved={"a": {}}, defer_reward_to_post_process=True)
+    deferred = build_args(
+        _genrm_instances_resolved={"a": {}}, _genrm_colocate_with_rollout=True, defer_reward_to_post_process=True
+    )
     assert placement_phase(deferred, PHASE_GENRM) == PHASE_GENRM
+
+
+def test_phase_plans_split_genrm_scores_inline_even_when_deferred():
+    """Only a GenRM sharing the rollout bundles takes turns with generation.
+
+    In split and fully-async layouts no role shares the GenRM slice, so a
+    ``genrm`` phase would have nothing to switch and ``enter_phase`` would fail
+    at the first publish.
+    """
+    split = build_args(
+        _genrm_instances_resolved={"a": {}}, _genrm_colocate_with_rollout=False, defer_reward_to_post_process=True
+    )
+    assert not deferred_genrm_enabled(split)
+    assert placement_phase(split, PHASE_GENRM) == PHASE_GENERATE
 
 
 def test_shared_co_resident_genrm_is_rejected_before_startup():

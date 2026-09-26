@@ -21,10 +21,16 @@ PHASE_TEACHER = "teacher"
 
 
 def deferred_genrm_enabled(args: Any) -> bool:
-    """Whether GenRM scores in its own stage instead of inline with
-    generation."""
-    return bool(getattr(args, "_genrm_instances_resolved", None)) and bool(
-        getattr(args, "defer_reward_to_post_process", False)
+    """Whether GenRM scores in its own stage instead of inline with generation.
+
+    Only a GenRM that shares the rollout bundles has to take turns with
+    generation. Split and fully-async layouts keep it resident, so a deferred
+    post-process hook scores inline without a phase switch.
+    """
+    return (
+        bool(getattr(args, "_genrm_instances_resolved", None))
+        and bool(getattr(args, "defer_reward_to_post_process", False))
+        and bool(getattr(args, "_genrm_colocate_with_rollout", False))
     )
 
 

@@ -274,12 +274,16 @@ def create_test_manager(args=None, servers=None):
     manager._weight_sync_lock = lock
 
     manager._health_monitors = []
+    manager._stranded_replicas = []
+    manager._stranded_lock = threading.Lock()
+    manager._stranded_retry_stop = threading.Event()
+    manager._stranded_retry_thread = None
     manager._max_terminal_requests = 100
     manager._port_cursors = {}
     manager._eviction_monitor_stop = None
     manager._eviction_monitor_thread = None
     from relax.distributed.ray.inference_manager import InferenceManager
-    from relax.engine.inference.config import ModelConfig
+    from relax.engine.inference.config import InferenceModelSpec
     from relax.engine.inference.types import Role
 
     manager.status = None
@@ -288,7 +292,7 @@ def create_test_manager(args=None, servers=None):
     manager._planner = manager.inference_manager.placement
     for name, server in manager.servers.items():
         server.model_name = name
-        server.model_spec = server.model_spec or ModelConfig(name, "test-checkpoint", elastic_enabled=True)
+        server.model_spec = server.model_spec or InferenceModelSpec(name, "test-checkpoint", elastic_enabled=True)
         server.ready_gate = manager._serving
     if manager.servers:
         with patch.object(ray, "get", mock_ray_get):

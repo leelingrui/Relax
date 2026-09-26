@@ -143,7 +143,7 @@ def _router_get(post, weight_version=None):
     listing it once ``post`` registered it."""
 
     def get(url, timeout=None):
-        if url.endswith("/get_weight_version"):
+        if url.endswith("/model_info"):
             return _Response(200, {"weight_version": weight_version})
         return _Response(200, {"workers": [{"url": "http://worker:8000"}] if post.called else []})
 
@@ -515,7 +515,7 @@ def test_inference_observation_policy_unknown_version_does_not_register(monkeypa
         "weight_version": version,
     }
     engine.health_generate.assert_called_once_with(timeout=5.0)
-    get.assert_called_once_with("http://worker:8000/get_weight_version", timeout=5.0)
+    get.assert_called_once_with("http://worker:8000/model_info", timeout=5.0)
     post.assert_not_called()
 
 
@@ -537,7 +537,7 @@ def test_inference_observation_policy_valid_version_registers_when_requested(
     assert observation["healthy"] is True
     assert observation["weight_version"] == "v1"
     assert observation["router_registered"] is ensure_router
-    assert get.call_args_list[0] == (("http://worker:8000/get_weight_version",), {"timeout": 5.0})
+    assert get.call_args_list[0] == (("http://worker:8000/model_info",), {"timeout": 5.0})
     if ensure_router:
         post.assert_called_once_with(
             "http://router:30000/workers",
@@ -566,7 +566,7 @@ def test_inference_observation_checkpoint_registers_without_weight_version(monke
     assert observation["healthy"] is True
     assert observation["weight_version"] is None
     assert observation["router_registered"] is True
-    assert all(not call.args[0].endswith("/get_weight_version") for call in get.call_args_list)
+    assert all(not call.args[0].endswith("/model_info") for call in get.call_args_list)
     post.assert_called_once_with(
         "http://router:30000/workers",
         json={"url": "http://worker:8000", "worker_type": "regular"},
