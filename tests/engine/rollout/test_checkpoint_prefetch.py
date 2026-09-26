@@ -5,7 +5,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from relax.engine.rollout import sglang_rollout
+
+try:
+    from relax.engine.rollout import sglang_rollout
+
+    HAS_DEPS = True
+except ImportError:
+    HAS_DEPS = False
+
+pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
 
 
 @pytest.mark.parametrize(

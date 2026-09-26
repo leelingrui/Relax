@@ -1086,10 +1086,11 @@ class SGLangEngine(RayActor):
     def get_weight_version(self) -> Optional[str]:
         if self.node_rank != 0:
             return
-        url = f"http://{self.server_host}:{self.server_port}/get_weight_version"
+        # Upstream sglang deprecated /get_weight_version (404); /model_info carries it on every build.
+        url = f"http://{self.server_host}:{self.server_port}/model_info"
         response = requests.get(url)
         response.raise_for_status()
-        return response.json()["weight_version"]
+        return response.json().get("weight_version")
 
     def get_inference_observation(self, ensure_router: bool = False) -> dict:
         """Return bounded runtime evidence for Manager topology publication.
@@ -1100,7 +1101,7 @@ class SGLangEngine(RayActor):
         healthy = not getattr(self, "_released_memory", None) and self.health_generate(timeout=5.0)
         version = None
         if healthy and self.node_rank == 0 and self.weight_source == WeightSource.DCS:
-            response = requests.get(f"http://{self.server_host}:{self.server_port}/get_weight_version", timeout=5.0)
+            response = requests.get(f"http://{self.server_host}:{self.server_port}/model_info", timeout=5.0)
             response.raise_for_status()
             version = response.json().get("weight_version")
         if (
