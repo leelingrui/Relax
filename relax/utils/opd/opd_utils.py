@@ -535,11 +535,12 @@ def validate_managed_opd_teacher_colocate_args(args: Any) -> None:
             )
         args.rollout_num_gpus = args.resource["rollout"][1]
 
-    actor_total_gpus = args.resource.get("actor", [1, args.actor_num_gpus_per_node * args.actor_num_nodes])[1]
-    if args.use_critic:
-        actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
+    # Teachers are placed in the actor placement group, which has exactly
+    # resource["actor"] bundles (critic GPUs are not part of it); the placement
+    # checks (teacher_shares_rollout_bundles, teacher_region_offset) use the same count.
+    actor_pg_gpus = args.resource.get("actor", [1, args.actor_num_gpus_per_node * args.actor_num_nodes])[1]
 
-    check_teacher_colocate_layout(int(args.rollout_num_gpus), int(args.resource["teacher"][1]), actor_total_gpus)
+    check_teacher_colocate_layout(int(args.rollout_num_gpus), int(args.resource["teacher"][1]), int(actor_pg_gpus))
 
 
 def add_opd_arguments(parser: Any) -> Any:

@@ -948,7 +948,10 @@ class RolloutServer:
                     try:
                         result = ray.get(head.get_inference_observation.remote(ensure_router=serving), timeout=45)
                         observation = result if isinstance(result, dict) else {}
-                    except Exception:
+                    except Exception as e:
+                        # Also covers a live engine whose probe failed; the reason
+                        # separates that from a real engine death.
+                        logger.warning(f"Observation of {group.replica_identity(replica_index)} failed: {e!r}")
                         alive = False
                 version = observation.get("weight_version")
                 ready = bool(

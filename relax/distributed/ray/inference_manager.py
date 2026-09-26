@@ -190,16 +190,6 @@ class InferenceManager:
                 raise RuntimeError(f"Inference role is not registered: {role.value}")
             spec = self._specs[role]
             models = tuple(model.snapshot for model in self._models[role].values())
-            if not spec.expose_engine_urls:
-                models = tuple(
-                    replace(
-                        model,
-                        replicas=tuple(
-                            replace(replica, base_url=None, direct_eligible=False) for replica in model.replicas
-                        ),
-                    )
-                    for model in models
-                )
             return RoleSnapshot(
                 role=role,
                 manager_epoch=self.manager_epoch,

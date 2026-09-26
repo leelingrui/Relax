@@ -194,9 +194,6 @@ class InferenceRoleSpec:
     deployment: DeploymentSpec
     routing: RoutingSpec
     models: tuple[InferenceModelSpec, ...]
-    # Whether discovery publishes replica URLs; without them clients go
-    # through the Gateway.
-    expose_engine_urls: bool = True
 
     def __post_init__(self) -> None:
         names = [model.name for model in self.models]

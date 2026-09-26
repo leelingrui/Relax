@@ -11,7 +11,14 @@ import pytest
 from starlette.requests import Request
 
 from relax.components.inference_gateway import InferenceGateway
-from relax.engine.inference.types import LifecycleState, ModelSnapshot, ReplicaSnapshot, Role, RoleSnapshot
+from relax.engine.inference.types import (
+    LifecycleState,
+    ModelSnapshot,
+    ReplicaSnapshot,
+    Role,
+    RoleSnapshot,
+    RoutingSpec,
+)
 
 
 def _snapshot(*, role: Role = Role.ROLLOUT, state: LifecycleState = LifecycleState.READY, admission: bool = True):
@@ -88,6 +95,26 @@ async def test_gateway_reuses_discovery_routing_and_rejects_unavailable_models()
     finally:
         await ready.close()
         await sleeping.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_single_model_role_serves_any_openai_model_name() -> None:
+    """A single-model role registers as "default"; OpenAI clients send the real
+    name and must keep being served, while a multi-model role stays strict."""
+    single = replace(_snapshot(), routing=RoutingSpec(default_model="model-a"))
+    second = replace(single.models[0], model_id="model-b")
+    multi = replace(single, models=(*single.models, second))
+    single_gateway = InferenceGateway(Role.ROLLOUT, manager_handle=_owner(lambda: single))
+    multi_gateway = InferenceGateway(Role.ROLLOUT, manager_handle=_owner(lambda: multi))
+    try:
+        assert await single_gateway._resolve_target({"model": "Qwen3-8B"}) == ("http://router", "model-a")
+        with pytest.raises(Exception) as error:
+            await multi_gateway._target({"model": "Qwen3-8B"})
+        assert error.value.status_code == 400
+        assert error.value.detail["code"] == "unknown_model"
+    finally:
+        await single_gateway.close()
+        await multi_gateway.close()
 
 
 @pytest.mark.asyncio

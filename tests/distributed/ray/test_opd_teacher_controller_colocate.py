@@ -124,3 +124,41 @@ def test_opd_utils_shared_teacher_layout_accepts_agentic_rollout():
     validate_managed_opd_teacher_colocate_args(_args(4, 4))
     with pytest.raises(ValueError, match="split bundles"):
         validate_managed_opd_teacher_colocate_args(_args(8, 9))
+
+
+def test_opd_utils_teacher_layout_counts_only_actor_pg_bundles_with_critic():
+    """Critic GPUs are not in the actor placement group the teachers share, so
+    validation and placement must agree on the actor bundle count."""
+    import pytest
+
+    from relax.utils.opd.opd_utils import teacher_shares_rollout_bundles, validate_managed_opd_teacher_colocate_args
+
+    def _args(rollout_gpus, teacher_gpus):
+        return Namespace(
+            use_opd=True,
+            opd_type="sglang",
+            colocate=True,
+            hybrid=False,
+            opd_teacher_routes=None,
+            teacher_hf_checkpoint="/ckpt",
+            use_agentic_rollout=False,
+            use_critic=True,
+            critic_num_gpus_per_node=8,
+            critic_num_nodes=1,
+            actor_num_gpus_per_node=8,
+            actor_num_nodes=1,
+            offload_train=None,
+            offload_rollout=None,
+            rollout_num_gpus=rollout_gpus,
+            resource={"actor": [1, 8], "rollout": [1, rollout_gpus], "teacher": [1, teacher_gpus]},
+        )
+
+    # Shared layout: rollout covers the 8 actor bundles and the teacher reuses 4 of them.
+    shared = _args(8, 4)
+    validate_managed_opd_teacher_colocate_args(shared)
+    assert teacher_shares_rollout_bundles(shared)
+    # 8 + 8 only fits a 16-bundle PG; the actor PG has 8, so it is the shared layout.
+    validate_managed_opd_teacher_colocate_args(_args(8, 8))
+    assert teacher_shares_rollout_bundles(_args(8, 8))
+    with pytest.raises(ValueError):
+        validate_managed_opd_teacher_colocate_args(_args(8, 9))

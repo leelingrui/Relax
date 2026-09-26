@@ -93,6 +93,22 @@ def test_manager_rejects_ready_policy_with_stale_weights() -> None:
         manager.publish(Role.ROLLOUT, stale)
 
 
+def test_manager_publish_rejects_admission_on_a_model_that_is_not_ready() -> None:
+    manager = _manager(rollout={"policy": FakePool("policy", version="1")})
+    starting = ModelSnapshot(
+        "policy",
+        (ReplicaSnapshot("policy/replica-0", LifecycleState.STARTING, "http://engine-0", "1"),),
+        "http://router",
+        LifecycleState.STARTING,
+        admission=True,
+        required_weight_version="1",
+    )
+    with pytest.raises(ValueError, match="Only READY models may admit requests"):
+        manager.publish(Role.ROLLOUT, starting)
+    # The rejected observation is not committed.
+    assert manager.snapshot(Role.ROLLOUT).models[0].state == LifecycleState.READY
+
+
 def test_manager_topology_revision_bumps_only_on_topology_change() -> None:
     manager = _manager(genrm={"judge": FakePool("judge")})
     revision = manager.snapshot(Role.GENRM).topology_revision
@@ -574,12 +590,3 @@ def test_manager_model_activate_releases_the_model_when_its_load_fails() -> None
     assert not manager.resident(Role.GENRM)
     manager.lifecycle.switch([], [Role.TEACHER], timeout=0.01)
     assert pools["teacher"].onloaded
-
-
-def test_manager_snapshot_hides_replica_urls_when_the_role_does_not_expose_them() -> None:
-    from dataclasses import replace
-
-    manager = _manager(genrm={"judge": FakePool("judge")})
-    manager._specs[Role.GENRM] = replace(manager._specs[Role.GENRM], expose_engine_urls=False)
-    replica = manager.snapshot(Role.GENRM).models[0].replicas[0]
-    assert (replica.base_url, replica.direct_eligible) == (None, False)

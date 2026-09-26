@@ -75,7 +75,7 @@ class InferenceGateway:
         manager_handle: Any,
         upstream_url: str | None = None,
         genrm_backend_handle: Any | None = None,
-        timeout: float = 1800.0,
+        timeout: float | None = None,
     ) -> None:
         if manager_handle is None:
             raise ValueError("InferenceGateway requires the task inference manager handle")
@@ -99,10 +99,21 @@ class InferenceGateway:
     async def _resolve_target(self, payload: Mapping[str, Any] | None = None) -> tuple[str, str]:
         snapshot = await self._snapshot()
         payload = payload or {}
+        requested = payload.get("model")
+        # OpenAI clients send the served model's real name (e.g. "Qwen3-8B"), which the
+        # router used to accept. A single-model role keeps serving it through its
+        # default model; only a multi-model role must be named exactly.
+        if (
+            requested is not None
+            and len(snapshot.models) == 1
+            and snapshot.routing.default_model is not None
+            and requested != snapshot.models[0].model_id
+        ):
+            requested = None
         try:
             model = resolve_model(
                 snapshot,
-                model=payload.get("model"),
+                model=requested,
                 route_key=payload.get("route_key"),
             )
             return select_target(model, cursor=next(self._cursor)).base_url.rstrip("/"), model.model_id

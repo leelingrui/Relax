@@ -69,11 +69,17 @@ def test_restart_cycle_ack_is_published_after_old_state_is_cleared():
     assert controller._restart_mode == "global"
 
 
-def test_global_restart_cleans_owned_inference_before_ray(monkeypatch):
-    import relax.core.controller as module
-    import relax.distributed.ray.rollout as rollout_module
+def _patched_restart_controller(monkeypatch, events):
+    import sys
+    import types
 
-    events = []
+    import relax.core.controller as module
+
+    # The controller imports stop_launched_routers lazily; a stub module keeps
+    # the test off sglang, which the real rollout module imports at load time.
+    rollout_module = types.ModuleType("relax.distributed.ray.rollout")
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", rollout_module)
+
     controller = object.__new__(Controller)
     controller.config = SimpleNamespace(
         use_agentic_rollout=False, sglang_router_ip="external", sglang_router_port=9000
@@ -99,12 +105,18 @@ def test_global_restart_cleans_owned_inference_before_ray(monkeypatch):
     monkeypatch.setattr(module.serve, "start", lambda **kwargs: None)
     monkeypatch.setattr(module.ray, "get", lambda ref: ref)
     monkeypatch.setattr(module.ray, "shutdown", lambda: events.append("ray_shutdown"))
-    monkeypatch.setattr(module.ray, "init", lambda **kwargs: None)
+    monkeypatch.setattr(module.ray, "init", lambda **kwargs: events.append("ray_init"))
     monkeypatch.setattr(module.tq, "close", lambda: events.append("tq"))
     monkeypatch.setattr(module, "shutdown_async_loop", lambda: events.append("async_loop"))
     monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
-    monkeypatch.setattr(rollout_module, "stop_launched_routers", lambda: 0)
+    rollout_module.stop_launched_routers = lambda: 0
     monkeypatch.setattr(Controller, "__init__", lambda *args: None)
+    return controller
+
+
+def test_global_restart_cleans_owned_inference_before_ray(monkeypatch):
+    events = []
+    controller = _patched_restart_controller(monkeypatch, events)
 
     controller._run_global_restart()
 
@@ -113,3 +125,14 @@ def test_global_restart_cleans_owned_inference_before_ray(monkeypatch):
     assert events.index("async_loop") < events.index("ray_shutdown")
     assert controller.config.sglang_router_ip == "external"
     assert controller.config.sglang_router_port == 9000
+
+
+def test_global_restart_continues_when_inference_shutdown_fails(monkeypatch):
+    """A stuck engine or dead manager must not abort the recovery path."""
+    events = []
+    controller = _patched_restart_controller(monkeypatch, events)
+    controller._inference_manager_handle.shutdown_all.remote.side_effect = RuntimeError("engine stop failed")
+
+    controller._run_global_restart()
+
+    assert events.index("dcs_coordinator") < events.index("ray_shutdown") < events.index("ray_init")

@@ -111,14 +111,37 @@ class DeferredOpdSession:
         flattened sample order when training indices are not unique.
         """
         del args, data_system_client
-        if not batch_samples:
-            return
-        flat = _flatten(batch_samples)
+        flat = _flatten(batch_samples) if batch_samples else []
         if not flat:
+            self._stage_empty_batch(batch_count, rollout_id, is_last)
             return
         batch_id = f"{rollout_id}:{batch_count}:{len(self._staged)}"
         self._staged.append((batch_id, batch_samples, flat, batch_count, rollout_id, is_last, scoring_ids))
         logger.info(f"Staged deferred batch {batch_id} with {len(flat)} samples; publication waits for scoring")
+
+    def _stage_empty_batch(self, batch_count: int, rollout_id: int, is_last: bool) -> None:
+        """Keep an empty batch's end-of-stream marker; there is nothing else to
+        stage.
+
+        A streaming partition only closes on ``is_last``. The last staged batch
+        of the same rollout publishes last, so it carries the marker instead.
+        """
+        if not is_last:
+            logger.warning(f"Deferred OPD got an empty batch {batch_count} for rollout {rollout_id}; nothing staged")
+            return
+        for index in range(len(self._staged) - 1, -1, -1):
+            staged = self._staged[index]
+            if staged[4] == rollout_id:
+                self._staged[index] = (*staged[:5], True, *staged[6:])
+                logger.warning(
+                    f"Deferred OPD got an empty last batch {batch_count} for rollout {rollout_id}; "
+                    f"batch {staged[0]} now closes the partition"
+                )
+                return
+        logger.error(
+            f"Deferred OPD got an empty last batch {batch_count} for rollout {rollout_id} with no staged batch "
+            f"to close train_{rollout_id}; a streaming trainer will wait for an end-of-stream that never comes"
+        )
 
     @property
     def staged_batches(self) -> int:
@@ -156,12 +179,19 @@ class DeferredOpdSession:
                 is_last=is_last,
             )
 
-            async def publish(published_payload: Any, published_is_last: bool, count: int = batch_count) -> None:
+            # Bind this batch's loop values: a timed-out wait must not let a slow
+            # batch publish under the next iteration's rollout_id.
+            async def publish(
+                published_payload: Any,
+                published_is_last: bool,
+                count: int = batch_count,
+                published_rollout_id: int = rollout_id,
+            ) -> None:
                 await self._publish(
                     self.args,
                     published_payload,
                     count,
-                    rollout_id,
+                    published_rollout_id,
                     self.data_system_client,
                     is_last=published_is_last,
                 )

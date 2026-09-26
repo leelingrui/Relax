@@ -323,3 +323,70 @@ def test_deferred_opd_active_for_agentic_rollout_on_shared_teacher():
     split = build_args(use_agentic_rollout=True, rollout_num_gpus=4)
     assert deferred_opd_active(shared)
     assert not deferred_opd_active(split)
+
+
+def test_deferred_opd_publish_keeps_its_own_rollout_id_after_a_timed_out_wait():
+    """A batch still publishing after its wait ended must not pick up the next
+    iteration's loop values and land in another TQ partition."""
+    from relax.engine.rollout.deferred_opd import DeferredOpdSession
+
+    published = []
+
+    async def record_publish(args, payload, count, rollout_id, client, *, is_last):
+        published.append((count, rollout_id))
+
+    opd_manager = SimpleNamespace(schema_opd_transfer_data=lambda: REQUIRED)
+    session = DeferredOpdSession(build_args(), 1, None, opd_manager, publish=record_publish)
+    pending = []
+
+    def start(handle, *, score, publish):
+        pending.append(publish)
+
+    async def wait_deferred(handle, timeout_s=None):
+        # The wait ends while the batch is still running, as a timeout would.
+        return SimpleNamespace(state=DeferredState.COMPLETED, published=0)
+
+    session.executor.start = start
+    session.executor.wait_deferred = wait_deferred
+
+    async def run():
+        await session.transfer(None, [build_sample(0), build_sample(1)], 0, 1, None)
+        await session.transfer(None, [build_sample(2), build_sample(3)], 1, 2, None)
+        await session.flush()
+        for publish in pending:
+            await publish([], False)
+
+    asyncio.run(run())
+
+    assert published == [(0, 1), (1, 2)]
+
+
+def test_deferred_opd_empty_last_batch_moves_end_of_stream_to_the_last_staged_batch():
+    """A last batch whose groups expand to no samples must not drop the marker
+    that closes a streaming partition."""
+    from relax.engine.rollout.deferred_opd import DeferredOpdSession
+
+    opd_manager = SimpleNamespace(schema_opd_transfer_data=lambda: REQUIRED)
+    session = DeferredOpdSession(build_args(), 1, None, opd_manager, publish=None)
+
+    async def run():
+        await session.transfer(None, [build_sample(0), build_sample(1)], 0, 1, None)
+        await session.transfer(None, [[], []], 1, 1, None, is_last=True)
+
+    asyncio.run(run())
+
+    assert session.staged_batches == 1
+    assert session._staged[0][5] is True
+
+
+def test_deferred_opd_empty_last_batch_without_staged_data_is_reported(caplog):
+    from relax.engine.rollout.deferred_opd import DeferredOpdSession
+
+    opd_manager = SimpleNamespace(schema_opd_transfer_data=lambda: REQUIRED)
+    session = DeferredOpdSession(build_args(), 1, None, opd_manager, publish=None)
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(session.transfer(None, [[]], 0, 1, None, is_last=True))
+
+    assert session.staged_batches == 0
+    assert "end-of-stream" in caplog.text

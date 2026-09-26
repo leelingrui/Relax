@@ -30,6 +30,7 @@ from transformers import AutoConfig, AutoTokenizer
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.engine.inference.phase_plans import deferred_genrm_enabled
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
@@ -2505,10 +2506,9 @@ class MegatronTrainRayActor(TrainRayActor):
         # RL warms KV here for the next per-step generate. SFT's /predict
         # calls onload_kv itself. genRM (deferred from before the weight
         # all-gather) is onloaded here too, in parallel.
-        # When --defer-reward-to-post-process is set the userland
-        # custom_reward_post_process function owns GenRM lifecycle, so skip
-        # onloading GenRM here (it must stay offloaded for rollout to have
-        # all GPUs during generate in shared-bundles mode).
+        # A deferred GenRM (shared bundles + --defer-reward-to-post-process)
+        # is woken by its own scoring phase, so skip onloading it here (it
+        # must stay offloaded for rollout to have all GPUs during generate).
         if self.args.offload_rollout and dist.get_rank() == 0:
             from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
 
@@ -2521,7 +2521,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         Role.ROLLOUT, tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
                     )
                 )
-            if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
+            if self.genrm_manager is not None and not deferred_genrm_enabled(self.args):
                 # A list of one or more GenRM manager handles (one per instance).
                 post_sync_handles.extend(m.activate.remote() for m in self.genrm_manager)
             if post_sync_handles:

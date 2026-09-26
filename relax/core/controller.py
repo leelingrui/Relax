@@ -1271,8 +1271,13 @@ class Controller:
                     logger.warning(f"[Global Restart] Failed to delete application '{app_name}': {e}")
 
         if self._inference_manager_handle is not None:
-            ray.get(self._inference_manager_handle.shutdown_all.remote())
-            logger.info("[Global Restart] Inference engines and owned routers shut down")
+            # A failed stop (stuck engine, dead manager) must not abort recovery:
+            # ray.shutdown() below still reclaims the GPUs.
+            try:
+                ray.get(self._inference_manager_handle.shutdown_all.remote())
+                logger.info("[Global Restart] Inference engines and owned routers shut down")
+            except Exception as e:
+                logger.warning(f"[Global Restart] Failed to shut down the inference manager: {e}")
 
         self.serve_dict.clear()
         logger.info("[Global Restart] All service references cleared")
