@@ -19,6 +19,7 @@ from conftest import (
 if HAS_DEPS:
     import ray
 
+    from relax.backends.sglang.sglang_engine import EngineMemoryStateUnknown
     from relax.engine.inference.config import InferenceModelSpec
     from relax.engine.inference.types import LifecycleState, Role, WeightSource
 
@@ -88,7 +89,7 @@ def test_rollout_observe_pd_exposes_only_router_service(patch_ray_get: Any, deco
     assert model.admission is ready
 
 
-def test_static_server_offload_and_onload_are_idempotent(patch_ray_get: Any) -> None:
+def test_static_server_offload_is_idempotent_and_onload_reopens_every_engine(patch_ray_get: Any) -> None:
     engine = _observed_engine(None)
     server = make_rollout_server(engine_groups=[make_engine_group(engines=[engine])])
     server.static = True
@@ -103,7 +104,9 @@ def test_static_server_offload_and_onload_are_idempotent(patch_ray_get: Any) -> 
     server.onload()
 
     assert engine.release_memory_occupation.remote.call_count == 1
-    assert engine.resume_memory_occupation.remote.call_count == 1
+    # The engine resumes only memory it released, so every onload may reopen
+    # it; one still resident after a failed release is reopened this way.
+    assert engine.resume_memory_occupation.remote.call_count == 3
     assert server.observe().state == LifecycleState.READY
 
 
@@ -321,4 +324,69 @@ def test_onload_keeps_a_timed_out_engine_instead_of_rebuilding_on_its_gpus(
 
     assert group.all_engines == [hung, healthy]
     server.recover.assert_not_called()
+    kill.assert_not_called()
+
+
+def _policy_server(*engines: Any) -> Any:
+    group = make_engine_group(engines=list(engines))
+    server = make_rollout_server(engine_groups=[group])
+    server.onloaded = True
+    return server, group
+
+
+def test_policy_offload_hears_every_engine_and_stays_onloaded_after_a_failed_release(
+    patch_ray_get: Any, monkeypatch: Any
+) -> None:
+    _raising_get(monkeypatch)
+    failed, released = make_mock_engine(), make_mock_engine()
+    failed.release_memory_occupation.remote.return_value = AwaitableValue(RuntimeError("router still lists it"))
+    released.release_memory_occupation.remote.return_value = AwaitableValue(None)
+    server, group = _policy_server(failed, released)
+
+    with pytest.raises(RuntimeError, match="router still lists it"):
+        server.offload()
+    # Both engines answered; the pool is still onloaded, so a retry releases
+    # again (the engine that already released skips it).
+    released.release_memory_occupation.remote.assert_called_once()
+    assert server.onloaded and group.all_engines == [failed, released]
+
+    failed.release_memory_occupation.remote.return_value = AwaitableValue(None)
+    server.offload()
+    assert not server.onloaded
+    assert failed.release_memory_occupation.remote.call_count == 2
+
+
+def test_policy_offload_releases_weights_left_by_a_weights_only_onload(patch_ray_get: Any, monkeypatch: Any) -> None:
+    _raising_get(monkeypatch)
+    engine = make_mock_engine()
+    engine.release_memory_occupation.remote.return_value = AwaitableValue(None)
+    server, _ = _policy_server(engine)
+    # A weights-only onload leaves the pool not onloaded, with weights held.
+    server.onloaded = False
+
+    server.offload()
+    engine.release_memory_occupation.remote.assert_called_once()
+
+
+@pytest.mark.parametrize("static", [True, False])
+@pytest.mark.parametrize("stopped", [True, False])
+def test_offload_retires_an_engine_whose_release_was_not_confirmed(
+    patch_ray_get: Any, monkeypatch: Any, static: bool, stopped: bool
+) -> None:
+    kill = _raising_get(monkeypatch)
+    unknown, released = make_mock_engine(), make_mock_engine()
+    unknown.release_memory_occupation.remote.return_value = AwaitableValue(EngineMemoryStateUnknown("lost reply"))
+    unknown.shutdown.remote.return_value = AwaitableValue(None if stopped else TimeoutError("shutdown timed out"))
+    released.release_memory_occupation.remote.return_value = AwaitableValue(None)
+    server, group = _static_server(unknown, released) if static else _policy_server(unknown, released)
+
+    if stopped:
+        # Stopping the engine freed its memory; it is never released again.
+        server.offload()
+        assert group.all_engines == [None, released] and not server.onloaded
+        kill.assert_called_once_with(unknown)
+        return
+    with pytest.raises(RuntimeError, match="may still hold GPU memory"):
+        server.offload()
+    assert group.all_engines == [unknown, released] and server.onloaded
     kill.assert_not_called()

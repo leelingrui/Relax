@@ -42,16 +42,19 @@ class _Owner:
 
     def __init__(self, provider) -> None:
         self.inflight: set[str] = set()
+        self.traces: list[str] = []
 
         async def snapshot(role):
             return provider()
 
-        async def admit_request(role, model_id, request_id):
-            self.inflight.add(request_id)
-            return request_id
+        async def admit_request(role, model_id, trace_id):
+            permit = f"permit-{len(self.traces)}"
+            self.traces.append(trace_id)
+            self.inflight.add(permit)
+            return permit
 
-        async def complete_request(request_id):
-            self.inflight.discard(request_id)
+        async def complete_request(permit):
+            self.inflight.discard(permit)
 
         self.snapshot = SimpleNamespace(remote=snapshot)
         self.admit_request = SimpleNamespace(remote=admit_request)

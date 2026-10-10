@@ -216,7 +216,9 @@ class GenRM(Base):
             GenerateResponse containing raw model response text
         """
         key = self._resolve_instance_key(request.route_key)
-        request_id = await self._admit(key)
+        # The engine rid traces the request; the permit holds its admission.
+        request_id = uuid4().hex
+        permit = await self._admit(key, request_id)
         try:
             output = await self._call_engine(
                 request.route_key, request.messages, request.sampling_params, request_id=request_id
@@ -228,9 +230,9 @@ class GenRM(Base):
             self._logger.error(f"GenRM generation failed (route_key={request.route_key}): {e}")
             raise
         finally:
-            await self._complete(request_id)
+            await self._complete(permit, request_id)
 
-    async def _admit(self, key: str) -> str:
+    async def _admit(self, key: str, request_id: str) -> str:
         """Admit a direct request through the Manager, or refuse it with 503.
 
         This endpoint calls the engines without the Gateway, so it records the
@@ -238,20 +240,20 @@ class GenRM(Base):
         waits for every request admitted here.
         """
         try:
-            return await self._inference_manager.admit_request.remote(Role.GENRM, key, uuid4().hex)
+            return await self._inference_manager.admit_request.remote(Role.GENRM, key, request_id)
         except Exception as exc:
-            self._logger.warning(f"GenRM request to instance '{key}' is not admitted: {exc}")
+            self._logger.warning(f"GenRM request {request_id} to instance '{key}' is not admitted: {exc}")
             raise HTTPException(
                 status_code=503,
                 detail=f"GenRM instance '{key}' is not accepting requests",
                 headers={"Retry-After": "1"},
             ) from exc
 
-    async def _complete(self, request_id: str) -> None:
+    async def _complete(self, permit: str, request_id: str) -> None:
         try:
-            await self._inference_manager.complete_request.remote(request_id)
+            await self._inference_manager.complete_request.remote(permit)
         except Exception as exc:
-            self._logger.warning(f"Failed to complete GenRM request {request_id}: {exc}")
+            self._logger.warning(f"Failed to complete GenRM request {request_id} (permit {permit}): {exc}")
 
     def _resolve_instance_key(self, route_key: Optional[str]) -> str:
         if route_key is None and len(self.genrm_managers) == 1:
@@ -361,6 +363,10 @@ class GenRM(Base):
                 raise
             except Exception as e:
                 status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
+                if request_id is not None and (status == 0 or status >= 500):
+                    # The engine may still run a request whose reply was lost;
+                    # abort it before retrying its rid elsewhere or giving up.
+                    await self._abort_engine_request(host, port, request_id)
                 if (status == 0 or status >= 500) and _attempt < retry_attempts:
                     # A transport error means this engine may be gone and its
                     # replacement will come back on a different port, so drop the

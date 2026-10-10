@@ -188,11 +188,14 @@ class InferenceGateway:
                 exc.status_code, str(exc.detail), code="unavailable" if exc.status_code == 503 else "routing_error"
             )
 
+        # The caller's ID only traces the request; the Manager's permit holds
+        # its admission.
+        trace_id = request.headers.get("x-relax-request-id") or uuid4().hex
         try:
-            request_id = await self._admit(request, model_id)
+            permit = await self._admit(trace_id, model_id)
         except HTTPException as exc:
             return _json_error(exc.status_code, str(exc.detail), code="unavailable")
-        rid = request_id
+        rid = trace_id
         response: Response | None = None
         finished = False
         try:
@@ -208,7 +211,7 @@ class InferenceGateway:
             if path == "generate":
                 payload.pop("model", None)
             # Both native and OpenAI requests must carry the ID used by abort.
-            rid = payload["rid"] = payload.get("rid") or request_id
+            rid = payload["rid"] = payload.get("rid") or trace_id
             response, finished = await self._forward(
                 request,
                 path,
@@ -216,7 +219,7 @@ class InferenceGateway:
                 json.dumps(payload).encode(),
                 wrap_response=wrap_response,
                 request_id=rid,
-                admission_id=request_id,
+                admission_id=permit,
             )
             return response
         finally:
@@ -224,7 +227,7 @@ class InferenceGateway:
             if not isinstance(response, StreamingResponse):
                 if not finished:
                     await self._abort_upstream(target, rid)
-                await self._manager_call("complete_request", request_id)
+                await self._manager_call("complete_request", permit)
 
     async def _manager_call(self, method: str, *args: Any) -> Any:
         value = getattr(self.manager_handle, method).remote(*args)
@@ -232,12 +235,13 @@ class InferenceGateway:
             return await value
         return await asyncio.to_thread(ray.get, value)
 
-    async def _admit(self, request: Request, model_id: str) -> str:
-        request_id = request.headers.get("x-relax-request-id") or uuid4().hex
+    async def _admit(self, trace_id: str, model_id: str) -> str:
+        """Admit a request through the Manager and return its permit, or refuse
+        it with 503."""
         try:
-            return await self._manager_call("admit_request", self.role, model_id, request_id)
+            return await self._manager_call("admit_request", self.role, model_id, trace_id)
         except Exception as exc:
-            self._logger.warning("Inference request admission failed: %s", exc)
+            self._logger.warning("Inference request %s admission failed: %s", trace_id, exc)
             raise HTTPException(
                 status_code=503,
                 detail="Inference request is not admitted",

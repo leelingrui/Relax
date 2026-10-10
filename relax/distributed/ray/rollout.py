@@ -21,7 +21,7 @@ import requests
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
-from relax.backends.sglang.sglang_engine import SGLangEngine
+from relax.backends.sglang.sglang_engine import EngineMemoryStateUnknown, SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.inference.config import (
@@ -82,13 +82,16 @@ logger = get_logger(__name__)
 # An engine process can die on its own (e.g. SGLang's scheduler watchdog
 # SIGQUITs the server after a CUDA-level hang); the next call into it then
 # raises one of these, including through ray.get, which re-raises a class that
-# inherits from the original cause. Everything else is a real bug.
+# inherits from the original cause. An engine whose memory release or resume
+# was not confirmed is handled the same way: only stopping it frees the memory.
+# Everything else is a real bug.
 _ENGINE_DEAD_EXCEPTIONS = (
     ConnectionError,
     TimeoutError,
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
     ray.exceptions.RayActorError,
+    EngineMemoryStateUnknown,
 )
 
 
@@ -541,13 +544,6 @@ class EngineGroup:
         ]
         return init_handles, port_cursors
 
-    def offload(self):
-        """Fire release_memory_occupation on all engines (non-blocking).
-
-        Returns a list of Ray ObjectRefs.
-        """
-        return [engine.release_memory_occupation.remote() for engine in self.engines if engine is not None]
-
     def onload(self, tags: list[str] | None = None):
         """Fire resume_memory_occupation on all engines (non-blocking).
 
@@ -776,22 +772,20 @@ class RolloutServer:
             )
 
     def offload(self):
-        """Release memory occupation across all groups (concurrent)."""
+        """Release memory occupation across all groups (concurrent).
+
+        Returns only once every engine has confirmed its release, or has been
+        stopped. The pool stays onloaded until then, so a retry after a failed
+        release releases the rest; an engine skips a release it already made.
+        An engine that died, timed out, or whose release was not confirmed is
+        retired, and the offload fails unless its shutdown is confirmed, since
+        it may still hold the GPUs.
+        """
         if self.static and not self.onloaded:
             return []
-        if self.static:
-            # Stay onloaded until the release succeeds, so a retry after a
-            # failed release is not skipped as already offloaded. An engine
-            # whose release timed out is retired as dead but may still hold
-            # the GPUs, so the offload fails unless its shutdown is confirmed.
-            self._retire(self._call_heads("release_memory_occupation"))
-            self.onloaded = False
-            return []
+        self._retire(self._call_heads("release_memory_occupation"))
         self.onloaded = False
-        handles = []
-        for g in self.engine_groups:
-            handles.extend(g.offload())
-        return ray.get(handles) if handles else []
+        return []
 
     def abort_requests(self) -> None:
         """Abort everything the live engines run; a forced drain calls it.
@@ -803,13 +797,10 @@ class RolloutServer:
 
     def onload(self, tags: list[str] | None = None):
         """Resume memory occupation across all groups (concurrent)."""
-        if self.static and self.onloaded:
-            # Already resident: resuming twice is not idempotent in SGLang.
-            self._rebuild()
-            return []
         if self.static:
             # Engines that died while asleep are rebuilt fully loaded; only the
-            # survivors are resumed.
+            # survivors are resumed. An engine resumes only memory it released,
+            # so one still resident after a failed release is only reopened.
             rebuilt = self._rebuild()
             dead = self._call_heads("resume_memory_occupation", skip=rebuilt, tags=tags)
             if dead:
@@ -838,7 +829,8 @@ class RolloutServer:
         """Call ``method`` on every live head engine; return the dead ones.
 
         One ray.get per handle: a batched get aborts on the first failure and
-        loses which engine raised.
+        loses which engine raised. Every engine answers before any other
+        failure is raised.
         """
         pending = []
         for g in self.engine_groups:
@@ -846,14 +838,18 @@ class RolloutServer:
                 if g.all_engines[i] is not None and (id(g), i) not in skip:
                     pending.append((g, i, getattr(g.all_engines[i], method).remote(**kwargs)))
         dead = []
+        failure: Exception | None = None
         for g, i, ref in pending:
             try:
                 ray.get(ref)
             except Exception as exc:
                 if not _is_engine_dead(exc):
-                    raise
+                    failure = failure or exc
+                    continue
                 logger.warning(f"[{self.model_name}] engine {g.rank_offset + i} died during {method}: {exc}")
                 dead.append((g, i))
+        if failure is not None:
+            raise failure
         return dead
 
     def _retire(self, dead: list[tuple[EngineGroup, int]], *, degrade: bool = False) -> None:

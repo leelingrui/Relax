@@ -143,7 +143,7 @@ def test_manager_drain_closes_admission_and_waits_for_requests(monkeypatch: pyte
     warnings = _warnings(monkeypatch)
     pool = FakePool("judge")
     manager = _manager(genrm={"judge": pool})
-    assert manager.admit_request(Role.GENRM, "judge", "req-1") == "req-1"
+    permit = manager.admit_request(Role.GENRM, "judge", "req-1")
 
     drainer = _start(manager.drain, [Role.GENRM], 0.01)
     # Without force_abort it warns every timeout and keeps waiting.
@@ -152,7 +152,59 @@ def test_manager_drain_closes_admission_and_waits_for_requests(monkeypatch: pyte
     with pytest.raises(RuntimeError, match="not ready"):
         manager.admit_request(Role.GENRM, "judge")
 
-    manager.complete_request("req-1")
+    manager.complete_request(permit)
+    drainer.join(5.0)
+    assert not drainer.is_alive()
+
+
+def test_manager_duplicate_trace_id_on_one_model_holds_each_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    warnings = _warnings(monkeypatch)
+    manager = _manager(genrm={"judge": FakePool("judge")})
+    first = manager.admit_request(Role.GENRM, "judge", "retry")
+    second = manager.admit_request(Role.GENRM, "judge", "retry")
+    assert first != second and "retry" not in (first, second)
+
+    manager.complete_request(first)
+    # A repeated completion and the trace ID itself release nothing.
+    manager.complete_request(first)
+    manager.complete_request("retry")
+    drainer = _start(manager.drain, [Role.GENRM], 0.01)
+    assert drainer.is_alive()
+    assert f"trace=retry permit={second}" in warnings[-1] and first not in warnings[-1]
+
+    manager.complete_request(second)
+    drainer.join(5.0)
+    assert not drainer.is_alive()
+
+
+def test_manager_duplicate_trace_id_across_roles_holds_each_admission() -> None:
+    manager = _manager(genrm={"judge": FakePool("judge")}, teacher={"teacher": FakePool("teacher")})
+    judge = manager.admit_request(Role.GENRM, "judge", "shared-trace")
+    teacher = manager.admit_request(Role.TEACHER, "teacher", "shared-trace")
+
+    manager.complete_request(judge)
+    drainer = _start(manager.drain, [Role.TEACHER], 0.01)
+    assert drainer.is_alive()
+
+    manager.complete_request(teacher)
+    drainer.join(5.0)
+    assert not drainer.is_alive()
+
+
+def test_manager_late_completion_of_an_aborted_permit_keeps_the_new_admission() -> None:
+    pool = FakePool("judge")
+    manager = _manager(genrm={"judge": pool})
+    old = manager.admit_request(Role.GENRM, "judge", "req-1")
+    manager.drain([Role.GENRM], timeout=0.01, force_abort=True)
+    manager.activate(Role.GENRM, "judge")
+    new = manager.admit_request(Role.GENRM, "judge", "req-1")
+
+    # The aborted request finishes late with its own permit.
+    manager.complete_request(old)
+    drainer = _start(manager.drain, [Role.GENRM], 0.01)
+    assert drainer.is_alive() and pool.calls.count("abort") == 1
+
+    manager.complete_request(new)
     drainer.join(5.0)
     assert not drainer.is_alive()
 
@@ -160,7 +212,7 @@ def test_manager_drain_closes_admission_and_waits_for_requests(monkeypatch: pyte
 def test_manager_drain_stays_closed_while_the_pool_reports_ready() -> None:
     pool = FakePool("judge")
     manager = _manager(genrm={"judge": pool})
-    manager.admit_request(Role.GENRM, "judge", "old")
+    old = manager.admit_request(Role.GENRM, "judge", "old")
 
     drainer = _start(manager.drain, [Role.GENRM], 5.0)
     for _ in range(3):
@@ -174,7 +226,7 @@ def test_manager_drain_stays_closed_while_the_pool_reports_ready() -> None:
             manager.admit_request(Role.GENRM, "judge", "new")
     assert drainer.is_alive()
 
-    manager.complete_request("old")
+    manager.complete_request(old)
     drainer.join(5.0)
     assert not drainer.is_alive()
     manager.health_check(Role.GENRM, "judge")
@@ -183,7 +235,7 @@ def test_manager_drain_stays_closed_while_the_pool_reports_ready() -> None:
 
     # Only a controlled activate reopens it.
     manager.activate(Role.GENRM, "judge")
-    assert manager.admit_request(Role.GENRM, "judge", "new") == "new"
+    manager.admit_request(Role.GENRM, "judge", "new")
 
 
 def test_manager_reactivating_a_drained_model_reopens_without_loading_again() -> None:
@@ -198,10 +250,10 @@ def test_manager_reactivating_a_drained_model_reopens_without_loading_again() ->
     manager.activate(Role.ROLLOUT, "policy", ["weights"])
     # Resuming memory that was never released is not idempotent in SGLang.
     assert rollout.calls.count("onload") == loads
-    assert manager.admit_request(Role.ROLLOUT, "policy", "req-2") == "req-2"
+    permit = manager.admit_request(Role.ROLLOUT, "policy", "req-2")
 
     # Once offloaded, it loads again.
-    manager.complete_request("req-2")
+    manager.complete_request(permit)
     manager.deactivate(Role.ROLLOUT)
     manager.activate(Role.ROLLOUT, "policy")
     assert rollout.calls.count("onload") == loads + 1
@@ -545,6 +597,221 @@ def test_manager_rollout_offload_waits_for_a_request_admitted_by_the_gateway() -
     assert manager.rollout_released() and rollout_pool.status == "offload"
 
 
+def test_manager_gateway_retries_with_one_request_id_each_hold_the_drain() -> None:
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    from relax.components.inference_gateway import InferenceGateway
+
+    manager = _manager(rollout={"policy": FakePool("policy", version="1")})
+    handle = SimpleNamespace(
+        **{
+            name: SimpleNamespace(remote=partial(asyncio.to_thread, getattr(manager, name)))
+            for name in ("snapshot", "admit_request", "complete_request")
+        }
+    )
+    gateway = InferenceGateway(Role.ROLLOUT, manager_handle=handle)
+
+    def request() -> Request:
+        async def receive():
+            return {"type": "http.request", "body": b'{"text": "hi"}', "more_body": False}
+
+        headers = [(b"x-relax-request-id", b"retry")]
+        return Request({"type": "http", "method": "POST", "path": "/generate", "headers": headers}, receive)
+
+    async def scenario() -> None:
+        released = {"first": asyncio.Event(), "second": asyncio.Event()}
+        admitted = asyncio.Queue()
+        rids = []
+
+        async def hold(*args, request_id=None, admission_id=None, **kwargs):
+            rids.append(request_id)
+            name = "first" if len(rids) == 1 else "second"
+            await admitted.put(name)
+            await released[name].wait()
+            return Response(), True
+
+        gateway._forward = hold
+        first = asyncio.create_task(gateway.proxy(request(), "generate"))
+        assert await admitted.get() == "first"
+        second = asyncio.create_task(gateway.proxy(request(), "generate"))
+        assert await admitted.get() == "second"
+        # The caller's ID reaches the engine as its rid.
+        assert rids == ["retry", "retry"]
+
+        released["first"].set()
+        await first
+        drain = asyncio.create_task(asyncio.to_thread(manager.drain, [Role.ROLLOUT], 0.01))
+        await asyncio.sleep(0.1)
+        assert not drain.done()
+
+        released["second"].set()
+        await second
+        await asyncio.wait_for(drain, 5.0)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(gateway.close())
+
+
+class BusyEnginePool(FakePool):
+    """A pool whose engine keeps running requests its HTTP callers dropped.
+
+    As in SGLang, an abort is only acknowledged: the requests leave the running
+    batch ``exit_after`` polls later, or never with ``None``. ``offload`` polls
+    until the engine is idle and fails after ``flush_polls``, the way
+    ``release_memory_occupation`` waits for ``/flush_cache``.
+    """
+
+    def __init__(self, name: str, *, exit_after: int | None = None, flush_polls: int = 3) -> None:
+        super().__init__(name)
+        self.running: set[str] = set()
+        self.aborted = False
+        self.exit_after = exit_after
+        self.flush_polls = flush_polls
+
+    def _idle(self) -> bool:
+        if self.aborted and self.exit_after is not None:
+            if self.exit_after == 0:
+                self.running.clear()
+            self.exit_after -= 1
+        return not self.running
+
+    def offload(self) -> None:
+        for _ in range(self.flush_polls):
+            if self._idle():
+                return super().offload()
+        raise TimeoutError("Timeout while flushing cache.")
+
+
+def _engine_gateway(manager: InferenceManager, pool: BusyEnginePool, *, abort_fails: bool = False, hold=None):
+    """A GenRM Gateway in front of ``pool``'s engine, whose ``/generate``
+    starts running and then loses its HTTP connection, or waits on ``hold``."""
+    import json
+
+    import httpx
+
+    from relax.components.inference_gateway import InferenceGateway
+
+    async def engine(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/generate":
+            pool.running.add(json.loads(request.content)["rid"])
+            if hold is None:
+                raise httpx.ReadTimeout("connection lost", request=request)
+            await hold.wait()
+            return httpx.Response(200, json={})
+        if path == "/workers":
+            return httpx.Response(200, json={"workers": [{"url": "http://engine-0"}]})
+        if path == "/abort_request":
+            if abort_fails:
+                raise httpx.ConnectError("abort lost", request=request)
+            pool.aborted = True
+            return httpx.Response(200, json={})
+        raise AssertionError(path)
+
+    handle = SimpleNamespace(
+        **{
+            name: SimpleNamespace(remote=partial(asyncio.to_thread, getattr(manager, name)))
+            for name in ("snapshot", "admit_request", "complete_request")
+        }
+    )
+    gateway = InferenceGateway(Role.GENRM, manager_handle=handle)
+    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(engine))
+    return gateway
+
+
+def _gateway_request():
+    from starlette.requests import Request
+
+    async def receive():
+        return {"type": "http.request", "body": b'{"text": "hi"}', "more_body": False}
+
+    return Request({"type": "http", "method": "POST", "path": "/generate", "headers": []}, receive)
+
+
+def _record_onload(pool: FakePool, engine: BusyEnginePool) -> list[tuple[set[str], bool]]:
+    """Record whether ``engine`` was idle and released when ``pool`` loads."""
+    seen: list[tuple[set[str], bool]] = []
+    onload = pool.onload
+
+    def recording_onload(tags=None) -> None:
+        seen.append((set(engine.running), engine.onloaded))
+        onload(tags)
+
+    pool.onload = recording_onload
+    return seen
+
+
+@pytest.mark.parametrize(
+    "case", ["abort_acked_then_exits", "abort_acked_never_exits", "abort_fails"], ids=lambda case: case
+)
+def test_manager_switch_waits_for_the_engine_after_the_gateway_lets_go(case: str) -> None:
+    judge = BusyEnginePool("judge", exit_after=1 if case == "abort_acked_then_exits" else None)
+    manager, pools = _shared(genrm=judge)
+    teacher_loads = _record_onload(pools["teacher"], judge)
+    manager.lifecycle.switch([], [Role.GENRM], timeout=0.01)
+    gateway = _engine_gateway(manager, judge, abort_fails=case == "abort_fails")
+
+    response = asyncio.run(gateway.proxy(_gateway_request(), "generate"))
+    asyncio.run(gateway.close())
+    # The Gateway let go and returned its permit; the engine still runs.
+    assert response.status_code == 502
+    assert judge.running and not manager._inflight
+
+    if case == "abort_acked_then_exits":
+        manager.lifecycle.switch([Role.GENRM], [Role.TEACHER], timeout=0.01)
+        assert teacher_loads == [(set(), False)]
+        return
+
+    with pytest.raises(TimeoutError, match="flushing"):
+        manager.lifecycle.switch([Role.GENRM], [Role.TEACHER], timeout=0.01)
+    # The unconfirmed release keeps the GPUs fenced.
+    assert not teacher_loads and judge.onloaded
+    assert manager.resident(Role.GENRM)
+    assert manager.snapshot(Role.GENRM).models[0].state == LifecycleState.DEAD
+    with pytest.raises(TimeoutError, match="genrm"):
+        manager.lifecycle.switch([], [Role.TEACHER], timeout=0.01)
+
+    # Once the engine finishes, a retried switch hands the GPUs over.
+    judge.running.clear()
+    manager.lifecycle.switch([Role.GENRM], [Role.TEACHER], timeout=0.01)
+    assert teacher_loads == [(set(), False)]
+
+
+def test_manager_request_cancelled_during_a_scoring_switch_waits_for_the_engine() -> None:
+    judge = BusyEnginePool("judge", exit_after=1)
+    manager, pools = _shared(genrm=judge)
+    teacher_loads = _record_onload(pools["teacher"], judge)
+    manager.lifecycle.switch([], [Role.GENRM], timeout=0.01)
+
+    async def scenario() -> None:
+        gateway = _engine_gateway(manager, judge, hold=asyncio.Event())
+        try:
+            proxied = asyncio.create_task(gateway.proxy(_gateway_request(), "generate"))
+            while not judge.running:
+                await asyncio.sleep(0.01)
+            switch = asyncio.create_task(
+                asyncio.to_thread(manager.lifecycle.switch, [Role.GENRM], [Role.TEACHER], 5.0)
+            )
+            await asyncio.sleep(0.1)
+            # The switch waits for the admitted request.
+            assert not switch.done() and not teacher_loads
+
+            # The caller gives up mid-switch: the Gateway aborts, completes,
+            # and the release still waits for the engine to go idle.
+            proxied.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await proxied
+            await asyncio.wait_for(switch, 5.0)
+        finally:
+            await gateway.close()
+
+    asyncio.run(scenario())
+    assert judge.aborted and teacher_loads == [(set(), False)]
+
+
 def test_manager_deactivate_keeps_waiting_and_the_gpus_held_without_force_abort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -552,7 +819,7 @@ def test_manager_deactivate_keeps_waiting_and_the_gpus_held_without_force_abort(
     manager, pools = _shared()
     judge = pools["genrm"]
     manager.lifecycle.switch([], [Role.GENRM], timeout=0.01)
-    manager.admit_request(Role.GENRM, "judge", "req-1")
+    permit = manager.admit_request(Role.GENRM, "judge", "req-1")
 
     releaser = _start(manager.deactivate, Role.GENRM, None, 0.01)
     assert releaser.is_alive() and len(warnings) > 1
@@ -562,7 +829,7 @@ def test_manager_deactivate_keeps_waiting_and_the_gpus_held_without_force_abort(
     with pytest.raises(TimeoutError, match="genrm"):
         manager.lifecycle.switch([], [Role.TEACHER], timeout=0.01)
 
-    manager.complete_request("req-1")
+    manager.complete_request(permit)
     releaser.join(5.0)
     assert not releaser.is_alive() and judge.calls[-1] == "offload"
     manager.lifecycle.switch([], [Role.TEACHER], timeout=0.01)
@@ -573,14 +840,14 @@ def test_manager_force_abort_aborts_the_engines_before_releasing() -> None:
     manager, pools = _shared()
     judge = pools["genrm"]
     manager.lifecycle.switch([], [Role.GENRM], timeout=0.01)
-    manager.admit_request(Role.GENRM, "judge", "req-1")
+    permit = manager.admit_request(Role.GENRM, "judge", "req-1")
 
     manager.deactivate(Role.GENRM, timeout=0.01, force_abort=True)
 
     assert judge.calls[-2:] == ["abort", "offload"]
     assert manager.snapshot(Role.GENRM).models[0].state == LifecycleState.SLEEPING
     # The aborted request was forgotten; its late completion is harmless.
-    manager.complete_request("req-1")
+    manager.complete_request(permit)
     manager.lifecycle.switch([], [Role.TEACHER], timeout=0.01)
     assert pools["teacher"].onloaded
 
@@ -607,11 +874,11 @@ def test_manager_failed_force_abort_keeps_the_gpus_held() -> None:
 def test_manager_shutdown_waits_for_admitted_requests_before_stopping() -> None:
     pool = FakePool("judge")
     manager = _manager(genrm={"judge": pool})
-    manager.admit_request(Role.GENRM, "judge", "req-1")
+    permit = manager.admit_request(Role.GENRM, "judge", "req-1")
 
     stopper = _start(manager.shutdown, Role.GENRM, "judge")
     assert stopper.is_alive() and "shutdown" not in pool.calls
-    manager.complete_request("req-1")
+    manager.complete_request(permit)
     stopper.join(5.0)
     assert not stopper.is_alive() and pool.calls == ["shutdown"]
 

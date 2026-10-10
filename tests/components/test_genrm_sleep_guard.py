@@ -37,16 +37,17 @@ class _Manager:
         self.inflight: dict[str, str] = {}
         self.completed: list[str] = []
 
-        async def admit_request(role, model_id, request_id):
+        async def admit_request(role, model_id, trace_id):
             assert role == Role.GENRM
             if model_id not in ready:
                 raise RuntimeError(f"Model genrm/{model_id} is not ready for inference")
-            self.inflight[request_id] = model_id
-            return request_id
+            permit = f"permit-{trace_id}"
+            self.inflight[permit] = model_id
+            return permit
 
-        async def complete_request(request_id):
-            self.inflight.pop(request_id, None)
-            self.completed.append(request_id)
+        async def complete_request(permit):
+            self.inflight.pop(permit, None)
+            self.completed.append(permit)
 
         self.admit_request = SimpleNamespace(remote=admit_request)
         self.complete_request = SimpleNamespace(remote=complete_request)
@@ -110,7 +111,7 @@ async def test_genrm_generate_completes_admitted_request_with_its_rid() -> None:
     assert response.response == "1"
     ((url, payload),) = replica._http_client.posts
     assert url.endswith("/generate")
-    assert manager.completed == [payload["rid"]]
+    assert manager.completed == [f"permit-{payload['rid']}"]
     assert manager.inflight == {}
 
 
@@ -132,4 +133,41 @@ async def test_genrm_generate_aborts_engine_request_when_cancelled() -> None:
 
     (_, generate), (abort_url, abort) = replica._http_client.posts
     assert abort_url.endswith("/abort_request") and abort == {"rid": generate["rid"]}
-    assert manager.completed == [generate["rid"]] and manager.inflight == {}
+    assert manager.completed == [f"permit-{generate['rid']}"] and manager.inflight == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retried", [True, False])
+async def test_genrm_generate_aborts_a_request_whose_reply_was_lost(monkeypatch, retried: bool) -> None:
+    from unittest.mock import MagicMock
+
+    import httpx
+
+    monkeypatch.setenv("GENRM_ENGINE_RETRY_ATTEMPTS", "2" if retried else "1")
+    manager = _Manager(ready={"judge"})
+    hosts = iter([("judge", 0, "192.0.2.1", 16001), ("judge", 1, "192.0.2.2", 16002)])
+    calls = []
+
+    async def lose_first_reply(payload):
+        calls.append(payload["rid"])
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("reply lost")
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"text": " 1 "})
+
+    replica = _replica(manager, lose_first_reply)
+    replica._pick_engine = lambda route_key: next(hosts)
+    replica._engine_caches = {"judge": MagicMock()}
+
+    if retried:
+        assert (await replica.generate(_request("judge"))).response == "1"
+    else:
+        with pytest.raises(httpx.ReadTimeout):
+            await replica.generate(_request("judge"))
+
+    urls = [url for url, _ in replica._http_client.posts]
+    # The first engine may still run the request: it is aborted before the
+    # retry reaches the second engine, or before the caller gives up.
+    assert urls[:2] == ["http://192.0.2.1:16001/generate", "http://192.0.2.1:16001/abort_request"]
+    assert replica._http_client.posts[1][1] == {"rid": calls[0]}
+    assert urls[2:] == (["http://192.0.2.2:16002/generate"] if retried else [])
+    assert manager.inflight == {}

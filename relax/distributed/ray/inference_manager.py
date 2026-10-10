@@ -18,6 +18,14 @@ An engine pool is a :class:`~relax.distributed.ray.rollout.RolloutServer`: it
 exposes ``onload``/``offload``/``recover``/``health_check``/``shutdown`` and
 reports its state with ``observe``. The Manager serializes lifecycle calls per
 model and is the only writer of the published snapshots.
+
+Handing shared GPUs over takes two separate proofs. An empty request ledger
+proves that every caller has let go; it says nothing about the engines, which
+may still run a request whose HTTP connection is gone or whose abort was only
+acknowledged. ``offload`` supplies the second: it returns only once its
+engines have confirmed they are idle and released their memory, and raises
+otherwise. A model stays resident, and so keeps conflicting roles off its
+GPUs, until ``offload`` or ``shutdown`` has succeeded.
 """
 
 import asyncio
@@ -119,6 +127,24 @@ class _Model:
     generation: int = 0
 
 
+@dataclass(frozen=True)
+class _Permit:
+    """What one admission holds until its permit is returned.
+
+    The permit token, not the caller's trace ID, keys the ledger: callers may
+    reuse a trace ID for retries or across roles, and each admission must stay
+    held until its own completion.
+    """
+
+    role: Role
+    model_id: str
+    trace_id: str
+
+    @property
+    def model(self) -> tuple[Role, str]:
+        return self.role, self.model_id
+
+
 class InferenceManager:
     """Owner of every inference model of one task; see the module docstring."""
 
@@ -130,7 +156,8 @@ class InferenceManager:
         self._models: dict[Role, dict[str, _Model]] = {}
         self._specs: dict[Role, InferenceRoleSpec] = {}
         self._revision: dict[Role, int] = {}
-        self._inflight: dict[str, tuple[Role, str]] = {}
+        # In-flight admissions by permit token.
+        self._inflight: dict[str, _Permit] = {}
         self._rollout_pool: Any = None
         self._rollout_started = False
         # Roles registered only with the models a failed ``create_role`` could
@@ -310,21 +337,33 @@ class InferenceManager:
     # Request admission.
     # ------------------------------------------------------------------
 
-    def admit_request(self, role: Role | str, model_id: str, request_id: str | None = None) -> str:
-        """Record an in-flight request on a READY model, or refuse it."""
+    def admit_request(self, role: Role | str, model_id: str, trace_id: str | None = None) -> str:
+        """Record an in-flight request on a READY model and return its permit
+        token, or refuse it.
+
+        Every admission gets a new permit, even for a ``trace_id`` already in
+        flight; ``trace_id`` only labels it in logs. The caller returns the
+        permit to :meth:`complete_request`.
+        """
         role = Role(role)
         with self._lock:
             model = self._model(role, model_id).snapshot
             if not model.admission or model.state != LifecycleState.READY:
                 raise RuntimeError(f"Model {role.value}/{model_id} is not ready for inference")
-            request_id = request_id or uuid4().hex
-            self._inflight[request_id] = (role, model_id)
-            return request_id
+            permit = uuid4().hex
+            self._inflight[permit] = _Permit(role, model_id, trace_id or permit)
+            return permit
 
-    def complete_request(self, request_id: str) -> None:
-        """Forget a finished, failed or aborted request."""
+    def complete_request(self, permit: str) -> None:
+        """Return the permit of a finished, failed or aborted request.
+
+        This only records that the caller let go; the engine may still run the
+        request, which the release waits for. Idempotent: a permit already
+        returned or forgotten by an abort is ignored, so a late completion
+        never releases another admission.
+        """
         with self._requests_done:
-            if self._inflight.pop(request_id, None) is not None:
+            if self._inflight.pop(permit, None) is not None:
                 self._requests_done.notify_all()
 
     def drain(
@@ -342,9 +381,10 @@ class InferenceManager:
 
         Every release goes through here before its engines let go of memory, so
         a request admitted just before the release never reaches a sleeping
-        engine. Closing and waiting happen under the admission lock, which the
-        wait gives up so ``complete_request`` can run. A model that is already
-        closed keeps its state.
+        engine. Returning only proves the callers are done; the release that
+        follows confirms the engines are idle. Closing and waiting happen under
+        the admission lock, which the wait gives up so ``complete_request`` can
+        run. A model that is already closed keeps its state.
 
         Every ``timeout`` seconds that requests are still in flight, a warning
         is logged and the wait goes on. With ``force_abort`` the engines abort
@@ -361,27 +401,31 @@ class InferenceManager:
                     self._close(role, model_id, LifecycleState.DRAINING)
             started = time.monotonic()
             deadline = started + timeout
-            while pending := sorted(rid for rid, model in self._inflight.items() if model in draining):
+            while pending := sorted(
+                permit for permit, admission in self._inflight.items() if admission.model in draining
+            ):
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     self._requests_done.wait(remaining)
                     continue
                 names = sorted(f"{role.value}/{model_id}" for role, model_id in draining)
                 waited = time.monotonic() - started
+                requests = [f"trace={self._inflight[permit].trace_id} permit={permit}" for permit in pending]
                 if not force_abort:
                     logger.warning(
                         f"{len(pending)} inference requests of {names} still in flight after {waited:.0f}s; "
-                        f"waiting for them: {pending}"
+                        f"waiting for them: {requests}"
                     )
                     deadline = time.monotonic() + timeout
                     continue
-                logger.warning(f"Aborting {len(pending)} inference requests of {names} after {waited:.0f}s: {pending}")
+                logger.warning(
+                    f"Aborting {len(pending)} inference requests of {names} after {waited:.0f}s: {requests}"
+                )
                 self._abort_requests(draining, pending)
                 return
 
-    def _abort_requests(self, models: set[tuple[Role, str]], request_ids: Sequence[str]) -> None:
-        """Abort everything the resident ``models`` run and forget
-        ``request_ids``.
+    def _abort_requests(self, models: set[tuple[Role, str]], permits: Sequence[str]) -> None:
+        """Abort everything the resident ``models`` run and forget ``permits``.
 
         Runs under the admission lock, so no request is admitted meanwhile. A
         request still on its way to an engine is caught by the release itself,
@@ -391,8 +435,8 @@ class InferenceManager:
             entry = self._model(role, model_id)
             if entry.resident:
                 entry.pool.abort_requests()
-        for request_id in request_ids:
-            self._inflight.pop(request_id, None)
+        for permit in permits:
+            self._inflight.pop(permit, None)
         self._requests_done.notify_all()
 
     # ------------------------------------------------------------------
@@ -487,6 +531,8 @@ class InferenceManager:
                 self._observe(role, model_id)
 
     def _deactivate_model(self, role: Role, model_id: str, timeout: float = SWITCH_DRAIN_TIMEOUT_S) -> None:
+        """Drain one model and release it once its engines confirm they are
+        idle; an unconfirmed release leaves it DEAD and resident."""
         entry = self._model(role, model_id)
         with entry.lock:
             if not entry.resident:
