@@ -16,14 +16,19 @@ those turns:
 - the rollout release barrier tells training when generation has let go.
 
 It runs in the Manager's process, so the lease is a plain lock rather than a
-token passed between actors.
+token passed between actors. A thread takes it with ``lease``; the Manager's
+async actor takes it with ``acquire`` on an event loop, so a load waiting for
+its GPUs holds no thread, and hands it to the thread that runs the load with
+``owned``.
 """
 
+import asyncio
+import functools
+import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
-from threading import Condition, get_ident
-from typing import Protocol
+from typing import Any, Protocol
 
 from relax.engine.inference.config import InferenceRoleSpec
 from relax.engine.inference.phase_plans import PHASE_GENERATE
@@ -35,9 +40,75 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 # Generation has finished by the time a role is switched out, so nothing should
-# still be in flight; the bound turns a request that never completes into a
-# failed switch instead of a hung training step.
+# still be in flight. A load waiting longer than this for its GPUs fails; a
+# drain logs a warning every time this elapses, or aborts the requests when
+# asked to.
 SWITCH_DRAIN_TIMEOUT_S = 600.0
+
+# Awaits the drain of the roles (``roles, timeout``); the async ``Manager.drain``.
+_AsyncDrain = Callable[[Sequence[Role], float], Awaitable[None]]
+# Runs a blocking call on a thread, then the ``releases`` callbacks on that
+# thread once the call is done.
+_BlockingRun = Callable[..., Awaitable[Any]]
+
+
+class LoopAwareCondition:
+    """A condition that threads and event loops both wait on.
+
+    Threads use it like ``threading.Condition``. A coroutine awaits
+    :meth:`wait_for` instead, which holds no thread while it waits;
+    :meth:`notify_all`, from any thread, wakes both kinds of waiter.
+    """
+
+    def __init__(self, lock: Any = None) -> None:
+        self._cond = threading.Condition(lock)
+        self._waiters: set[tuple[asyncio.AbstractEventLoop, asyncio.Future]] = set()
+
+    def __enter__(self) -> bool:
+        return self._cond.__enter__()
+
+    def __exit__(self, *exc: Any) -> None:
+        self._cond.__exit__(*exc)
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._cond.wait(timeout)
+
+    def notify_all(self) -> None:
+        """Wake every waiter; call with the lock held."""
+        self._cond.notify_all()
+        for loop, future in self._waiters:
+            loop.call_soon_threadsafe(_wake, future)
+
+    async def wait_for(self, predicate: Callable[[], bool], deadline: float | None = None) -> bool:
+        """Wait until ``predicate``, checked under the lock, holds; False once
+        ``deadline`` (``time.monotonic``) passes first.
+
+        The check and whatever ``predicate`` claims when it holds happen under
+        the lock, so a waiter that returns True already owns what it waited
+        for.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            with self._cond:
+                if predicate():
+                    return True
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                waiter = (loop, loop.create_future())
+                self._waiters.add(waiter)
+            try:
+                await asyncio.wait_for(waiter[1], remaining)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                with self._cond:
+                    self._waiters.discard(waiter)
+
+
+def _wake(future: asyncio.Future) -> None:
+    if not future.done():
+        future.set_result(None)
 
 
 class LifecyclePort(Protocol):
@@ -51,7 +122,9 @@ class LifecyclePort(Protocol):
 
     def resident(self, role: Role) -> bool: ...
 
-    def drain(self, roles: Sequence[Role | str], timeout: float = SWITCH_DRAIN_TIMEOUT_S) -> None: ...
+    def drain(
+        self, roles: Sequence[Role | str], timeout: float = SWITCH_DRAIN_TIMEOUT_S, force_abort: bool = False
+    ) -> None: ...
 
     def activate(self, role: Role | str, model_id: str | None = None, tags: list[str] | None = None) -> None: ...
 
@@ -63,12 +136,14 @@ class LifecycleCoordinator:
 
     def __init__(self, manager: LifecyclePort) -> None:
         self._manager = manager
-        # Loads (switch, activate, recover) run one at a time, owned by the
-        # thread running them, and only once no conflicting role is resident.
-        # A separate lock from the Manager's, because a waiting load must not
+        # Loads (switch, activate, recover) run one at a time, under a lease
+        # token, and only once no conflicting role is resident. A thread owns
+        # the token it runs under, so a load nested in it runs directly. A
+        # separate lock from the Manager's, because a waiting load must not
         # block admission or request completion.
-        self._gpus_changed = Condition()
-        self._gpu_owner: int | None = None
+        self._gpus_changed = LoopAwareCondition()
+        self._gpu_owner: object | None = None
+        self._local = threading.local()
         # Scoring phases entered and not yet left. Their roles are waited for,
         # never taken over, by another phase; generation has no such block.
         self._held_phases: set[str] = set()
@@ -95,31 +170,102 @@ class LifecycleCoordinator:
         inside a held scoring phase are waited for. A load nested in the owning
         thread runs directly.
         """
-        if self._gpu_owner == get_ident():
+        if self._owns_lease():
             yield
             return
+        token = object()
         deadline = time.monotonic() + timeout
         with self._gpus_changed:
-            while True:
-                blockers = self._blockers(roles, released)
-                if release_conflicting:
-                    blockers = [role for role in blockers if self._phase(role) in self._held_phases]
-                if self._gpu_owner is None and not blockers:
-                    break
+            while not self._claim(token, roles, released, release_conflicting):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    holders = [role.value for role in blockers] or ["another load"]
-                    raise TimeoutError(
-                        f"GPUs for {[role.value for role in roles]} still held by {holders} after {timeout}s"
-                    )
+                    raise self._lease_timeout(roles, released, release_conflicting, timeout)
                 self._gpus_changed.wait(remaining)
-            self._gpu_owner = get_ident()
+        try:
+            with self.adopted(token):
+                yield
+        finally:
+            self.release(token)
+
+    async def acquire(
+        self,
+        roles: Sequence[Role],
+        *,
+        released: Sequence[Role] = (),
+        release_conflicting: bool = False,
+        timeout: float = SWITCH_DRAIN_TIMEOUT_S,
+    ) -> object:
+        """``lease`` for an event loop: wait without a thread and return the
+        lease token.
+
+        Run the load with :meth:`owned` and give the token back with
+        :meth:`release`.
+        """
+        token = object()
+        claimed = await self._gpus_changed.wait_for(
+            lambda: self._claim(token, roles, released, release_conflicting), time.monotonic() + timeout
+        )
+        if not claimed:
+            with self._gpus_changed:
+                raise self._lease_timeout(roles, released, release_conflicting, timeout)
+        return token
+
+    def release(self, token: object) -> None:
+        """Give the lease back; a token that no longer owns it is ignored."""
+        with self._gpus_changed:
+            if self._gpu_owner is token:
+                self._gpu_owner = None
+                self._gpus_changed.notify_all()
+
+    @contextmanager
+    def adopted(self, token: object) -> Iterator[None]:
+        """Run the calling thread under ``token``, so loads it nests run
+        directly."""
+        previous = getattr(self._local, "token", None)
+        self._local.token = token
         try:
             yield
         finally:
-            with self._gpus_changed:
-                self._gpu_owner = None
-                self._gpus_changed.notify_all()
+            self._local.token = previous
+
+    def owned(self, token: object, fn: Callable[..., Any]) -> Callable[..., Any]:
+        """``fn`` run under ``token`` on whichever thread calls it."""
+
+        @functools.wraps(fn)
+        def run(*args: Any, **kwargs: Any) -> Any:
+            with self.adopted(token):
+                return fn(*args, **kwargs)
+
+        return run
+
+    def _owns_lease(self) -> bool:
+        token = getattr(self._local, "token", None)
+        return token is not None and token is self._gpu_owner
+
+    def _claim(
+        self, token: object, roles: Sequence[Role], released: Sequence[Role], release_conflicting: bool
+    ) -> bool:
+        """Take the lease for ``token`` if it is free; call under the lock."""
+        if self._gpu_owner is None and not self._lease_blockers(roles, released, release_conflicting):
+            self._gpu_owner = token
+            return True
+        return False
+
+    def _lease_blockers(
+        self, roles: Sequence[Role], released: Sequence[Role], release_conflicting: bool
+    ) -> list[Role]:
+        blockers = self._blockers(roles, released)
+        if release_conflicting:
+            blockers = [role for role in blockers if self._phase(role) in self._held_phases]
+        return blockers
+
+    def _lease_timeout(
+        self, roles: Sequence[Role], released: Sequence[Role], release_conflicting: bool, timeout: float
+    ) -> TimeoutError:
+        holders = [role.value for role in self._lease_blockers(roles, released, release_conflicting)]
+        return TimeoutError(
+            f"GPUs for {[role.value for role in roles]} still held by {holders or ['another load']} after {timeout}s"
+        )
 
     def notify_released(self) -> None:
         """Wake loads waiting for GPUs after a role released its memory."""
@@ -141,6 +287,15 @@ class LifecycleCoordinator:
         waited for instead. A scoring phase is held until ``leave_phase``;
         generation is not.
         """
+        self._switch(*self._enter_plan(phase_id), timeout)
+
+    async def enter_phase_async(
+        self, phase_id: str, drain: _AsyncDrain, run: _BlockingRun, timeout: float = SWITCH_DRAIN_TIMEOUT_S
+    ) -> None:
+        """``enter_phase`` for an event loop; see ``_switch_async``."""
+        await self._switch_async(*self._enter_plan(phase_id), timeout, drain, run)
+
+    def _enter_plan(self, phase_id: str) -> tuple[Callable[[], list[Role]], list[Role], str, dict[str, Any]]:
         registered = self._manager.registered_roles()
         incoming = [
             role for role in self._roles_in_phase(phase_id) if any(self.conflict(role, other) for other in registered)
@@ -159,33 +314,41 @@ class LifecycleCoordinator:
                 and any(self.conflict(other, role) for role in incoming)
             ]
 
-        self._switch(
-            outgoing,
-            incoming,
-            timeout,
-            f"Entering phase {phase_id}",
-            release_conflicting=True,
-            hold=phase_id if phase_id != PHASE_GENERATE else None,
-        )
+        options = {"release_conflicting": True, "hold": phase_id if phase_id != PHASE_GENERATE else None}
+        return outgoing, incoming, f"Entering phase {phase_id}", options
 
     def leave_phase(self, phase_id: str, timeout: float = SWITCH_DRAIN_TIMEOUT_S) -> None:
         """Drain and release the resident roles placed in ``phase_id``.
 
         Does not restore generation: the next weight sync activates it anyway.
         """
+        try:
+            self._switch(*self._leave_plan(phase_id), timeout)
+        finally:
+            self._end_hold(phase_id)
 
+    async def leave_phase_async(
+        self, phase_id: str, drain: _AsyncDrain, run: _BlockingRun, timeout: float = SWITCH_DRAIN_TIMEOUT_S
+    ) -> None:
+        """``leave_phase`` for an event loop; see ``_switch_async``."""
+        try:
+            await self._switch_async(*self._leave_plan(phase_id), timeout, drain, run)
+        finally:
+            self._end_hold(phase_id)
+
+    def _leave_plan(self, phase_id: str) -> tuple[Callable[[], list[Role]], list[Role], str, dict[str, Any]]:
         def outgoing() -> list[Role]:
             # Read under the lease, so a role of the phase activated meanwhile
             # is released too.
             return [role for role in self._roles_in_phase(phase_id) if self._manager.resident(role)]
 
-        try:
-            self._switch(outgoing, [], timeout, f"Leaving phase {phase_id}")
-        finally:
-            # Even a failed release ends the block; the next phase retries it.
-            with self._gpus_changed:
-                self._held_phases.discard(phase_id)
-                self._gpus_changed.notify_all()
+        return outgoing, [], f"Leaving phase {phase_id}", {}
+
+    def _end_hold(self, phase_id: str) -> None:
+        # Even a failed release ends the block; the next phase retries it.
+        with self._gpus_changed:
+            self._held_phases.discard(phase_id)
+            self._gpus_changed.notify_all()
 
     def switch(
         self,
@@ -202,49 +365,100 @@ class LifecycleCoordinator:
         is resident. Every step is idempotent.
         """
         deactivate = [Role(role) for role in deactivate]
-        self._switch(lambda: deactivate, activate, timeout, "Switching", released=deactivate)
+        self._switch(lambda: deactivate, activate, "Switching", {"released": deactivate}, timeout)
 
     def _switch(
         self,
         outgoing: Callable[[], list[Role]],
         activate: Sequence[Role | str],
-        timeout: float,
         reason: str,
-        *,
-        released: Sequence[Role] = (),
-        release_conflicting: bool = False,
-        hold: str | None = None,
+        options: dict[str, Any],
+        timeout: float,
     ) -> None:
-        """``switch`` with the outgoing roles read once the lease is held;
-        ``hold`` marks that phase held before the lease is given up."""
+        """``switch`` with the outgoing roles read once the lease is held.
+
+        ``options`` holds the lease's ``released`` and ``release_conflicting``,
+        and ``hold``, the phase marked held before the lease is given up.
+        """
+        activate = self._incoming(activate)
+        hold = options.get("hold")
+        lease_options = {key: value for key, value in options.items() if key != "hold"}
+        with self.lease(activate, timeout=timeout, **lease_options):
+            deactivate = outgoing()
+            self._log_switch(reason, deactivate, activate)
+            self._manager.drain(deactivate, timeout)
+            self._hand_over(deactivate, activate, hold)
+
+    async def _switch_async(
+        self,
+        outgoing: Callable[[], list[Role]],
+        activate: Sequence[Role | str],
+        reason: str,
+        options: dict[str, Any],
+        timeout: float,
+        drain: _AsyncDrain,
+        run: _BlockingRun,
+    ) -> None:
+        """``_switch`` for an event loop: the lease and the drain are awaited,
+        and only the hand-over runs on a thread, through ``run``.
+
+        ``run`` gives the lease back once that thread is done; until the hand-
+        over is handed to it, this does. A switch cancelled while draining
+        leaves the outgoing roles closed.
+        """
+        activate = self._incoming(activate)
+        hold = options.get("hold")
+        lease_options = {key: value for key, value in options.items() if key != "hold"}
+        token = await self.acquire(activate, timeout=timeout, **lease_options)
+        try:
+            deactivate = outgoing()
+            self._log_switch(reason, deactivate, activate)
+            await drain(deactivate, timeout)
+        except BaseException:
+            self.release(token)
+            raise
+        await run(
+            self.owned(token, self._hand_over),
+            deactivate,
+            activate,
+            hold,
+            releases=(functools.partial(self.release, token),),
+        )
+
+    def _incoming(self, activate: Sequence[Role | str]) -> list[Role]:
         activate = [Role(role) for role in activate]
         clashing = [
             (a.value, b.value) for i, a in enumerate(activate) for b in activate[i + 1 :] if self.conflict(a, b)
         ]
         if clashing:
             raise ValueError(f"Roles that share GPUs cannot be active together: {clashing}")
-        with self.lease(activate, released=released, release_conflicting=release_conflicting, timeout=timeout):
-            deactivate = outgoing()
-            logger.info(
-                f"{reason}: release {[role.value for role in deactivate]}, activate {[role.value for role in activate]}"
-            )
-            self._manager.drain(deactivate, timeout)
-            for role in deactivate:
-                self._manager.deactivate(role)
-            try:
-                for role in activate:
-                    self._manager.activate(role)
-            except Exception:
-                # An incoming role that failed to load gives its GPUs back.
-                for role in activate:
-                    try:
-                        self._manager.deactivate(role)
-                    except Exception as exc:
-                        logger.warning(f"Failed to release {role.value} after a failed switch: {exc}")
-                raise
-            if hold is not None:
-                with self._gpus_changed:
-                    self._held_phases.add(hold)
+        return activate
+
+    @staticmethod
+    def _log_switch(reason: str, deactivate: Sequence[Role], activate: Sequence[Role]) -> None:
+        logger.info(
+            f"{reason}: release {[role.value for role in deactivate]}, activate {[role.value for role in activate]}"
+        )
+
+    def _hand_over(self, deactivate: Sequence[Role], activate: Sequence[Role], hold: str | None) -> None:
+        """Release the drained outgoing roles, then load the incoming ones; run
+        under the lease."""
+        for role in deactivate:
+            self._manager.deactivate(role)
+        try:
+            for role in activate:
+                self._manager.activate(role)
+        except Exception:
+            # An incoming role that failed to load gives its GPUs back.
+            for role in activate:
+                try:
+                    self._manager.deactivate(role)
+                except Exception as exc:
+                    logger.warning(f"Failed to release {role.value} after a failed switch: {exc}")
+            raise
+        if hold is not None:
+            with self._gpus_changed:
+                self._held_phases.add(hold)
 
     def current_phase(self, default: str) -> str:
         """The phase of the resident role that takes turns outside ``default``,

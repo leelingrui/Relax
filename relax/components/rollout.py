@@ -18,6 +18,7 @@ from ray import serve
 from relax.components.base import Base
 from relax.components.inference_gateway import GATEWAY_REQUEST_HEADER
 from relax.distributed.coordination import PeerStepBarrier
+from relax.distributed.ray.inference_manager import WEIGHT_UPDATE_FULLY_ASYNC
 from relax.distributed.ray.placement_group import create_rollout_worker
 from relax.engine.inference.types import Role
 from relax.utils.env import Envs
@@ -609,14 +610,16 @@ class Rollout(Base):
             self._weight_update_ready.clear()
             self.status = "paused"
             try:
-                prepared = await self.inference_manager.rollout_operation.remote("set_weight_updating", True)
+                prepared = await self.inference_manager.begin_weight_update.remote(
+                    Role.ROLLOUT, WEIGHT_UPDATE_FULLY_ASYNC
+                )
                 if prepared is False:
                     raise HTTPException(status_code=503, detail="Elastic scale-in is draining")
                 await self.inference_manager.rollout_operation.remote("health_monitoring_pause")
             except Exception:
                 rollback_succeeded = False
                 try:
-                    await self.inference_manager.rollout_operation.remote("set_weight_updating", False)
+                    await self.inference_manager.end_weight_update.remote(Role.ROLLOUT, WEIGHT_UPDATE_FULLY_ASYNC)
                     rollback_succeeded = True
                 except Exception as rollback_error:
                     self._logger.warning(
@@ -682,11 +685,9 @@ class Rollout(Base):
         await self._weight_update_ready.wait()
 
         self.status = "running"
-        await self.inference_manager.rollout_operation.remote("set_weight_updating", False)
-
-        # The update lease alone is not evidence of ready weights. Re-observe
-        # health, Router registration and engine-reported versions afterwards.
-        await self.inference_manager.rollout_operation.remote("refresh_inference_state")
+        # Ending the update is not evidence of ready weights: the manager
+        # re-observes health, Router registration and engine-reported versions.
+        await self.inference_manager.end_weight_update.remote(Role.ROLLOUT, WEIGHT_UPDATE_FULLY_ASYNC)
 
     @app.get("/recover_rollout_engines")
     async def recover_rollout_engines(self):

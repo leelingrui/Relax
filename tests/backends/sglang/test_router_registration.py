@@ -625,7 +625,10 @@ def test_inference_observation_skips_generation_probe_until_memory_is_resumed(mo
     engine = _make_engine(sglang_engine_module)
     engine.role = sglang_engine_module.Role.ROLLOUT
     engine.weight_source = sglang_engine_module.WeightSource.DCS
-    engine.flush_cache = MagicMock()
+    engine.pause_generation = MagicMock()
+    engine.continue_generation = MagicMock()
+    engine.unregister_from_router = MagicMock(return_value=True)
+    engine._drain_until_idle = MagicMock()
     engine._make_request = MagicMock()
     engine.health_generate = MagicMock(return_value=True)
     monkeypatch.setattr(

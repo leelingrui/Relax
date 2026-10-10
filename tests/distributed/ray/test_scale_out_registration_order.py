@@ -64,7 +64,7 @@ async def test_ray_native_finalizer_failure_rolls_back_precreated_group():
     manager._rollback_engines = AsyncMock()
 
     info_actor = MagicMock()
-    info_actor.get_ip_and_gpu_id.remote.return_value = AwaitableValue(("10.0.0.1", 0))
+    info_actor.get_ip_gpu_and_node_id.remote.return_value = AwaitableValue(("10.0.0.1", 0, "node-0"))
     info_actor_class = MagicMock()
     info_actor_class.options.return_value.remote.return_value = info_actor
 
@@ -100,7 +100,7 @@ async def test_ray_native_replica_uses_manager_owned_planned_slice():
     manager._rollback_engines = AsyncMock()
 
     info_actor = MagicMock()
-    info_actor.get_ip_and_gpu_id.remote.return_value = AwaitableValue(("10.0.0.1", 0))
+    info_actor.get_ip_gpu_and_node_id.remote.return_value = AwaitableValue(("10.0.0.1", 0, "node-0"))
     info_actor_class = MagicMock()
     info_actor_class.options.return_value.remote.return_value = info_actor
     created = {}
@@ -235,7 +235,7 @@ async def test_engine_init_timeout_propagates_as_provision_timeout():
     manager._rollback_engines = AsyncMock()
 
     info_actor = MagicMock()
-    info_actor.get_ip_and_gpu_id.remote.return_value = AwaitableValue(("10.0.0.1", 0))
+    info_actor.get_ip_gpu_and_node_id.remote.return_value = AwaitableValue(("10.0.0.1", 0, "node-0"))
     info_actor_class = MagicMock()
     info_actor_class.options.return_value.remote.return_value = info_actor
 
@@ -350,7 +350,7 @@ async def test_ray_native_failed_replica_releases_its_planned_slice(failure):
     manager._rollback_engines = AsyncMock()
 
     info_actor = MagicMock()
-    info_actor.get_ip_and_gpu_id.remote.return_value = AwaitableValue(("10.0.0.1", 0))
+    info_actor.get_ip_gpu_and_node_id.remote.return_value = AwaitableValue(("10.0.0.1", 0, "node-0"))
     info_actor_class = MagicMock()
     info_actor_class.options.return_value.remote.return_value = info_actor
     planned = []
@@ -424,7 +424,7 @@ async def _strand_one_replica(manager, pg):
     )
     manager._rollback_engines = AsyncMock(return_value=False)
     info_actor = MagicMock()
-    info_actor.get_ip_and_gpu_id.remote.return_value = AwaitableValue(("10.0.0.1", 0))
+    info_actor.get_ip_gpu_and_node_id.remote.return_value = AwaitableValue(("10.0.0.1", 0, "node-0"))
     info_actor_class = MagicMock()
     info_actor_class.options.return_value.remote.return_value = info_actor
     group = SimpleNamespace(engines=[make_mock_engine()], all_engines=[make_mock_engine()])
@@ -564,3 +564,45 @@ def test_stop_monitors_stops_the_stranded_replica_retry(monkeypatch):
     assert not thread.is_alive() and manager._stranded_retry_thread is None
     # The replica stays for the final retry at role shutdown.
     assert len(manager._stranded_replicas) == 1
+
+
+@pytest.mark.asyncio
+async def test_ray_native_replica_with_a_bad_binding_starts_no_engine():
+    """A replica whose TP2 slot lands on two nodes is refused at planning;
+    nothing is reserved and the caller still owns the placement group."""
+    manager = create_test_manager()
+    server = make_rollout_server()
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
+    manager._rollback_engines = AsyncMock()
+
+    info_actor = MagicMock()
+    info_actor.get_ip_gpu_and_node_id.remote.side_effect = [
+        AwaitableValue(("10.0.0.1", 0, "node-a")),
+        AwaitableValue(("192.0.2.2", 0, "node-b")),
+    ]
+    info_actor_class = MagicMock()
+    info_actor_class.options.return_value.remote.return_value = info_actor
+    engine_group = MagicMock()
+
+    with (
+        patch("relax.distributed.ray.rollout.EngineGroup", engine_group),
+        patch("relax.distributed.ray.rollout.ray.kill"),
+    ):
+        result = await manager._bring_up_single_replica(
+            request=request,
+            srv=server,
+            pg=object(),
+            replica_idx=0,
+            num_gpus=2,
+            gpus_per_engine=2,
+            engine_offset=1,
+            sort_key=lambda item: item,
+            InfoActor=info_actor_class,
+        )
+
+    assert result.success is False
+    assert "spans nodes" in result.reason.detail
+    engine_group.assert_not_called()
+    manager._rollback_engines.assert_not_awaited()
+    assert manager._planner.allocations() == ()
+    assert manager._stranded_replicas == []

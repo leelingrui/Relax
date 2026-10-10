@@ -9,6 +9,7 @@ from relax.core.node_group_affinity import (
     require_control_plane_resource_on_node,
     with_control_plane_affinity,
 )
+from relax.engine.inference.placement import PlacementBinding
 from relax.engine.sft.runtime import is_offline_mode
 from relax.utils.device import ray_get_device_ids
 from relax.utils.env import Envs
@@ -53,6 +54,11 @@ class InfoActor:
     def get_ip_and_gpu_id(self):
         return ray.util.get_node_ip_address(), ray_get_device_ids()[0]
 
+    def get_ip_gpu_and_node_id(self):
+        """Where this bundle landed: node IP (for ordering), GPU id, Ray node
+        id (for identity)."""
+        return ray.util.get_node_ip_address(), ray_get_device_ids()[0], ray.get_runtime_context().get_node_id()
+
 
 def sort_key(x):
     index, node_identifier, gpu_id = x
@@ -73,6 +79,25 @@ def sort_key(x):
             node_ip_parts = [ord(c) for c in node_identifier]
 
     return (node_ip_parts, int(gpu_id))
+
+
+def build_placement_binding(pg, probes, sort_key=sort_key) -> PlacementBinding:
+    """Order a placement group's bundles by node and GPU from per-bundle
+    probes.
+
+    ``probes[i]`` is ``InfoActor.get_ip_gpu_and_node_id()`` run on bundle
+    ``i``. The IP only decides the order; node identity is the Ray node id.
+    """
+    ordered = sorted(
+        ((index, ip, gpu_id) for index, (ip, gpu_id, _) in enumerate(probes)),
+        key=sort_key,
+    )
+    return PlacementBinding(
+        pg,
+        tuple(index for index, _, _ in ordered),
+        tuple(probes[index][1] for index, _, _ in ordered),
+        tuple(probes[index][2] for index, _, _ in ordered),
+    )
 
 
 def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):

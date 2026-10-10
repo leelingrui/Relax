@@ -11,6 +11,7 @@ import pytest
 from starlette.requests import Request
 
 from relax.components.inference_gateway import InferenceGateway
+from relax.engine.inference.executor import AdmittedRequest
 from relax.engine.inference.types import (
     LifecycleState,
     ModelSnapshot,
@@ -42,16 +43,19 @@ class _Owner:
 
     def __init__(self, provider) -> None:
         self.inflight: set[str] = set()
+        self.traces: list[str] = []
 
         async def snapshot(role):
             return provider()
 
-        async def admit_request(role, model_id, request_id):
-            self.inflight.add(request_id)
-            return request_id
+        async def admit_request(role, model_id, trace_id):
+            permit = f"permit-{len(self.traces)}"
+            self.traces.append(trace_id)
+            self.inflight.add(permit)
+            return permit
 
-        async def complete_request(request_id):
-            self.inflight.discard(request_id)
+        async def complete_request(permit):
+            self.inflight.discard(permit)
 
         self.snapshot = SimpleNamespace(remote=snapshot)
         self.admit_request = SimpleNamespace(remote=admit_request)
@@ -60,6 +64,11 @@ class _Owner:
 
 def _owner(provider):
     return _Owner(provider)
+
+
+async def _use_upstream(gateway: InferenceGateway, upstream) -> None:
+    await gateway._client.aclose()
+    gateway._executor.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
 
 
 def test_gateway_requires_the_task_owner_handle() -> None:
@@ -130,8 +139,7 @@ async def test_gateway_admission_race_returns_retryable_503_without_forwarding()
     def upstream(_request):
         pytest.fail("rejected requests must not reach the offloaded engine")
 
-    await gateway._client.aclose()
-    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    await _use_upstream(gateway, upstream)
     try:
         response = await gateway.proxy(_request({"model": "model-a", "input_ids": [1]}), "generate")
         assert response.status_code == 503
@@ -211,8 +219,7 @@ async def test_gateway_teacher_forwards_the_router_routing_key() -> None:
         sent.append(request.headers.get("x-smg-routing-key"))
         return httpx.Response(200, json={"meta_info": {}})
 
-    await gateway._client.aclose()
-    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    await _use_upstream(gateway, upstream)
     try:
         request = _request({"input_ids": [1], "model": "model-a"}, ((b"x-smg-routing-key", b"7"),))
         response = await gateway.proxy(request, "generate")
@@ -242,8 +249,7 @@ async def test_gateway_genrm_router_adapts_only_messages(native: bool) -> None:
         assert int(request.headers["content-length"]) == len(request.content)
         return httpx.Response(200, json={"text": " score \n", "meta_info": {"id": "result"}})
 
-    await gateway._client.aclose()
-    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    await _use_upstream(gateway, upstream)
     content = {"text": "judge"} if native else {"messages": [{"role": "user", "content": "judge"}]}
     payload = {**content, "model": "model-a", "route_key": "model-a", "sampling_params": {"temperature": 0.3}}
     try:
@@ -290,8 +296,7 @@ async def test_gateway_genrm_rejects_missing_router_without_backend_fallback() -
     def upstream(request):
         raise AssertionError("Gateway must not bypass the Router")
 
-    await gateway._client.aclose()
-    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    await _use_upstream(gateway, upstream)
     try:
         response = await gateway.proxy(_request({"messages": messages, "model": "model-a"}), "generate")
         assert response.status_code == 503
@@ -322,8 +327,7 @@ async def test_gateway_teacher_native_strips_routing_metadata() -> None:
         assert body == {"input_ids": [1, 2], "return_logprob": True}
         return httpx.Response(200, json={"text": "", "meta_info": {"input_token_logprobs": []}})
 
-    await gateway._client.aclose()
-    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    await _use_upstream(gateway, upstream)
     try:
         response = await gateway.proxy(
             _request({"model": "model-a", "route_key": "model-a", "input_ids": [1, 2], "return_logprob": True}),
@@ -379,8 +383,7 @@ async def test_gateway_completes_admitted_requests_and_aborts_failed_ones() -> N
         aborted.append(json.loads(request.content)["rid"])
         return httpx.Response(200, json={})
 
-    await gateway._client.aclose()
-    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    await _use_upstream(gateway, upstream)
     try:
         response = await gateway.proxy(_request({"model": "model-a", "input_ids": [1]}), "generate")
         assert response.status_code == 502
@@ -434,7 +437,7 @@ async def test_gateway_stream_disconnect_completes_admission(disconnect: str) ->
 
     owner.complete_request.remote = complete
     gateway = InferenceGateway(Role.ROLLOUT, manager_handle=owner)
-    gateway._abort_upstream = AsyncMock()
+    gateway._executor.abort = AsyncMock()
 
     class Stream(httpx.AsyncByteStream):
         async def __aiter__(self):
@@ -445,7 +448,8 @@ async def test_gateway_stream_disconnect_completes_admission(disconnect: str) ->
             await asyncio.sleep(0)
 
     upstream = httpx.Response(200, stream=Stream())
-    response = gateway._stream_response(upstream, "engine-rid", "disconnected", "http://router")
+    admitted = AdmittedRequest("model-a", "http://router", True, "disconnected", "engine-rid", dispatched=True)
+    response = gateway._stream_response(upstream, admitted)
 
     async def send(message):
         if disconnect == "send_failure":
@@ -469,7 +473,7 @@ async def test_gateway_stream_disconnect_completes_admission(disconnect: str) ->
             await response({"type": "http", "asgi": {"spec_version": "2.0"}}, receive, send)
         await asyncio.wait_for(finished.wait(), timeout=1)
         assert owner.inflight == set()
-        gateway._abort_upstream.assert_awaited_once_with("http://router", "engine-rid")
+        gateway._executor.abort.assert_awaited_once_with(admitted)
         assert upstream.is_closed
     finally:
         await gateway.close()
@@ -480,15 +484,14 @@ async def test_gateway_stream_disconnect_completes_admission(disconnect: str) ->
 async def test_gateway_chat_abort_uses_forwarded_request_id(rid: str | None) -> None:
     owner = _owner(_snapshot)
     gateway = InferenceGateway(Role.ROLLOUT, manager_handle=owner)
-    gateway._abort_upstream = AsyncMock()
+    gateway._executor.abort = AsyncMock()
     forwarded = []
 
     def upstream(request):
         forwarded.append(json.loads(request.content)["rid"])
         raise httpx.ReadTimeout("lost", request=request)
 
-    await gateway._client.aclose()
-    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    await _use_upstream(gateway, upstream)
     try:
         response = await gateway.proxy(
             _request({"model": "model-a", "messages": [], "rid": rid}), "v1/chat/completions"
@@ -497,7 +500,8 @@ async def test_gateway_chat_abort_uses_forwarded_request_id(rid: str | None) -> 
         assert forwarded[0]
         if rid:
             assert forwarded == [rid]
-        gateway._abort_upstream.assert_awaited_once_with("http://router", forwarded[0])
+        ((aborted,), _) = gateway._executor.abort.await_args
+        assert (aborted.target, aborted.rid) == ("http://router", forwarded[0])
         assert not owner.inflight
     finally:
         await gateway.close()

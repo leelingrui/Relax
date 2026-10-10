@@ -475,8 +475,8 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
     instance._teacher_manager = None
 
     # Hand-assembled Controller: keep the fields training_loop reads in step.
-    async def publish_rollout(method):
-        assert method == "complete_inference_weight_update"
+    async def publish_rollout(role, source):
+        assert (role, source) == (controller.Role.ROLLOUT, controller.WEIGHT_UPDATE_BACKEND)
         events.append("publish_rollout")
 
     async def snapshot(_role):
@@ -486,7 +486,7 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
         )
 
     instance._inference_manager_handle = SimpleNamespace(
-        rollout_operation=SimpleNamespace(remote=publish_rollout), snapshot=SimpleNamespace(remote=snapshot)
+        end_weight_update=SimpleNamespace(remote=publish_rollout), snapshot=SimpleNamespace(remote=snapshot)
     )
     instance._pending_task_refs = []
     instance._pending_task_refs_lock = threading.Lock()

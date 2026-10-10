@@ -30,7 +30,8 @@ from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
-from relax.distributed.ray.inference_manager import create_inference_manager
+from relax.distributed.ray.inference_manager import WEIGHT_UPDATE_BACKEND, create_inference_manager
+from relax.engine.inference.placement import PlacementBinding
 from relax.engine.inference.types import LifecycleState, Role
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
@@ -610,7 +611,8 @@ class Controller:
             if pgs is None:
                 role_nodes[role] = set()
                 continue
-            pg, bundle_indices, _gpu_ids = pgs
+            binding = PlacementBinding.coerce(pgs)
+            pg, bundle_indices = binding.pg, binding.bundle_indices
             if id(pg) not in seen_pgs:
                 refs = [
                     probe.options(
@@ -925,8 +927,8 @@ class Controller:
                     update_refs = await asyncio.gather(*handles)
                     await asyncio.gather(*(ref for ref in update_refs if ref is not None))
                     if ROLES.rollout in self.serve_dict:
-                        await self._inference_manager_handle.rollout_operation.remote(
-                            "complete_inference_weight_update"
+                        await self._inference_manager_handle.end_weight_update.remote(
+                            Role.ROLLOUT, WEIGHT_UPDATE_BACKEND
                         )
                         snapshot = await self._inference_manager_handle.snapshot.remote(Role.ROLLOUT)
                         unready = [

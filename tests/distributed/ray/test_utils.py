@@ -64,8 +64,19 @@ def _capture_engine_runtime_env(monkeypatch, args, sglang_overrides):
         lambda **kwargs: ({0: {}}, {}),
     )
 
+    from relax.engine.inference.placement import (
+        PlacementGroupView,
+        PlacementOwner,
+        PlacementPlanner,
+        PlacementRequest,
+    )
+
     group = make_engine_group(args=args, engines=[None], num_gpus_per_engine=1)
     group.pg = (object(), [0], [0])
+    (group.placement,) = PlacementPlanner().plan(
+        (PlacementRequest("rollout/group-0", "regular", 1, 1, 1),),
+        PlacementGroupView((0,), (0,), PlacementOwner.CONTROLLER, identity=group.pg[0]),
+    )
     group.sglang_overrides = sglang_overrides
     group.start_engines()
     return captured["runtime_env"]["env_vars"]

@@ -957,12 +957,11 @@ class TestScaleInStatusQueries:
 
 @pytest.mark.asyncio
 async def test_scale_in_stops_an_engine_added_by_scale_out():
-    """The topology callback of a scaled-out group reports to the manager."""
+    """The topology events of a scaled-out group reach the manager."""
     from relax.engine.inference.types import LifecycleState, Role
 
     server = make_rollout_server(engine_groups=[make_engine_group(engines=[make_mock_engine()])])
     manager = create_test_manager(servers={"default": server})
-    manager.refresh_inference_state = MagicMock()
     manager._health_check_engines = AsyncMock(return_value=True)
     manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
     engine = make_mock_engine()
@@ -978,7 +977,9 @@ async def test_scale_in_stops_an_engine_added_by_scale_out():
     stopped = await manager._shutdown_engine_actors(group, "group_2_engine_0", [(0, engine)], shutdown_timeout=1)
 
     assert stopped and group.all_engines[0] is None
-    assert manager.inference_manager.snapshot(Role.ROLLOUT).models[0].state == LifecycleState.STARTING
+    # The change closed admission; the settled report only queues an observation.
+    assert manager.owner.snapshot(Role.ROLLOUT).models[0].state == LifecycleState.STARTING
+    assert manager.owner._stale == {(Role.ROLLOUT, "default")}
 
 
 @pytest.mark.asyncio
@@ -1013,7 +1014,6 @@ async def test_scale_in_treats_a_dead_engine_as_stopped(patch_ray_get):
     engine.shutdown.remote.side_effect = ray.exceptions.RayActorError()
     group = make_engine_group(engines=[engine], is_scaled_out=True)
     manager = create_test_manager()
-    manager.refresh_inference_state = MagicMock()
 
     with patch("relax.distributed.ray.rollout.ray.kill") as kill:
         stopped = await manager._shutdown_engine_actors(group, "group_0_engine_0", [(0, engine)], shutdown_timeout=1)

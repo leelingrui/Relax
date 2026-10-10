@@ -55,14 +55,22 @@ logger = get_logger(__name__)
 _ROUTER_JOIN_TIMEOUT_S = 30.0
 
 
-# GenRM colocate offload drain: bound every HTTP round-trip and the whole drain
+# Offload drain: bound every HTTP round-trip, the whole drain and the release
 # by a wall-clock deadline so a wedged SGLang scheduler surfaces as a
 # TimeoutError instead of blocking rank-0 in ray.get() (and every other rank at
 # the downstream offload barrier) indefinitely.
-_GENRM_OFFLOAD_DRAIN_TIMEOUT_S = 120.0
-_GENRM_OFFLOAD_RELEASE_TIMEOUT_S = 120.0
+_OFFLOAD_DRAIN_TIMEOUT_S = 120.0
+_OFFLOAD_RELEASE_TIMEOUT_S = 120.0
 _SGLANG_HTTP_ATTEMPT_TIMEOUT_S = 30.0
 _MIN_HTTP_TIMEOUT_S = 1.0
+
+
+class EngineMemoryStateUnknown(RuntimeError):
+    """A memory release or resume was sent to the engine but not confirmed.
+
+    SGLang's release and resume are not idempotent, so neither may be retried:
+    the memory may be held or gone. Only stopping the engine frees it.
+    """
 
 
 def _preferred_s3_stream_load_format() -> str:
@@ -377,6 +385,10 @@ class SGLangEngine(RayActor):
         # Memory types released and not yet resumed. A generation probe while
         # any of them is missing (e.g. weights back, KV cache not) crashes SGLang.
         self._released_memory: set[str] = set()
+        # A release or resume was sent without a confirmed reply.
+        self._memory_state_unknown = False
+        # A release paused generation; the full resume reopens it.
+        self._generation_paused = False
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -454,6 +466,9 @@ class SGLangEngine(RayActor):
             num_gpus_per_engine=self.num_gpus_per_engine,
         )
         self.node_rank = server_args_dict["node_rank"]
+        # The device SGLang was launched on, in this process's numbering;
+        # ``get_device_identity`` reports what it names.
+        self._launched_base_gpu_id = server_args_dict.get("base_gpu_id")
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
 
@@ -466,6 +481,7 @@ class SGLangEngine(RayActor):
         if self.args.rollout_external or init_external_kwargs:
             if not init_external_kwargs:
                 init_external_kwargs = {"external_engine_need_check_fields": external_engine_need_check_fields}
+            self._launched_base_gpu_id = None
             self._init_external(server_args_dict, **init_external_kwargs)
         else:
             if self.weight_source == WeightSource.DCS:
@@ -878,6 +894,24 @@ class SGLangEngine(RayActor):
             return None
         return f"http://{self.server_host}:{self.server_port}"
 
+    def get_device_identity(self) -> dict:
+        """Return this engine's Ray node id and its workers' devices on it.
+
+        ``devices`` lists, in worker order, the device identity of
+        ``base_gpu_id + k`` exactly as SGLang was launched (``gpu_id_step=1``),
+        resolved in this process. It is ``None`` for an external engine, whose
+        devices this actor does not control.
+        """
+        from relax.utils.colocate_alignment import local_device_identity
+
+        node_id = ray.get_runtime_context().get_node_id()
+        base = getattr(self, "_launched_base_gpu_id", None)
+        if base is None:
+            return {"node_id": node_id, "devices": None}
+        num_gpus = self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine
+        local_gpus = min(num_gpus, self.args.num_gpus_per_node)
+        return {"node_id": node_id, "devices": [local_device_identity(base + k) for k in range(local_gpus)]}
+
     def get_pid_and_node_id(self) -> dict:
         """Return the PID and Ray node ID of this engine.
 
@@ -966,6 +1000,10 @@ class SGLangEngine(RayActor):
             return False
 
     def _router_lists_worker(self, worker_url: str, timeout: float = 5.0) -> bool:
+        if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
+            response = requests.get(f"http://{self.router_ip}:{self.router_port}/list_workers", timeout=timeout)
+            response.raise_for_status()
+            return any(router_worker_base_url(url) == worker_url for url in response.json().get("urls", []))
         response = requests.get(f"http://{self.router_ip}:{self.router_port}/workers", timeout=timeout)
         response.raise_for_status()
         workers = response.json().get("workers", [])
@@ -1098,7 +1136,12 @@ class SGLangEngine(RayActor):
         A partially resumed engine is reported unhealthy without a generation
         probe; it is checked once all its memory is back.
         """
-        healthy = not getattr(self, "_released_memory", None) and self.health_generate(timeout=5.0)
+        healthy = (
+            not getattr(self, "_released_memory", None)
+            and not getattr(self, "_memory_state_unknown", False)
+            and not getattr(self, "_generation_paused", False)
+            and self.health_generate(timeout=5.0)
+        )
         version = None
         if healthy and self.node_rank == 0 and self.weight_source == WeightSource.DCS:
             response = requests.get(f"http://{self.server_host}:{self.server_port}/model_info", timeout=5.0)
@@ -1120,40 +1163,109 @@ class SGLangEngine(RayActor):
         }
 
     def release_memory_occupation(self):
-        # Marked before the request: a release that fails half-way leaves the
-        # memory state unknown, so the engine must not be probed either.
+        """Drain the engine, then release all of its GPU memory.
+
+        Every role drains the same way. Generation is paused and the engine
+        leaves its Router first, so no new request reaches the scheduler; the
+        requests still running are aborted until ``/flush_cache`` reports it
+        idle; only then is the memory released, and the release must be
+        confirmed. A step that cannot be confirmed raises before the release
+        and leaves the memory held. Releasing an engine already released does
+        nothing; one whose release or resume was not confirmed raises
+        :class:`EngineMemoryStateUnknown`.
+        """
         from sglang.srt.constants import GPU_MEMORY_ALL_TYPES
 
+        self._check_memory_state()
+        tags = sorted(set(GPU_MEMORY_ALL_TYPES) - getattr(self, "_released_memory", set()))
+        if not tags:
+            return None
+        if self.node_rank == 0:
+            deadline = time.monotonic() + _OFFLOAD_DRAIN_TIMEOUT_S
+            # Not best-effort: without it a request reaching the scheduler
+            # between the last flush and the release crashes the scheduler.
+            self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
+            self._generation_paused = True
+            self._leave_router()
+            self._drain_until_idle(deadline)
+        # Marked before the request: a release that fails half-way leaves the
+        # memory state unknown, so the engine must not be probed either.
         self._released_memory = set(GPU_MEMORY_ALL_TYPES)
-        if self.role in (Role.GENRM, Role.TEACHER):
-            if self.node_rank == 0:
-                deadline = time.monotonic() + _GENRM_OFFLOAD_DRAIN_TIMEOUT_S
-                self._pause_generation_for_offload(deadline)
-            if self.node_rank == 0 and not self.unregister_from_router(wait_for_removal=True):
-                raise RuntimeError(f"Cannot offload {self.role.value} while its Router worker is still registered")
-            return self._release_genrm_memory_occupation()
-        self.flush_cache()
-        return self._make_request("release_memory_occupation")
+        return self._confirmed_memory_request(
+            "release_memory_occupation", {"tags": tags}, timeout=_OFFLOAD_RELEASE_TIMEOUT_S
+        )
 
     def resume_memory_occupation(self, tags: list[str] = None):
-        """Available tags for multi-stage resume: weights, kv_cache."""
-        result = self._make_request(
-            "resume_memory_occupation",
-            {"tags": tags},
-        )
-        self._released_memory = set() if tags is None else getattr(self, "_released_memory", set()) - set(tags)
-        # Re-open admission that the GenRM/teacher release closed via
-        # /pause_generation. Only after a full resume (weights + KV cache back):
-        # Static models normally full-resume, but the ``not tags`` guard prevents
-        # re-enabling generation before KV cache exists if a partial
-        # (weights-only) resume is ever introduced. Not swallowed — if the
-        # engine stays paused, the model silently stops serving, so fail loudly.
-        if self.role in (Role.GENRM, Role.TEACHER) and self.node_rank == 0 and not tags:
+        """Resume released memory; available tags for multi-stage resume:
+        weights, kv_cache.
+
+        Only memory still released is resumed, so resuming memory that is
+        already back does nothing. Once all of it is back, the generation a
+        release paused reopens. A GenRM or Teacher engine then rejoins its
+        Router; a policy engine rejoins on the observation after its weight
+        sync.
+        """
+        from sglang.srt.constants import GPU_MEMORY_ALL_TYPES
+
+        self._check_memory_state()
+        released = getattr(self, "_released_memory", set())
+        pending = released & (set(GPU_MEMORY_ALL_TYPES) if tags is None else set(tags))
+        result = None
+        if pending:
+            result = self._confirmed_memory_request("resume_memory_occupation", {"tags": sorted(pending)})
+        self._released_memory = released - pending
+        if self._released_memory or self.node_rank != 0:
+            return result
+        # Generating before the KV cache is back crashes SGLang, so generation
+        # reopens only once nothing is released. Not swallowed — if the engine
+        # stays paused, the model silently stops serving, so fail loudly.
+        if self.role in (Role.GENRM, Role.TEACHER):
             self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+            self._generation_paused = False
             if not self.register_to_router():
                 self.pause_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+                self._generation_paused = True
                 raise RuntimeError(f"Cannot register resumed {self.role.value} engine with its Router")
+        elif getattr(self, "_generation_paused", False):
+            self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+            self._generation_paused = False
         return result
+
+    def _check_memory_state(self) -> None:
+        if getattr(self, "_memory_state_unknown", False):
+            raise EngineMemoryStateUnknown(
+                f"{self.role.value} engine {self.server_host}:{self.server_port} has unconfirmed memory state; "
+                "it must be restarted"
+            )
+
+    def _confirmed_memory_request(self, endpoint: str, payload: dict, timeout: float | None = None):
+        """Send a release or resume; without a confirmed reply the memory state
+        is unknown."""
+        self._memory_state_unknown = True
+        try:
+            result = self._make_request(endpoint, payload, timeout=timeout)
+        except Exception as exc:
+            raise EngineMemoryStateUnknown(
+                f"{endpoint} on {self.role.value} engine {self.server_host}:{self.server_port} was not confirmed: {exc}"
+            ) from exc
+        self._memory_state_unknown = False
+        return result
+
+    def _leave_router(self) -> None:
+        """Take the engine out of its Router before a release.
+
+        An engine the Router does not list, such as a policy engine before its
+        first weight sync, has nothing to leave.
+        """
+        if self.unregister_from_router(wait_for_removal=True):
+            return
+        worker_url = f"http://{self.server_host}:{self.server_port}"
+        try:
+            listed = self._router_lists_worker(worker_url)
+        except Exception as exc:
+            raise RuntimeError(f"Cannot offload {self.role.value}: its Router membership is unknown: {exc}") from exc
+        if listed:
+            raise RuntimeError(f"Cannot offload {self.role.value} while its Router worker is still registered")
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
@@ -1541,76 +1653,49 @@ class SGLangEngine(RayActor):
             logger.info(f"Unregistering checkpoint engine client for engine {self.server_host}:{self.server_port}...")
             run(self.checkpoint_engine_client.unregister())
 
-    def _release_genrm_memory_occupation(self):
-        # Static inference models can be offloaded while their raw SGLang ports
-        # remain reachable. Two failure modes are defended against here:
-        #
-        # 1. Admission race. SGLang's release_memory_occupation asserts the
-        #    scheduler is idle (``_is_no_request``); a straggler agentic
-        #    /generate admitted between our flush and the release crashes the
-        #    scheduler. Even after Manager admission closes, raw ports can
-        #    receive requests, so /pause_generation
-        #    (mode="abort", the default) is issued first: it stops the scheduler
-        #    from admitting new requests for the whole offloaded window AND
-        #    aborts everything in flight. Admission is re-opened by
-        #    continue_generation in resume_memory_occupation, after weights + KV
-        #    cache are back. We still abort on each retry as a fallback in case
-        #    the pause did not take (best-effort). The lifecycle manager has
-        #    already drained admitted requests before offloading.
-        #
-        # 2. Unbounded hang. Every HTTP call must have a timeout and the whole
-        #    drain must be bounded by a wall-clock deadline. Otherwise a wedged
-        #    scheduler blocks rank-0 in ray.get() forever and every other rank
-        #    stalls at the downstream offload barrier — a silent training hang.
-        if self.node_rank == 0:
-            deadline = time.monotonic() + _GENRM_OFFLOAD_DRAIN_TIMEOUT_S
-            self._pause_generation_for_offload(deadline)
-            connect_errors = 0
-            while True:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"Timeout while draining {self.role.value} before release.")
-                self.abort_requests(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
-                try:
-                    resp = requests.get(
-                        f"http://{self.server_host}:{self.server_port}/flush_cache",
-                        timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()),
-                    )
-                    if resp.status_code == 200:
-                        break
-                    connect_errors = 0
-                except requests.exceptions.ConnectionError as e:
-                    # requests wraps urllib3's NewConnectionError, so catching the
-                    # latter here would never fire and a dead engine would be
-                    # retried until the drain deadline.
-                    connect_errors += 1
-                    logger.warning(
-                        f"Cannot reach {self.server_host}:{self.server_port}/flush_cache while "
-                        f"draining {self.role.value} ({connect_errors}/{_MAX_CONSECUTIVE_CONNECT_ERRORS}): {e}"
-                    )
-                    if connect_errors >= _MAX_CONSECUTIVE_CONNECT_ERRORS:
-                        raise ConnectionError(
-                            f"{self.role.value} engine {self.server_host}:{self.server_port} unreachable while "
-                            f"draining before release ({connect_errors} consecutive connection "
-                            f"errors) — the server process is most likely dead."
-                        ) from e
-                except Exception as e:  # noqa: BLE001
-                    connect_errors = 0
-                    logger.info(f"Error flushing {self.role.value} cache: {e}")
-                time.sleep(1)
-        return self._make_request("release_memory_occupation", timeout=_GENRM_OFFLOAD_RELEASE_TIMEOUT_S)
+    def _drain_until_idle(self, deadline: float) -> None:
+        """Abort what the scheduler still runs until ``/flush_cache`` reports
+        it idle; generation is already paused.
 
-    def _pause_generation_for_offload(self, deadline: float) -> None:
-        """Best-effort /pause_generation (abort mode) before draining for
-        offload.
-
-        Never raises: if the pause does not take, the per-retry abort in
-        release_memory_occupation still drains the engine — the pause only
-        additionally closes the flush->release admission window.
+        SGLang's release_memory_occupation asserts the scheduler is idle
+        (``_is_no_request``), and an abort ACK does not prove a request left
+        the running batch, so only a successful flush confirms the drain. The
+        whole drain is bounded by ``deadline``: a wedged scheduler raises
+        instead of blocking rank-0 in ray.get() forever while every other rank
+        stalls at the downstream offload barrier.
         """
-        try:
-            self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"{self.role.value} pause_generation before offload failed (continuing to drain): {e}")
+        connect_errors = 0
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timeout while draining {self.role.value} before release.")
+            self.abort_requests(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
+            try:
+                resp = requests.get(
+                    f"http://{self.server_host}:{self.server_port}/flush_cache",
+                    timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()),
+                )
+                if resp.status_code == 200:
+                    return
+                connect_errors = 0
+            except requests.exceptions.ConnectionError as e:
+                # requests wraps urllib3's NewConnectionError, so catching the
+                # latter here would never fire and a dead engine would be
+                # retried until the drain deadline.
+                connect_errors += 1
+                logger.warning(
+                    f"Cannot reach {self.server_host}:{self.server_port}/flush_cache while "
+                    f"draining {self.role.value} ({connect_errors}/{_MAX_CONSECUTIVE_CONNECT_ERRORS}): {e}"
+                )
+                if connect_errors >= _MAX_CONSECUTIVE_CONNECT_ERRORS:
+                    raise ConnectionError(
+                        f"{self.role.value} engine {self.server_host}:{self.server_port} unreachable while "
+                        f"draining before release ({connect_errors} consecutive connection "
+                        f"errors) — the server process is most likely dead."
+                    ) from e
+            except Exception as e:  # noqa: BLE001
+                connect_errors = 0
+                logger.info(f"Error flushing {self.role.value} cache: {e}")
+            time.sleep(1)
 
 
 def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:

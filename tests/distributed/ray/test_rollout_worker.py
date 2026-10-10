@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 from relax.distributed.coordination import RolloutOffloadBarrier
 from relax.distributed.ray import rollout_worker
 from relax.distributed.ray.inference_manager import InferenceManager
+from relax.engine.inference.config import InferenceModelSpec
 from relax.engine.inference.types import Role
 
 
@@ -56,14 +57,23 @@ def test_rollout_worker_binds_workload_and_local_scoring_to_same_owner(monkeypat
 
 def test_inference_manager_preserves_recovery_guard_before_first_generation():
     manager = InferenceManager()
-    pool = SimpleNamespace(recover_rollout_engines=Mock(), health_monitoring_resume=Mock())
+    model = SimpleNamespace(model_spec=InferenceModelSpec("policy", "/tmp/policy"))
+    manager.register(Role.ROLLOUT, {"policy": model}, observe=False)
+    pool = SimpleNamespace(
+        get_rollout_engines_and_lock=Mock(return_value="engines"),
+        health_monitoring_pause=Mock(),
+        health_monitoring_resume=Mock(),
+    )
     manager._rollout_pool = pool
-    manager.rollout_operation("recover_rollout_engines")
-    pool.recover_rollout_engines.assert_called_once_with(rollout_started=False)
+    manager.recover = Mock()
+    assert manager.rollout_operation("recover_rollout_engines") == "engines"
+    manager.recover.assert_not_called()
+    pool.health_monitoring_pause.assert_called_once_with()
     manager.begin_rollout()
     pool.health_monitoring_resume.assert_called_once_with()
     manager.rollout_operation("recover_rollout_engines", "policy")
-    pool.recover_rollout_engines.assert_called_with("policy", rollout_started=True)
+    manager.recover.assert_called_once_with(Role.ROLLOUT, "policy")
+    pool.get_rollout_engines_and_lock.assert_called_with("policy")
 
 
 def test_rollout_offload_barrier_polls_inference_owner(monkeypatch):

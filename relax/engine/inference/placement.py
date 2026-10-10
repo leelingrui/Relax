@@ -16,12 +16,16 @@ placement group.
 
 Allocations in the same phase may never share GPUs; different phases may
 reuse one slice because the Manager runs them one at a time.
+
+A view built from a probed :class:`PlacementBinding` also carries where every
+bundle physically landed, and planning then checks the resolved slots against
+that binding instead of trusting node boundaries inferred from offsets.
 """
 
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import Lock
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 
 class PlacementOwner(str, Enum):
@@ -62,14 +66,55 @@ def placement_group_key(placement_group: object) -> str:
     return f"local:{id(placement_group):x}"
 
 
+class PlacementBinding(NamedTuple):
+    """A ready placement group and where each of its reordered bundles landed.
+
+    Entry ``i`` of ``bundle_indices``, ``gpu_ids`` and ``node_ids`` describes
+    logical slot ``i``. ``node_ids`` holds Ray node ids, which -- unlike node
+    IPs or hostnames -- name one machine exactly once; it is ``None`` only for
+    a binding that was never probed (a legacy 3-tuple).
+    """
+
+    pg: Any
+    bundle_indices: tuple[int, ...]
+    gpu_ids: tuple[int, ...]
+    node_ids: tuple[str, ...] | None = None
+
+    @classmethod
+    def coerce(cls, value: Any) -> "PlacementBinding":
+        """Accept a binding or a legacy ``(pg, bundle_indices, gpu_ids)``."""
+        if isinstance(value, cls):
+            return value
+        pg, bundle_indices, gpu_ids = value
+        return cls(pg, tuple(bundle_indices), tuple(gpu_ids), None)
+
+
 @dataclass(frozen=True)
 class PlacementGroupView:
-    """A reordered, node-grouped view of one placement group's bundles."""
+    """A reordered, node-grouped view of one placement group's bundles.
+
+    ``node_ids`` and ``bundle_count`` are known only for a probed placement
+    group; without them planning can check the logical layout alone.
+    """
 
     bundle_indices: tuple[int, ...]
     gpu_ids: tuple[int, ...]
     owner: PlacementOwner
     identity: object = field(default_factory=object, repr=False, compare=False)
+    node_ids: tuple[str, ...] | None = None
+    bundle_count: int | None = None
+
+    @classmethod
+    def from_binding(cls, binding: PlacementBinding, owner: PlacementOwner) -> "PlacementGroupView":
+        bundle_count = getattr(binding.pg, "bundle_count", None)
+        return cls(
+            tuple(binding.bundle_indices),
+            tuple(binding.gpu_ids),
+            owner,
+            identity=binding.pg,
+            node_ids=None if binding.node_ids is None else tuple(binding.node_ids),
+            bundle_count=bundle_count if isinstance(bundle_count, int) else None,
+        )
 
     @property
     def key(self) -> str:
@@ -235,6 +280,8 @@ class PlacementPlanner:
             else ()
         )
         self._validate_node_boundaries(request, referenced, slot_size)
+        if placement_group.node_ids is not None:
+            self._validate_binding(request, placement_group, referenced, slot_size)
         for other_request, other in recorded.values():
             if other.phase != request.phase:
                 continue
@@ -262,11 +309,69 @@ class PlacementPlanner:
     # ------------------------------------------------------------------
     @staticmethod
     def _validate_view(placement_group: PlacementGroupView) -> None:
-        if len(placement_group.bundle_indices) != len(placement_group.gpu_ids):
+        bundles = placement_group.bundle_indices
+        if len(bundles) != len(placement_group.gpu_ids):
             raise ValueError(
-                "Placement group view is inconsistent: "
-                f"{len(placement_group.bundle_indices)} bundles, {len(placement_group.gpu_ids)} GPU ids"
+                f"Placement group view is inconsistent: {len(bundles)} bundles, {len(placement_group.gpu_ids)} GPU ids"
             )
+        if len(set(bundles)) != len(bundles):
+            raise ValueError(f"Placement group view repeats a bundle index: {bundles}")
+        count = placement_group.bundle_count
+        if count is not None and any(index < 0 or index >= count for index in bundles):
+            raise ValueError(f"Placement group view names bundles outside [0, {count}): {bundles}")
+        node_ids = placement_group.node_ids
+        if node_ids is None:
+            return
+        if len(node_ids) != len(bundles):
+            raise ValueError(f"Placement group view is inconsistent: {len(bundles)} bundles, {len(node_ids)} node ids")
+        if not all(isinstance(node_id, str) and node_id for node_id in node_ids):
+            raise ValueError(f"Placement group view has an unknown node id: {node_ids}")
+        devices = [(node_id, int(gpu_id)) for node_id, gpu_id in zip(node_ids, placement_group.gpu_ids, strict=True)]
+        if len(set(devices)) != len(devices):
+            duplicated = sorted({device for device in devices if devices.count(device) > 1})
+            raise ValueError(f"Placement group bundles map to the same physical GPU: {duplicated}")
+
+    @staticmethod
+    def _validate_binding(
+        request: PlacementRequest,
+        placement_group: PlacementGroupView,
+        referenced: Sequence[int],
+        slot_size: int,
+    ) -> None:
+        """Check resolved slots against where the bundles physically are.
+
+        One slot is one engine actor on one node, and the engine drives GPUs
+        ``base_gpu_id + k``, so a slot must sit on one node over consecutive
+        GPU ids. A multi-node engine must put each of its slots on a distinct
+        node, or it would run fewer nodes than its TP/PP layout assumes.
+        """
+        node_ids = placement_group.node_ids
+        assert node_ids is not None
+        gpu_ids = placement_group.gpu_ids
+        for start in referenced:
+            slot = range(start, start + slot_size)
+            nodes = {node_ids[index] for index in slot}
+            if len(nodes) != 1:
+                raise ValueError(
+                    f"An engine slot of {request.group_id} spans nodes {sorted(nodes)}: "
+                    f"bundles [{start}, {start + slot_size})"
+                )
+            base = int(gpu_ids[start])
+            actual = [int(gpu_ids[index]) for index in slot]
+            if actual != list(range(base, base + slot_size)):
+                raise ValueError(
+                    f"An engine slot of {request.group_id} needs consecutive GPUs from {base}, "
+                    f"got {actual} on node {node_ids[start]}"
+                )
+        nodes_per_engine = max(1, request.num_gpus_per_engine // request.num_gpus_per_node)
+        for first in range(0, len(referenced), nodes_per_engine):
+            replica = referenced[first : first + nodes_per_engine]
+            nodes = [node_ids[start] for start in replica]
+            if len(set(nodes)) != nodes_per_engine:
+                raise ValueError(
+                    f"A {nodes_per_engine}-node engine of {request.group_id} lands on nodes {nodes}: "
+                    f"bundles {list(replica)}"
+                )
 
     @staticmethod
     def _validate_parallel_layout(request: PlacementRequest, capacity: int) -> int:

@@ -2570,8 +2570,11 @@ class MegatronTrainRayActor(TrainRayActor):
             return
 
         if dist.get_rank(group=get_gloo_group()) == 0:
+            from relax.distributed.ray.inference_manager import WEIGHT_UPDATE_BACKEND
+            from relax.engine.inference.types import Role
+
             # Close rollout admission until the new policy weights are published.
-            ray.get(self.inference_manager.rollout_operation.remote("invalidate_inference_state"))
+            ray.get(self.inference_manager.begin_weight_update.remote(Role.ROLLOUT, WEIGHT_UPDATE_BACKEND))
 
         if self.args.offload_train:
             # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
@@ -2677,7 +2680,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(post_sync_handles)
 
         if dist.get_rank(group=get_gloo_group()) == 0:
-            ray.get(self.inference_manager.rollout_operation.remote("complete_inference_weight_update"))
+            from relax.distributed.ray.inference_manager import WEIGHT_UPDATE_BACKEND
+            from relax.engine.inference.types import Role
+
+            ray.get(self.inference_manager.end_weight_update.remote(Role.ROLLOUT, WEIGHT_UPDATE_BACKEND))
 
     @timer("wait update_weights_fully_async")
     def _check_services_health(self) -> tuple[bool, bool]:

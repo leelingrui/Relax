@@ -5,7 +5,7 @@ admission."""
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
 
 class Role(str, Enum):
@@ -221,3 +221,19 @@ class RouteTarget:
 
     model_id: str
     base_url: str
+
+
+class TopologyEvents(Protocol):
+    """What an engine pool tells its owner about one model's engines.
+
+    The owner decides what each event means for discovery and admission. Both
+    calls return at once: neither waits for a lifecycle operation nor calls
+    back into the pool, so a pool may report from any thread.
+    """
+
+    def changed(self, model_id: str) -> None:
+        """Engines of ``model_id`` are being replaced or removed."""
+
+    def settled(self, model_id: str) -> None:
+        """A change to the engines of ``model_id`` finished; observe it
+        again."""
