@@ -3,21 +3,19 @@
 """CPU HTTP gateway shared by rollout, GenRM, and Teacher services."""
 
 import asyncio
-import inspect
-import itertools
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 from uuid import uuid4
 
 import httpx
-import ray
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from ray import serve
 from starlette.types import Receive, Scope, Send
 
-from relax.engine.inference.routing import RoutingError, resolve_model, select_target
+from relax.engine.inference.executor import AdmittedRequest, InferenceRequestExecutor
+from relax.engine.inference.routing import RoutingError
 from relax.engine.inference.types import Role, RoleSnapshot
 from relax.utils.logging_utils import get_logger
 
@@ -33,8 +31,6 @@ _HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 GATEWAY_REQUEST_HEADER = "x-relax-inference-gateway"
-
-_ABORT_TIMEOUT_S = 10.0
 
 
 class _GatewayStreamingResponse(StreamingResponse):
@@ -58,12 +54,34 @@ def _json_error(status_code: int, message: str, *, code: str) -> JSONResponse:
     )
 
 
+def _routing_error(exc: RoutingError) -> JSONResponse:
+    return _json_error(exc.status_code, str(exc), code="unavailable" if exc.status_code == 503 else "routing_error")
+
+
+def _forward_headers(request: Request) -> dict[str, str]:
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in _HOP_BY_HOP_HEADERS and key.lower() not in {"host", "content-length"}
+    }
+    headers[GATEWAY_REQUEST_HEADER] = "1"
+    return headers
+
+
+def _response_headers(response: httpx.Response, *, body: bool = True) -> dict[str, str]:
+    """Upstream headers to relay; ``body=False`` drops those describing a body
+    the Gateway rewrites."""
+    dropped = _HOP_BY_HOP_HEADERS if body else _HOP_BY_HOP_HEADERS | {"content-length", "content-encoding"}
+    return {key: value for key, value in response.headers.items() if key.lower() not in dropped}
+
+
 class InferenceGateway:
     """Role-neutral HTTP ingress which routes through a Manager snapshot.
 
     The gateway owns no GPU resources and keeps no availability state of its
     own. The task inference owner behind ``manager_handle`` is the only state
-    source.
+    source. Admitted requests run through the shared
+    :class:`~relax.engine.inference.executor.InferenceRequestExecutor`.
     """
 
     app = FastAPI()
@@ -83,46 +101,36 @@ class InferenceGateway:
         self.manager_handle = manager_handle
         self.upstream_url = upstream_url.rstrip("/") if upstream_url else None
         self.genrm_backend_handle = genrm_backend_handle
-        self._client = httpx.AsyncClient(timeout=timeout, limits=httpx.Limits(max_connections=2048))
-        # Rotates across direct-eligible replicas; a Router target ignores it.
-        self._cursor = itertools.count()
+        self._executor = InferenceRequestExecutor(
+            self.role, manager_handle, httpx.AsyncClient(timeout=timeout, limits=httpx.Limits(max_connections=2048))
+        )
         self._logger = get_logger(__name__)
         self._stream_cleanups: set[asyncio.Task] = set()
 
+    @property
+    def _client(self) -> httpx.AsyncClient:
+        return self._executor.client
+
     async def _snapshot(self) -> RoleSnapshot:
-        return await self._manager_call("snapshot", self.role)
+        return await self._executor.snapshot()
 
     async def _target(self, payload: Mapping[str, Any] | None = None) -> str:
         target, _ = await self._resolve_target(payload)
         return target
 
     async def _resolve_target(self, payload: Mapping[str, Any] | None = None) -> tuple[str, str]:
-        snapshot = await self._snapshot()
         payload = payload or {}
-        requested = payload.get("model")
-        # OpenAI clients send the served model's real name (e.g. "Qwen3-8B"), which the
-        # router used to accept. A single-model role keeps serving it through its
-        # default model; only a multi-model role must be named exactly.
-        if (
-            requested is not None
-            and len(snapshot.models) == 1
-            and snapshot.routing.default_model is not None
-            and requested != snapshot.models[0].model_id
-        ):
-            requested = None
         try:
-            model = resolve_model(
-                snapshot,
-                model=requested,
-                route_key=payload.get("route_key"),
+            target, model_id, _ = await self._executor.resolve(
+                model=payload.get("model"), route_key=payload.get("route_key")
             )
-            return select_target(model, cursor=next(self._cursor)).base_url.rstrip("/"), model.model_id
         except RoutingError as exc:
             raise HTTPException(
                 status_code=exc.status_code,
                 detail={"code": exc.code, "message": str(exc)},
                 headers={"Retry-After": "1"} if exc.status_code == 503 else None,
             ) from exc
+        return target, model_id
 
     async def engines(self, schema_version: int | None = None, status_filter: str | None = None) -> Any:
         """Serve the common discovery schema; ``schema_version=1`` keeps the
@@ -181,23 +189,16 @@ class InferenceGateway:
         ):
             return _json_error(400, "Invalid messages or sampling_params", code="invalid_request")
 
-        try:
-            target, model_id = await self._resolve_target(payload)
-        except HTTPException as exc:
-            return _json_error(
-                exc.status_code, str(exc.detail), code="unavailable" if exc.status_code == 503 else "routing_error"
-            )
-
         # The caller's ID only traces the request; the Manager's permit holds
         # its admission.
         trace_id = request.headers.get("x-relax-request-id") or uuid4().hex
         try:
-            permit = await self._admit(trace_id, model_id)
-        except HTTPException as exc:
-            return _json_error(exc.status_code, str(exc.detail), code="unavailable")
-        rid = trace_id
+            admitted = await self._executor.admit(
+                trace_id, model=payload.get("model"), route_key=payload.get("route_key")
+            )
+        except RoutingError as exc:
+            return _routing_error(exc)
         response: Response | None = None
-        finished = False
         try:
             payload.pop("route_key", None)
             wrap_response = False
@@ -205,173 +206,88 @@ class InferenceGateway:
                 if self.genrm_backend_handle is None:
                     raise HTTPException(status_code=503, detail="GenRM adapter is not configured")
                 payload = await self.genrm_backend_handle.prepare_generate_payload.remote(
-                    model_id, payload["messages"], payload.get("sampling_params")
+                    admitted.model_id, payload["messages"], payload.get("sampling_params")
                 )
                 wrap_response = True
             if path == "generate":
                 payload.pop("model", None)
             # Both native and OpenAI requests must carry the ID used by abort.
-            rid = payload["rid"] = payload.get("rid") or trace_id
-            response, finished = await self._forward(
-                request,
-                path,
-                target,
-                json.dumps(payload).encode(),
-                wrap_response=wrap_response,
-                request_id=rid,
-                admission_id=permit,
+            admitted.rid = payload["rid"] = payload.get("rid") or trace_id
+            response = await self._forward_admitted(
+                request, path, admitted, json.dumps(payload).encode(), wrap_response=wrap_response
             )
             return response
         finally:
-            # A stream completes its own request when it ends.
+            # A stream releases its own request when it ends.
             if not isinstance(response, StreamingResponse):
-                if not finished:
-                    await self._abort_upstream(target, rid)
-                await self._manager_call("complete_request", permit)
+                await self._executor.release(admitted)
 
-    async def _manager_call(self, method: str, *args: Any) -> Any:
-        value = getattr(self.manager_handle, method).remote(*args)
-        if inspect.isawaitable(value):
-            return await value
-        return await asyncio.to_thread(ray.get, value)
-
-    async def _admit(self, trace_id: str, model_id: str) -> str:
-        """Admit a request through the Manager and return its permit, or refuse
-        it with 503."""
+    async def _forward_admitted(
+        self, request: Request, path: str, admitted: AdmittedRequest, body: bytes, *, wrap_response: bool
+    ) -> Response:
+        headers = _forward_headers(request)
         try:
-            return await self._manager_call("admit_request", self.role, model_id, trace_id)
-        except Exception as exc:
-            self._logger.warning("Inference request %s admission failed: %s", trace_id, exc)
-            raise HTTPException(
-                status_code=503,
-                detail="Inference request is not admitted",
-                headers={"Retry-After": "1"},
-            ) from exc
-
-    async def _abort_upstream(self, target: str, request_id: str | None) -> None:
-        """Send an abort for ``request_id`` to the workers behind ``target``.
-
-        The router does not proxy aborts, so it is broadcast to its workers,
-        the same way the rollout and Agentic paths do it. An ACK only proves
-        the scheduler received it, never that the request left the running
-        batch.
-        """
-        if not request_id:
-            return
-        try:
-            urls = await self._worker_base_urls(target)
-        except Exception as exc:
-            self._logger.warning("Could not resolve engines behind %s to abort %s: %s", target, request_id, exc)
-            return
-        results = await asyncio.gather(
-            *(
-                self._client.post(f"{url}/abort_request", json={"rid": request_id}, timeout=_ABORT_TIMEOUT_S)
-                for url in urls
-            ),
-            return_exceptions=True,
+            upstream = await self._executor.send(
+                admitted, lambda target: self._build_upstream(request, path, target, body, headers)
+            )
+        except RoutingError as exc:
+            return _routing_error(exc)
+        except httpx.RequestError as exc:
+            return _json_error(502, f"Failed to connect to inference router: {exc}", code="upstream_unavailable")
+        if upstream.headers.get("content-type", "").startswith("text/event-stream"):
+            return self._stream_response(upstream, admitted)
+        content = await self._executor.read(admitted, upstream)
+        if wrap_response and upstream.is_success:
+            data = {"response": json.loads(content).get("text", "").strip()}
+            return JSONResponse(
+                data, status_code=upstream.status_code, headers=_response_headers(upstream, body=False)
+            )
+        return Response(
+            content=content, status_code=upstream.status_code, headers=_response_headers(upstream), media_type=None
         )
-        for url, result in zip(urls, results, strict=False):
-            if isinstance(result, BaseException):
-                self._logger.warning("Abort of %s at %s failed: %s", request_id, url, result)
 
-    async def _worker_base_urls(self, target: str) -> list[str]:
-        from relax.utils.http_utils import router_worker_base_urls
-
-        base = target.rstrip("/")
-        try:
-            response = await self._client.get(f"{base}/workers", timeout=_ABORT_TIMEOUT_S)
-            response.raise_for_status()
-            urls = [worker["url"] for worker in response.json()["workers"] if worker.get("url")]
-        except Exception:
-            response = await self._client.get(f"{base}/list_workers", timeout=_ABORT_TIMEOUT_S)
-            response.raise_for_status()
-            urls = list(response.json()["urls"])
-        return router_worker_base_urls(urls)
+    def _build_upstream(
+        self, request: Request, path: str, target: str, body: bytes, headers: dict[str, str]
+    ) -> httpx.Request:
+        upstream_url = f"{target}/{path.lstrip('/')}"
+        if request.url.query:
+            upstream_url = f"{upstream_url}?{request.url.query}"
+        return self._client.build_request(request.method, upstream_url, content=body, headers=headers)
 
     async def proxy_backend(self, request: Request, path: str) -> Response:
         """Forward role control-plane endpoints to the internal service."""
         if self.upstream_url is None:
             return _json_error(404, "Gateway backend is not configured", code="backend_unavailable")
-        response, _ = await self._forward(request, path, self.upstream_url, await request.body())
-        return response
-
-    async def _forward(
-        self,
-        request: Request,
-        path: str,
-        target: str,
-        body: bytes,
-        *,
-        wrap_response: bool = False,
-        request_id: str | None = None,
-        admission_id: str | None = None,
-    ) -> tuple[Response, bool]:
-        """Forward one request; also report whether the upstream finished it.
-
-        A streamed response hands ``request_id`` to the stream, which completes
-        or aborts it when the stream ends.
-        """
-        headers = {
-            key: value
-            for key, value in request.headers.items()
-            if key.lower() not in _HOP_BY_HOP_HEADERS and key.lower() not in {"host", "content-length"}
-        }
-        headers[GATEWAY_REQUEST_HEADER] = "1"
-        upstream_url = f"{target}/{path.lstrip('/')}"
-        if request.url.query:
-            upstream_url = f"{upstream_url}?{request.url.query}"
-        upstream = self._client.build_request(request.method, upstream_url, content=body, headers=headers)
-        response: httpx.Response | None = None
+        upstream_request = self._build_upstream(
+            request, path, self.upstream_url, await request.body(), _forward_headers(request)
+        )
         try:
-            response = await self._client.send(upstream, stream=True)
-            if response.headers.get("content-type", "").startswith("text/event-stream"):
-                stream_response = self._stream_response(response, request_id, admission_id, target)
-                response = None
-                return stream_response, True
-            content = await response.aread()
-            response_headers = {
-                key: value for key, value in response.headers.items() if key.lower() not in _HOP_BY_HOP_HEADERS
-            }
-            if wrap_response and response.is_success:
-                data = json.loads(content)
-                data = {"response": data.get("text", "").strip()}
-                response_headers.pop("content-length", None)
-                response_headers.pop("content-encoding", None)
-                return JSONResponse(data, status_code=response.status_code, headers=response_headers), True
-            return (
-                Response(content=content, status_code=response.status_code, headers=response_headers, media_type=None),
-                True,
-            )
+            upstream = await self._client.send(upstream_request, stream=True)
         except httpx.RequestError as exc:
-            return (
-                _json_error(502, f"Failed to connect to inference router: {exc}", code="upstream_unavailable"),
-                False,
-            )
+            return _json_error(502, f"Failed to connect to inference router: {exc}", code="upstream_unavailable")
+        if upstream.headers.get("content-type", "").startswith("text/event-stream"):
+            return self._stream_response(upstream, None)
+        try:
+            content = await upstream.aread()
         finally:
-            if response is not None and not response.is_closed:
-                await response.aclose()
+            await upstream.aclose()
+        return Response(
+            content=content, status_code=upstream.status_code, headers=_response_headers(upstream), media_type=None
+        )
 
-    def _stream_response(
-        self, response: httpx.Response, request_id: str | None, admission_id: str | None, target: str
-    ) -> StreamingResponse:
-        completed = False
-
+    def _stream_response(self, response: httpx.Response, admitted: AdmittedRequest | None) -> StreamingResponse:
         async def finish() -> None:
             try:
                 await response.aclose()
             finally:
-                if admission_id is not None:
-                    try:
-                        if not completed:
-                            await self._abort_upstream(target, request_id)
-                    finally:
-                        await self._manager_call("complete_request", admission_id)
+                if admitted is not None:
+                    await self._executor.release(admitted)
 
         async def body():
-            nonlocal completed
             async for chunk in response.aiter_raw():
                 yield chunk
-            completed = True
+            if admitted is not None:
+                admitted.finished = True
 
         async def cleanup() -> None:
             # ASGI disconnect cancels awaits in the response's scope.

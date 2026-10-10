@@ -572,9 +572,9 @@ def test_manager_rollout_offload_waits_for_a_request_admitted_by_the_gateway() -
             admitted.set()
             await forward.wait()
             engine_loaded.append(policy.onloaded)
-            return Response(), True
+            return Response()
 
-        gateway._forward = hold_before_forwarding
+        gateway._forward_admitted = hold_before_forwarding
         proxied = asyncio.create_task(gateway.proxy(request(), "generate"))
         await admitted.wait()
         # What components/rollout.py runs after each generate.
@@ -624,14 +624,14 @@ def test_manager_gateway_retries_with_one_request_id_each_hold_the_drain() -> No
         admitted = asyncio.Queue()
         rids = []
 
-        async def hold(*args, request_id=None, admission_id=None, **kwargs):
-            rids.append(request_id)
+        async def hold(request, path, inflight, *args, **kwargs):
+            rids.append(inflight.rid)
             name = "first" if len(rids) == 1 else "second"
             await admitted.put(name)
             await released[name].wait()
-            return Response(), True
+            return Response()
 
-        gateway._forward = hold
+        gateway._forward_admitted = hold
         first = asyncio.create_task(gateway.proxy(request(), "generate"))
         assert await admitted.get() == "first"
         second = asyncio.create_task(gateway.proxy(request(), "generate"))
@@ -718,7 +718,7 @@ def _engine_gateway(manager: InferenceManager, pool: BusyEnginePool, *, abort_fa
         }
     )
     gateway = InferenceGateway(Role.GENRM, manager_handle=handle)
-    gateway._client = httpx.AsyncClient(transport=httpx.MockTransport(engine))
+    gateway._executor.client = httpx.AsyncClient(transport=httpx.MockTransport(engine))
     return gateway
 
 

@@ -12,9 +12,7 @@ fall back to the sole "__default__" instance (the legacy single-model config).
 """
 
 import asyncio
-import time
 from argparse import Namespace
-from itertools import cycle
 from typing import Any, List, Optional, Union
 from uuid import uuid4
 
@@ -28,6 +26,8 @@ from ray.serve.schema import LoggingConfig
 from relax.components.base import Base
 from relax.distributed.ray.inference_manager import ModelHandle
 from relax.distributed.ray.placement_group import create_genrm_role
+from relax.engine.inference.executor import InferenceRequestExecutor
+from relax.engine.inference.routing import RoutingError
 from relax.engine.inference.types import Role
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
@@ -42,15 +42,21 @@ app = FastAPI()
 GENRM_SERVE_MAX_ONGOING_REQUESTS = Envs.GENRM_SERVE_MAX_ONGOING_REQUESTS
 
 # NOTE: GENRM_SERVE_MAX_ONGOING_REQUESTS above must stay module-level — it feeds
-# the @serve.deployment decorator, which runs at import. The retry count has no
-# such constraint, so it is read at the call site to stay lazy.
+# the @serve.deployment decorator, which runs at import. The retry count
+# (GENRM_ENGINE_RETRY_ATTEMPTS) has no such constraint; the request executor
+# reads it at send time.
 
 # Sentinel instance key for the legacy single-model config (--genrm-model-path)
 # and for requests that don't pass a route_key.
 _DEFAULT_INSTANCE_KEY = "__default__"
 
-# Bound on aborting an engine request whose caller went away.
-_ABORT_TIMEOUT_S = 5.0
+
+def _http_error(exc: RoutingError) -> HTTPException:
+    return HTTPException(
+        status_code=exc.status_code,
+        detail=str(exc),
+        headers={"Retry-After": "1"} if exc.status_code == 503 else None,
+    )
 
 
 class Message(BaseModel):
@@ -78,40 +84,6 @@ class GenerateResponse(BaseModel):
     """
 
     response: str
-
-
-class _EngineCacheState:
-    """Per-instance round-robin cache over one GenRM model's live engine list.
-
-    Isolated per route_key so a dead/rebuilt engine on one instance never
-    perturbs another instance's cycle.
-    """
-
-    def __init__(self) -> None:
-        self.hosts_ports: Optional[list] = None
-        self.cycle: Optional[Any] = None
-        self.refreshed_at: float = 0.0
-
-    def invalidate(self) -> None:
-        now = time.monotonic()
-        if now - self.refreshed_at < Envs.GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S:
-            return
-        self.hosts_ports = None
-
-    def needs_refresh(self) -> bool:
-        if self.hosts_ports is None:
-            return True
-        if self.hosts_ports:
-            return False
-        return time.monotonic() - self.refreshed_at >= Envs.GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S
-
-    def refresh(self, hosts_ports: list) -> None:
-        self.refreshed_at = time.monotonic()
-        # Swap the list and its cycle together: the manager compacts the list
-        # over dead engines, so a cycle built for the old length would hand
-        # back an out-of-range index.
-        self.cycle = cycle(range(len(hosts_ports)))
-        self.hosts_ports = hosts_ports
 
 
 @serve.deployment(
@@ -172,16 +144,18 @@ class GenRM(Base):
             key: ray.get(inference_manager_handle.model_spec.remote(Role.GENRM, key)) for key in self.genrm_managers
         }
 
-        self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
         self._logger.info(f"GenRM service initialized successfully: instances={list(self.genrm_managers)}")
         # Shared HTTP client for engine calls (avoids per-request connection overhead).
         # Raise pool limits well above httpx's default 100 so one replica can fan out
         # many concurrent engine requests; keepalive_expiry >> the default 5s so
         # idle-then-reused connections aren't reaped mid-burst (avoids ReadError/500).
-        self._http_client = httpx.AsyncClient(
+        http_client = httpx.AsyncClient(
             timeout=1800,
             limits=httpx.Limits(max_connections=2048, max_keepalive_connections=2048, keepalive_expiry=600),
         )
+        # Requests run the same admission, target, retry and abort protocol as
+        # the Gateway's.
+        self._executor = InferenceRequestExecutor(Role.GENRM, inference_manager_handle, http_client)
 
         # Load one tokenizer per instance -- distinct instances may be distinct
         # models with distinct tokenizers/chat templates.
@@ -216,44 +190,26 @@ class GenRM(Base):
             GenerateResponse containing raw model response text
         """
         key = self._resolve_instance_key(request.route_key)
-        # The engine rid traces the request; the permit holds its admission.
-        request_id = uuid4().hex
-        permit = await self._admit(key, request_id)
         try:
-            output = await self._call_engine(
-                request.route_key, request.messages, request.sampling_params, request_id=request_id
-            )
-            response = output.get("text", "").strip()
-            return GenerateResponse(response=response)
-
-        except Exception as e:
-            self._logger.error(f"GenRM generation failed (route_key={request.route_key}): {e}")
-            raise
+            admitted = await self._executor.admit(uuid4().hex, model=key)
+        except RoutingError as exc:
+            self._logger.warning(f"GenRM request to instance '{key}' is not admitted: {exc}")
+            raise _http_error(exc) from exc
+        try:
+            payload = await self.prepare_generate_payload(key, request.messages, request.sampling_params)
+            payload["rid"] = admitted.rid
+            output = await self._executor.post(admitted, "generate", payload)
+        except RoutingError as exc:
+            raise _http_error(exc) from exc
+        except httpx.RequestError as exc:
+            self._logger.error(f"GenRM generation failed (route_key={request.route_key}): {exc}")
+            raise HTTPException(status_code=502, detail=f"GenRM engine request failed: {exc}") from exc
         finally:
-            await self._complete(permit, request_id)
-
-    async def _admit(self, key: str, request_id: str) -> str:
-        """Admit a direct request through the Manager, or refuse it with 503.
-
-        This endpoint calls the engines without the Gateway, so it records the
-        request itself: a sleeping or switching model is refused, and a drain
-        waits for every request admitted here.
-        """
-        try:
-            return await self._inference_manager.admit_request.remote(Role.GENRM, key, request_id)
-        except Exception as exc:
-            self._logger.warning(f"GenRM request {request_id} to instance '{key}' is not admitted: {exc}")
-            raise HTTPException(
-                status_code=503,
-                detail=f"GenRM instance '{key}' is not accepting requests",
-                headers={"Retry-After": "1"},
-            ) from exc
-
-    async def _complete(self, permit: str, request_id: str) -> None:
-        try:
-            await self._inference_manager.complete_request.remote(permit)
-        except Exception as exc:
-            self._logger.warning(f"Failed to complete GenRM request {request_id} (permit {permit}): {exc}")
+            await self._executor.release(admitted)
+        if output.is_error:
+            self._logger.error(f"GenRM engine returned {output.status_code} (route_key={request.route_key})")
+            raise HTTPException(status_code=output.status_code, detail=output.text)
+        return GenerateResponse(response=output.json().get("text", "").strip())
 
     def _resolve_instance_key(self, route_key: Optional[str]) -> str:
         if route_key is None and len(self.genrm_managers) == 1:
@@ -264,26 +220,6 @@ class GenRM(Base):
                 f"No GenRM instance registered for route_key={key!r}; available={list(self.genrm_managers)}"
             )
         return key
-
-    def _pick_engine(self, route_key: Optional[str]) -> tuple[str, int, str, int]:
-        """Round-robin one live engine of the instance selected by
-        ``route_key``, refreshing that instance's cache if it was dropped."""
-        key = self._resolve_instance_key(route_key)
-        cache = self._engine_caches[key]
-        if cache.needs_refresh():
-            hosts_ports = ray.get(self.genrm_managers[key].get_engine_hosts_ports.remote())
-            cache.refresh(hosts_ports)
-
-        hosts_ports = cache.hosts_ports
-        if not hosts_ports:
-            raise RuntimeError(f"No genRM engines available for instance '{key}'")
-
-        # Thread-safe round-robin via itertools.cycle (next() is atomic in CPython).
-        # Re-read the local alias, not cache.*, so a concurrent invalidation
-        # can't make the index and the list disagree.
-        idx = next(cache.cycle) % len(hosts_ports)
-        host, port = hosts_ports[idx]
-        return key, idx, host, port
 
     async def prepare_generate_payload(
         self, route_key: Optional[str], messages: list, sampling_params: Optional[dict] = None
@@ -326,66 +262,6 @@ class GenRM(Base):
             "input_ids": input_ids,
             "sampling_params": default_sampling,
         }
-
-    async def _call_engine(
-        self,
-        route_key: Optional[str],
-        messages: list,
-        sampling_params: Optional[dict] = None,
-        request_id: Optional[str] = None,
-    ) -> dict:
-        """Adapt messages once and call a live engine, retrying transient
-        failures.
-
-        ``request_id`` becomes the engine rid, so a cancelled caller aborts the
-        engine request before its admission is completed.
-        """
-        key, idx, host, port = self._pick_engine(route_key)
-        payload = await self.prepare_generate_payload(key, messages, sampling_params)
-        if request_id is not None:
-            payload["rid"] = request_id
-
-        # Retry transient resets (transport-level or 5xx) with short backoff so
-        # bursty colocate contention doesn't surface as a 500; 4xx is a client bug
-        # (terminal) and a cancellation (caller timeout) is never retried.
-        # Serve→engine retry attempts for transient resets (ReadError / 5xx under
-        # bursty colocate contention), absorbing them before they surface as a 500
-        # to the client. Set 1 to disable.
-        retry_attempts = Envs.GENRM_ENGINE_RETRY_ATTEMPTS
-        for _attempt in range(1, retry_attempts + 1):
-            try:
-                resp = await self._http_client.post(f"http://{host}:{port}/generate", json=payload)
-                resp.raise_for_status()
-                break
-            except asyncio.CancelledError:
-                if request_id is not None:
-                    await self._abort_engine_request(host, port, request_id)
-                raise
-            except Exception as e:
-                status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
-                if request_id is not None and (status == 0 or status >= 500):
-                    # The engine may still run a request whose reply was lost;
-                    # abort it before retrying its rid elsewhere or giving up.
-                    await self._abort_engine_request(host, port, request_id)
-                if (status == 0 or status >= 500) and _attempt < retry_attempts:
-                    # A transport error means this engine may be gone and its
-                    # replacement will come back on a different port, so drop the
-                    # cache and re-pick — retrying the same dead host is useless.
-                    if status == 0:
-                        self._engine_caches[key].invalidate()
-                    key, idx, host, port = self._pick_engine(route_key)
-                    await asyncio.sleep(0.3 * _attempt)
-                    continue
-                raise
-        return resp.json()
-
-    async def _abort_engine_request(self, host: str, port: int, request_id: str) -> None:
-        try:
-            await self._http_client.post(
-                f"http://{host}:{port}/abort_request", json={"rid": request_id}, timeout=_ABORT_TIMEOUT_S
-            )
-        except Exception as exc:
-            self._logger.warning(f"Abort of GenRM request {request_id} at {host}:{port} failed: {exc}")
 
     @app.get("/health")
     async def health(self) -> dict:
