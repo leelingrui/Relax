@@ -16,7 +16,12 @@ import pytest
 try:
     from relax.distributed.ray import rollout as module
     from relax.engine.inference.config import EngineGroupSpec, InferenceModelSpec
-    from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementPlanner
+    from relax.engine.inference.placement import (
+        PlacementBinding,
+        PlacementGroupView,
+        PlacementOwner,
+        PlacementPlanner,
+    )
     from relax.engine.inference.types import Role, WeightSource
 
     HAS_DEPS = True
@@ -102,7 +107,8 @@ def startup(monkeypatch):
 
 
 def _pg(num_gpus=4):
-    return (MagicMock(), list(range(num_gpus)), list(range(num_gpus)))
+    # What ``create_placement_group`` returns: one node, GPUs in order.
+    return PlacementBinding(MagicMock(), tuple(range(num_gpus)), tuple(range(num_gpus)), ("node-0",) * num_gpus)
 
 
 def _view(pg):
@@ -649,3 +655,87 @@ def test_task_layout_rejects_a_later_role_before_any_engine_starts(monkeypatch):
     # GenRM sits behind four rollout bundles of a four-GPU actor group.
     with pytest.raises(ValueError, match="Invalid genrm placement"):
         validate_task_layout(_task_args(rollout_gpus=4, genrm_gpus=2))
+
+
+# ---------------------------------------------------------------------------
+# Node binding is checked after the group is ready and before any engine.
+# ---------------------------------------------------------------------------
+def _split_pg():
+    """4 GPUs over two nodes, 1 + 3: a TP2 slot at offset 0 crosses nodes."""
+    return PlacementBinding(MagicMock(), (0, 1, 2, 3), (0, 0, 1, 2), ("node-a", "node-b", "node-b", "node-b"))
+
+
+def test_rollout_startup_rejects_a_bad_binding_before_any_engine(startup, monkeypatch):
+    import importlib
+
+    ray_pg = importlib.import_module("ray.util.placement_group")
+    removed = []
+    monkeypatch.setattr(ray_pg, "remove_placement_group", removed.append)
+    ledger = PlacementPlanner()
+    pg = _split_pg()
+
+    with pytest.raises(ValueError, match="spans nodes"):
+        module.start_rollout_servers(_args(), pg, planner=ledger)
+
+    assert startup.groups == [] and startup.routers == []
+    assert ledger.allocations() == ()
+    # The group was borrowed from the Controller: only the slices go.
+    assert removed == []
+
+
+def test_rollout_startup_bad_binding_removes_only_a_group_it_created(startup, monkeypatch):
+    import importlib
+
+    import relax.core.service as service
+
+    ray_pg = importlib.import_module("ray.util.placement_group")
+    pg = _split_pg()
+    removed = []
+    monkeypatch.setattr(service, "create_placement_group", lambda **kwargs: pg)
+    monkeypatch.setattr(ray_pg, "remove_placement_group", removed.append)
+
+    with pytest.raises(ValueError, match="spans nodes"):
+        _start_teacher(_args(), None, PlacementPlanner(), bundle_offset=0, phase="teacher")
+
+    assert removed == [pg.pg] and startup.groups == []
+
+
+def test_placement_group_view_requires_a_binding_for_a_group_it_created():
+    legacy = (MagicMock(), [0, 1], [0, 1])
+
+    with pytest.raises(ValueError, match="node binding"):
+        module.placement_group_view(legacy, PlacementOwner.MANAGER)
+    # A borrowed legacy group is still planned, on its logical layout only.
+    view = module.placement_group_view(legacy, PlacementOwner.CONTROLLER)
+    assert view.node_ids is None and view.gpu_ids == (0, 1)
+
+
+def test_placement_preview_checks_the_binding_before_startup():
+    planner = PlacementPlanner()
+    view, requests = module.placement_preview(
+        _args(), module.rollout_role_models(_args()), role=Role.ROLLOUT, pg=_split_pg(), bundle_offset=0
+    )
+
+    with pytest.raises(ValueError, match="spans nodes"):
+        planner.plan(requests, view, dry_run=True)
+
+
+def test_build_placement_binding_orders_by_address_but_names_nodes_by_ray_id():
+    from relax.distributed.ray.placement_group import build_placement_binding
+
+    pg = MagicMock()
+    # Probes arrive in bundle order; the binding is ordered by IP then GPU,
+    # while each slot keeps the Ray node id its bundle reported.
+    probes = [
+        ("192.0.2.2", 1, "node-b"),
+        ("10.0.0.1", 1, "node-a"),
+        ("192.0.2.2", 0, "node-b"),
+        ("10.0.0.1", 0, "node-a"),
+    ]
+
+    binding = build_placement_binding(pg, probes)
+
+    assert binding.bundle_indices == (3, 1, 2, 0)
+    assert binding.gpu_ids == (0, 1, 0, 1)
+    assert binding.node_ids == ("node-a", "node-a", "node-b", "node-b")
+    assert binding.pg is pg

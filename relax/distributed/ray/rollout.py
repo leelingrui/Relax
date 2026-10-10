@@ -33,6 +33,7 @@ from relax.engine.inference.config import (
 )
 from relax.engine.inference.phase_plans import PHASE_GENERATE
 from relax.engine.inference.placement import (
+    PlacementBinding,
     PlacementGroupView,
     PlacementOwner,
     PlacementPlanner,
@@ -309,7 +310,7 @@ class EngineGroup:
     """
 
     args: Any
-    pg: Any  # (placement_group, reordered_bundle_indices, reordered_gpu_ids)
+    pg: Any  # PlacementBinding, or a legacy (placement_group, bundle_indices, gpu_ids)
     all_engines: list
     num_gpus_per_engine: int
     num_new_engines: int
@@ -403,7 +404,12 @@ class EngineGroup:
 
         num_gpu_per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
 
-        pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
+        if self.placement is None:
+            # Engines run only on a slice the planner resolved and checked;
+            # re-deriving it here would bypass that check.
+            raise ValueError(f"Engine group {self.model_id}/{self.worker_type} has no planned placement slice")
+        binding = PlacementBinding.coerce(self.pg)
+        pg, reordered_gpu_ids = binding.pg, binding.gpu_ids
 
         validate_server_group_gpu_indices(
             worker_type=self.worker_type,
@@ -427,18 +433,12 @@ class EngineGroup:
             num_gpus = self.ray_num_gpus
             num_cpus = num_gpus
 
-            # Get the base GPU ID from placement group using gpu_offset.
-            gpu_index = (
-                self.placement.referenced_offsets[i]
-                if self.placement is not None
-                else self.gpu_offset + i * num_gpu_per_engine
-            )
-            base_gpu_id = int(reordered_gpu_ids[gpu_index])
+            base_gpu_id = int(self.placement.gpu_ids[i])
 
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=pg,
                 placement_group_capture_child_tasks=True,
-                placement_group_bundle_index=reordered_bundle_indices[gpu_index],
+                placement_group_bundle_index=self.placement.bundle_indices[i],
             )
 
             env_vars = dict.fromkeys(NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, "1") | {
@@ -692,12 +692,16 @@ class RolloutServer:
         ``engines``.
 
         Accounts for placeholder groups that occupy GPU slots without creating
-        engines.
+        engines. A planned group reads each engine's first slot from its slice;
+        an external group has no placement group, so its offsets name no GPU.
         """
         offsets = []
         for g in self.engine_groups:
             for j in range(len(g.engines)):
-                offsets.append(g.gpu_offset + j * g.num_gpus_per_engine)
+                if g.placement is not None:
+                    offsets.append(g.placement.referenced_offsets[j * g.nodes_per_engine])
+                else:
+                    offsets.append(g.gpu_offset + j * g.num_gpus_per_engine)
         return offsets
 
     @property
@@ -1918,17 +1922,22 @@ class RolloutEnginePool:
                         **accelerator_kwargs,
                     ).remote()
                 )
-            gpu_ids = await asyncio.gather(*[actor.get_ip_and_gpu_id.remote() for actor in info_actors])
+            probes = await asyncio.gather(*[actor.get_ip_gpu_and_node_id.remote() for actor in info_actors])
             for actor in info_actors:
                 ray.kill(actor)
             info_actors = []
 
-            bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_gpus)]
-            sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
-            pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
-            pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
-            pg_tuple = (pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids)
+            from relax.distributed.ray.placement_group import build_placement_binding
 
+            binding = build_placement_binding(pg, probes, sort_key=sort_key)
+            logger.info(
+                f"[ScaleOut] Replica {replica_idx}: GPU topology probed, "
+                f"bundle_indices={list(binding.bundle_indices)}, gpu_ids={list(binding.gpu_ids)}, "
+                f"node_ids={list(binding.node_ids)}"
+            )
+
+            # Planned against the probed binding, so a slot that is not one
+            # node over consecutive GPUs is refused before any engine starts.
             placement = self._plan_placement(
                 (
                     PlacementRequest(
@@ -1939,23 +1948,13 @@ class RolloutEnginePool:
                         num_gpus_per_node=self.args.num_gpus_per_node,
                     ),
                 ),
-                PlacementGroupView(
-                    tuple(pg_reordered_bundle_indices),
-                    tuple(pg_reordered_gpu_ids),
-                    PlacementOwner.MANAGER,
-                    identity=pg,
-                ),
+                placement_group_view(binding, PlacementOwner.MANAGER),
             )[0]
-
-            logger.info(
-                f"[ScaleOut] Replica {replica_idx}: GPU topology probed, "
-                f"bundle_indices={pg_reordered_bundle_indices}, gpu_ids={pg_reordered_gpu_ids}"
-            )
 
             # Step 2: Create EngineGroup (skip router registration during init)
             new_group = EngineGroup(
                 args=self.args,
-                pg=pg_tuple,
+                pg=binding,
                 all_engines=[None],  # Single engine per replica
                 num_gpus_per_engine=gpus_per_engine,
                 num_new_engines=0,
@@ -4870,6 +4869,24 @@ def _placement_requests(
     return requests
 
 
+def placement_group_view(pg: Any, owner: PlacementOwner) -> PlacementGroupView:
+    """The planner view of a ready placement group, with its node binding.
+
+    A group this control plane created is always probed, so a binding without
+    node ids there is a bug, not a degraded mode. One handed in by a caller may
+    predate probing; it is planned on its logical layout, loudly.
+    """
+    binding = PlacementBinding.coerce(pg)
+    if binding.node_ids is None:
+        if owner.removable:
+            raise ValueError("A placement group created by this control plane must carry its node binding")
+        logger.warning(
+            "Placement group %s has no node binding; only its logical layout is checked",
+            binding.pg,
+        )
+    return PlacementGroupView.from_binding(binding, owner)
+
+
 def placement_preview(
     args,
     models: list[InferenceModelSpec],
@@ -4888,7 +4905,7 @@ def placement_preview(
     """
     requests = _placement_requests(args, models, role=role, bundle_offset=bundle_offset, phase=phase)
     if pg is not None:
-        return PlacementGroupView(tuple(pg[1]), tuple(pg[2]), PlacementOwner.CONTROLLER, identity=pg[0]), requests
+        return placement_group_view(pg, PlacementOwner.CONTROLLER), requests
     size = sum(model.total_num_gpus for model in models)
     identity = f"preview/{role.value}/{'+'.join(model.name for model in models)}"
     view = PlacementGroupView(tuple(range(size)), tuple(range(size)), PlacementOwner.MANAGER, identity=identity)
@@ -4946,7 +4963,7 @@ def start_servers(
         )
         pg_owner = PlacementOwner.MANAGER
     try:
-        pg_view = PlacementGroupView(tuple(pg[1]), tuple(pg[2]), pg_owner, identity=pg[0])
+        pg_view = placement_group_view(pg, pg_owner)
         planned_by_id = {planned.group_id: planned for planned in planner.plan(placement_requests, pg_view)}
     except Exception:
         # Nothing was reserved, but a group created here is still ours to remove.

@@ -466,6 +466,9 @@ class SGLangEngine(RayActor):
             num_gpus_per_engine=self.num_gpus_per_engine,
         )
         self.node_rank = server_args_dict["node_rank"]
+        # The device SGLang was launched on, in this process's numbering;
+        # ``get_device_identity`` reports what it names.
+        self._launched_base_gpu_id = server_args_dict.get("base_gpu_id")
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
 
@@ -478,6 +481,7 @@ class SGLangEngine(RayActor):
         if self.args.rollout_external or init_external_kwargs:
             if not init_external_kwargs:
                 init_external_kwargs = {"external_engine_need_check_fields": external_engine_need_check_fields}
+            self._launched_base_gpu_id = None
             self._init_external(server_args_dict, **init_external_kwargs)
         else:
             if self.weight_source == WeightSource.DCS:
@@ -889,6 +893,24 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return None
         return f"http://{self.server_host}:{self.server_port}"
+
+    def get_device_identity(self) -> dict:
+        """Return this engine's Ray node id and its workers' devices on it.
+
+        ``devices`` lists, in worker order, the device identity of
+        ``base_gpu_id + k`` exactly as SGLang was launched (``gpu_id_step=1``),
+        resolved in this process. It is ``None`` for an external engine, whose
+        devices this actor does not control.
+        """
+        from relax.utils.colocate_alignment import local_device_identity
+
+        node_id = ray.get_runtime_context().get_node_id()
+        base = getattr(self, "_launched_base_gpu_id", None)
+        if base is None:
+            return {"node_id": node_id, "devices": None}
+        num_gpus = self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine
+        local_gpus = min(num_gpus, self.args.num_gpus_per_node)
+        return {"node_id": node_id, "devices": [local_device_identity(base + k) for k in range(local_gpus)]}
 
     def get_pid_and_node_id(self) -> dict:
         """Return the PID and Ray node ID of this engine.

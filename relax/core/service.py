@@ -14,7 +14,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.components.inference_gateway import delete_gateway, deploy_gateway, gateway_deployment_name
 from relax.core.node_group_affinity import with_control_plane_affinity
-from relax.distributed.ray.placement_group import InfoActor, sort_key
+from relax.distributed.ray.placement_group import InfoActor, build_placement_binding
 from relax.engine.inference.types import Role
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
@@ -378,8 +378,8 @@ def _require_node_group_markers(node_group: str, retries: int = 3, retry_delay: 
 
 
 def create_placement_group(num_gpus, node_group_affinity=True):
-    """Create a packed GPU placement group with optional node-group
-    affinity."""
+    """Create a packed GPU placement group with optional node-group affinity,
+    returned as a :class:`PlacementBinding` probed per bundle."""
     accel_resource = device_utils.get_ray_accelerator_name()
     base_bundle = {accel_resource: 1, "CPU": 1}
     node_group = os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip()
@@ -403,21 +403,17 @@ def create_placement_group(num_gpus, node_group_affinity=True):
                 **accelerator_kwargs,
             ).remote()
         )
-    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
+    probes = ray.get([actor.get_ip_gpu_and_node_id.remote() for actor in info_actors])
     for actor in info_actors:
         ray.kill(actor)
 
-    bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
-    sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
-    pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
-    # Map from logical index -> physical GPU ID
-    pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
-
-    for i in range(num_bundles):
-        actual_bundle_index = pg_reordered_bundle_indices[i]
+    binding = build_placement_binding(pg, probes)
+    for i, (actual_bundle_index, gpu_id, node_id) in enumerate(
+        zip(binding.bundle_indices, binding.gpu_ids, binding.node_ids, strict=True)
+    ):
         logger.info(
             f"  bundle {i:4}, actual_bundle_index: {actual_bundle_index:4}, "
-            f"node: {gpu_ids[actual_bundle_index][0]}, gpu: {gpu_ids[actual_bundle_index][1]}"
+            f"node: {probes[actual_bundle_index][0]} ({node_id}), gpu: {gpu_id}"
         )
 
-    return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids
+    return binding

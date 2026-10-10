@@ -405,3 +405,147 @@ def test_model_placement_aggregates_slices_and_marks_deferred_models() -> None:
     assert ModelPlacement.from_slices(split, shared_phase="inference").activation_group is None
     with pytest.raises(ValueError, match="one phase"):
         ModelPlacement.from_slices([*split, *planner.allocations(view)[:1]], shared_phase="inference")
+
+
+# ---------------------------------------------------------------------------
+# Node binding: a probed view is checked against where bundles really are.
+# ---------------------------------------------------------------------------
+def _bound_view(devices, *, bundle_indices=None, bundle_count=None, owner=PlacementOwner.CONTROLLER):
+    """A probed view from ``(node_id, gpu_id)`` per logical slot."""
+    return PlacementGroupView(
+        tuple(bundle_indices) if bundle_indices is not None else tuple(range(len(devices))),
+        tuple(gpu for _, gpu in devices),
+        owner,
+        identity=_FakePlacementGroup("bound"),
+        node_ids=tuple(node for node, _ in devices),
+        bundle_count=bundle_count,
+    )
+
+
+def _node(name, gpus):
+    return [(name, gpu) for gpu in gpus]
+
+
+def test_placement_binding_accepts_whole_nodes_and_resolves_their_slots():
+    planner = PlacementPlanner()
+    view = _bound_view(_node("node-a", range(4)) + _node("node-b", range(4)), bundle_count=8)
+
+    single, multi = planner.plan(
+        (
+            _request("rollout/tp2", num_gpus=8, num_gpus_per_engine=2, bundle_offset=0),
+            _request("rollout/tp8", num_gpus=8, num_gpus_per_engine=8, bundle_offset=0, phase="other"),
+        ),
+        view,
+    )
+
+    assert single.referenced_offsets == (0, 2, 4, 6)
+    assert multi.referenced_offsets == (0, 4)
+
+
+def test_placement_binding_accepts_a_partial_node_that_slots_fit():
+    planner = PlacementPlanner()
+    # PACK may hand out part of a node: 4 GPUs on one node, 2 on another.
+    view = _bound_view(_node("node-a", range(4)) + _node("node-b", (6, 7)))
+
+    (slice_,) = planner.plan((_request(num_gpus=6, num_gpus_per_engine=2, bundle_offset=0),), view)
+
+    assert slice_.gpu_ids == (0, 2, 6)
+
+
+def test_placement_binding_rejects_a_slot_across_a_partial_node_boundary():
+    planner = PlacementPlanner()
+    # 3 + 5 GPUs: offsets alone place slot [2, 4) inside "node 0" of 4 GPUs.
+    view = _bound_view(_node("node-a", range(3)) + _node("node-b", range(5)))
+
+    with pytest.raises(ValueError, match="spans nodes"):
+        planner.plan((_request(num_gpus=8, num_gpus_per_engine=2, bundle_offset=0),), view)
+    assert planner.allocations() == ()
+
+
+def test_placement_binding_rejects_a_slot_whose_gpus_are_not_consecutive():
+    planner = PlacementPlanner()
+    # Reordered out of GPU order: the engine would drive GPUs 1 and 2.
+    view = _bound_view(_node("node-a", (1, 0, 2, 3)))
+
+    with pytest.raises(ValueError, match="consecutive GPUs"):
+        planner.plan((_request(num_gpus=4, num_gpus_per_engine=2, bundle_offset=0),), view)
+
+
+def test_placement_binding_rejects_two_bundles_on_one_physical_gpu():
+    planner = PlacementPlanner()
+    view = _bound_view(_node("node-a", (0, 1, 1, 2)))
+
+    with pytest.raises(ValueError, match="same physical GPU"):
+        planner.plan((_request(num_gpus=2, num_gpus_per_engine=1, bundle_offset=0),), view)
+
+
+def test_placement_binding_rejects_one_node_seen_under_two_addresses():
+    planner = PlacementPlanner()
+    # Sorting by IP split one machine into two "nodes"; its Ray node id did not.
+    view = _bound_view(_node("node-a", range(4)) + _node("node-a", range(4, 8)))
+
+    with pytest.raises(ValueError, match="2-node engine"):
+        planner.plan((_request(num_gpus=8, num_gpus_per_engine=8, bundle_offset=0),), view)
+
+
+def test_placement_binding_rejects_a_multi_node_engine_on_interleaved_nodes():
+    planner = PlacementPlanner()
+    view = _bound_view(
+        _node("node-a", range(4))
+        + _node("node-a", range(4, 8))
+        + _node("node-b", range(4))
+        + _node("node-b", range(4, 8))
+    )
+
+    with pytest.raises(ValueError, match="2-node engine"):
+        planner.plan((_request(num_gpus=16, num_gpus_per_engine=8, bundle_offset=0),), view)
+
+
+def test_placement_binding_rejects_repeated_or_out_of_range_bundles():
+    planner = PlacementPlanner()
+
+    with pytest.raises(ValueError, match="repeats a bundle"):
+        planner.plan(
+            (_request(num_gpus=2, num_gpus_per_engine=1),), _bound_view(_node("a", range(2)), bundle_indices=(0, 0))
+        )
+    with pytest.raises(ValueError, match="outside"):
+        planner.plan(
+            (_request(num_gpus=2, num_gpus_per_engine=1),),
+            _bound_view(_node("a", range(2)), bundle_indices=(0, 2), bundle_count=2),
+        )
+
+
+def test_placement_binding_rejects_a_bad_layout_in_a_dry_run_too():
+    planner = PlacementPlanner()
+    view = _bound_view(_node("node-a", range(3)) + _node("node-b", range(5)))
+
+    with pytest.raises(ValueError, match="spans nodes"):
+        planner.plan((_request(num_gpus=8, num_gpus_per_engine=2, bundle_offset=0),), view, dry_run=True)
+
+
+def test_placement_binding_ignores_a_placeholder_region():
+    planner = PlacementPlanner()
+    view = _bound_view(_node("node-a", range(3)) + _node("node-b", range(5)))
+
+    (slice_,) = planner.plan((_request(num_gpus=4, num_gpus_per_engine=2, bundle_offset=0, active=False),), view)
+
+    assert slice_.referenced_offsets == ()
+
+
+def test_placement_view_from_binding_carries_node_identity():
+    from relax.engine.inference.placement import PlacementBinding
+
+    pg = _FakePlacementGroup("probed")
+    pg.bundle_count = 2
+    binding = PlacementBinding(pg, (1, 0), (0, 1), ("node-a", "node-a"))
+
+    view = PlacementGroupView.from_binding(binding, PlacementOwner.MANAGER)
+
+    assert (view.bundle_indices, view.gpu_ids, view.node_ids, view.bundle_count) == (
+        (1, 0),
+        (0, 1),
+        ("node-a",) * 2,
+        2,
+    )
+    assert view.key == "pg:probed"
+    assert PlacementBinding.coerce((pg, [0], [3])) == PlacementBinding(pg, (0,), (3,), None)
