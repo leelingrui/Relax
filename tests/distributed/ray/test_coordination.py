@@ -740,13 +740,13 @@ class TestLegacyDiscoveryContract:
         manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
 
         def snapshot():
-            return manager.inference_manager.snapshot(Role.ROLLOUT)
+            return manager.owner.snapshot(Role.ROLLOUT)
 
-        manager.refresh_inference_state()
+        manager.owner.refresh(Role.ROLLOUT, "default")
         initial = snapshot()
         group.all_engines[1] = _observed_engine("http://node-b:30000")
         assert snapshot() == initial
-        manager.refresh_inference_state()
+        manager.owner.refresh(Role.ROLLOUT, "default")
         updated = snapshot()
 
         assert updated.topology_revision > initial.topology_revision

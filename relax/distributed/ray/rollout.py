@@ -40,7 +40,14 @@ from relax.engine.inference.placement import (
     PlacementRequest,
     PlacementSlice,
 )
-from relax.engine.inference.types import LifecycleState, ModelSnapshot, ReplicaSnapshot, Role, WeightSource
+from relax.engine.inference.types import (
+    LifecycleState,
+    ModelSnapshot,
+    ReplicaSnapshot,
+    Role,
+    TopologyEvents,
+    WeightSource,
+)
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
 from relax.utils.env import Envs
@@ -651,9 +658,6 @@ class RolloutServer:
     router_port: int | None = None
     model_name: str = "default"
     model_spec: InferenceModelSpec | None = None
-    # Whether the rollout pool lets this model serve: false while offloaded,
-    # restoring or replacing policy weights. Static models leave it unset.
-    ready_gate: Callable[[], bool] | None = dataclasses.field(default=None, repr=False)
     # A static-weight pool (GenRM, Teacher) retires engines that die during a
     # memory transition and rebuilds them on onload; rollout relies on its
     # health monitor and the training-side weight sync instead.
@@ -931,15 +935,17 @@ class RolloutServer:
         if failure is not None:
             raise failure
 
-    def observe(self) -> ModelSnapshot:
+    def observe(self, serving: bool = True) -> ModelSnapshot:
         """Observe replica health, Router registration and weight versions.
 
         A replica is READY only with a healthy server registered at the Router
         (and, for policy weights, a real weight version); PD prefill/decode
         workers fold into one Router-backed service replica and are reported
-        separately for diagnosis.
+        separately for diagnosis. ``serving`` is the manager's verdict on
+        whether the model may serve; without it nothing is READY and no engine
+        is registered at the Router.
         """
-        serving = self.onloaded and (self.ready_gate is None or self.ready_gate())
+        serving = self.onloaded and serving
         policy = self.model_spec is None or self.model_spec.needs_weight_update
         replicas = []
         router_members_ready = True
@@ -1028,21 +1034,28 @@ class RolloutEnginePool:
     _SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS
     _WEIGHT_SYNC_MAX_INIT_ATTEMPTS = Envs.RELAX_WEIGHT_SYNC_MAX_INIT_ATTEMPTS
 
-    def __init__(self, args, pg, *, inference_manager: Any, startup_leftovers: dict | None = None):
-        """Create the rollout engines inside the task's inference manager and
-        register them there; its placement ledger is the only one.
+    def __init__(
+        self,
+        args,
+        pg,
+        *,
+        planner: PlacementPlanner,
+        events: TopologyEvents,
+        startup_leftovers: dict | None = None,
+    ):
+        """Create the rollout engines in the task's placement ledger, the only
+        one; the inference manager registers ``servers`` once this returns.
 
-        ``startup_leftovers`` receives what a failed startup could not stop;
-        see ``start_servers``.
+        ``events`` receives every change to the engines; the pool never calls
+        the manager. ``startup_leftovers`` receives what a failed startup could
+        not stop; see ``start_servers``.
         """
         self.pg = pg
         self.args = args
-        self.inference_manager = inference_manager
-        self._planner = inference_manager.placement
-        self._inference_sync_pending = False
+        self._planner = planner
+        self._events = events
         self._training_weight_updating = False
         self._scale_out_weight_updating = False
-        self.status = None
         self._engine_lifecycle_lock = threading.RLock()
         # Scale-out replicas whose rollback could not confirm their engines
         # stopped: (group, planned slice, placement group). Their slice and
@@ -1053,22 +1066,26 @@ class RolloutEnginePool:
         self._stranded_lock = threading.Lock()
         self._stranded_retry_stop = threading.Event()
         self._stranded_retry_thread: threading.Thread | None = None
+        # Created before the engines start: once they run, nothing here may
+        # fail, or the manager would never learn of them.
+        self.rollout_engine_lock = Lock.options(
+            **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
+        ).remote()
+        # Distributed mutex shared with the Actor process to ensure DCS weight
+        # sync (update_weights_fully_async) and sglang remote instance weight sync
+        # (_sync_weights_from_seed_engine) never run concurrently.
+        # Both paths use the seed engine's NCCL stack and cannot overlap.
+        self._weight_sync_lock = Lock.options(
+            **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
+        ).remote()
         if self.args.debug_train_only:
             self.servers: dict[str, RolloutServer] = {}
         else:
             init_http_client(args)
             self.servers = start_rollout_servers(args, pg, planner=self._planner, leftovers=startup_leftovers)
         for name, server in self.servers.items():
-            server.ready_gate = self._serving
             for group in server.engine_groups:
-                group.on_topology_change = lambda name=name: self.inference_manager.set_state(
-                    Role.ROLLOUT, name, LifecycleState.STARTING
-                )
-        if self.servers:
-            self.inference_manager.register(Role.ROLLOUT, self.servers)
-        self.rollout_engine_lock = Lock.options(
-            **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
-        ).remote()
+                group.on_topology_change = lambda name=name: self._events.changed(name)
         existing_groups = [group for srv in self.servers.values() for group in srv.engine_groups]
         self._next_engine_rank = max(
             (group.rank_offset + len(group.all_engines) for group in existing_groups),
@@ -1092,13 +1109,6 @@ class RolloutEnginePool:
 
         # Elastic scale-in tracking
         self._scale_in_requests: dict[str, ScaleInRequest] = {}
-        # Distributed mutex shared with the Actor process to ensure DCS weight
-        # sync (update_weights_fully_async) and sglang remote instance weight sync
-        # (_sync_weights_from_seed_engine) never run concurrently.
-        # Both paths use the seed engine's NCCL stack and cannot overlap.
-        self._weight_sync_lock = Lock.options(
-            **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
-        ).remote()
 
         # GC config: max terminal requests to keep per dict
         self._max_terminal_requests = 100
@@ -1116,16 +1126,6 @@ class RolloutEnginePool:
     def _release_placement(self, placement):
         return self._planner.release(placement)
 
-    def _serving(self) -> bool:
-        """Whether rollout may admit requests: onloaded, with current policy
-        weights."""
-        return (
-            self.status not in ("offload", "onloading")
-            and not self._is_weight_updating
-            and not self._inference_sync_pending
-            and not self.args.debug_train_only
-        )
-
     def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
         """Allocate ranks monotonically so a removed elastic rank is not
         reused."""
@@ -1138,6 +1138,16 @@ class RolloutEnginePool:
     def _is_weight_updating(self) -> bool:
         with self._engine_lifecycle_lock:
             return self._training_weight_updating or self._scale_out_weight_updating
+
+    def weights_changing(self) -> bool:
+        """Whether a weight update holds the topology lease or a scale-out is
+        syncing new engines; the manager keeps rollout closed meanwhile."""
+        return self._is_weight_updating
+
+    def _topology_settled(self) -> None:
+        """Report that the engines changed; the manager observes them again."""
+        for name in self.servers:
+            self._events.settled(name)
 
     def inject_ci_fault(self):
         """Try to inject fault during generate (when health monitor is
@@ -1208,44 +1218,6 @@ class RolloutEnginePool:
         lock around update_weights_fully_async.
         """
         return self._weight_sync_lock
-
-    def offload_local(self):
-        """Release every rollout model; ``InferenceManager.deactivate`` calls
-        it."""
-        if self.status == "offload":
-            logger.info("Rollout already offloaded; skipping")
-            return
-        self.health_monitoring_pause()
-        for name in self.servers:
-            self.inference_manager.deactivate(Role.ROLLOUT, name)
-        self.status = "offload"
-
-    def onload_local(self, tags: list[str] | None = None):
-        """Load every rollout model; ``InferenceManager.activate`` calls it."""
-        self.status = "onloading"
-        for name in self.servers:
-            self.inference_manager.activate(Role.ROLLOUT, name, tags)
-        # Generation is back once its KV cache is; a weights-only onload stays
-        # "onloading" until the weight sync is followed by the KV onload.
-        if tags is None or GPU_MEMORY_TYPE_KV_CACHE in tags:
-            self.status = "onload"
-            self.refresh_inference_state()
-
-    def get_status(self):
-        return self.status
-
-    def recover_rollout_engines(self, model_name: str | None = None, *, rollout_started: bool = True):
-        """Restart any dead rollout engines and update num_new_engines for
-        update_weights detection.
-
-        ``rollout_started`` is false before the first ``generate`` pass, when a
-        recovery would only race the initial bring-up.
-        """
-        self.health_monitoring_pause()
-        srv = self._get_server(model_name)
-        if rollout_started and srv is not None:
-            self.inference_manager.recover(Role.ROLLOUT, srv.model_name)
-        return self.get_rollout_engines_and_lock(model_name)
 
     def clear_num_new_engines(self, model_name: str | None = None):
         # when fault tolerance is not enabled, we need to manually clear num_new_engines after update_weights
@@ -2322,13 +2294,11 @@ class RolloutEnginePool:
 
         # Step 6: Add to server
         srv.engine_groups.append(engine_group)
-        engine_group.on_topology_change = lambda name=request.model_name: self.inference_manager.set_state(
-            Role.ROLLOUT, name, LifecycleState.STARTING
-        )
+        engine_group.on_topology_change = lambda name=request.model_name: self._events.changed(name)
         engine_group.num_new_engines = 0
 
         # Step 7: Register health monitor
-        if self.inference_manager.model_spec(Role.ROLLOUT, request.model_name).fault_tolerance_enabled:
+        if srv.model_spec is not None and srv.model_spec.fault_tolerance_enabled:
             monitor = RolloutHealthMonitor(engine_group, self.args)
             monitor.start()
             self._health_monitors.append(monitor)
@@ -2338,7 +2308,7 @@ class RolloutEnginePool:
             f"Total engine_groups: {len(srv.engine_groups)}, "
             f"total engines: {sum(len(g.all_engines) for g in srv.engine_groups)}"
         )
-        await asyncio.to_thread(self.refresh_inference_state)
+        self._topology_settled()
         return EngineFinalizeResult(True, group=engine_group)
 
     def _update_scale_out_final_status(
@@ -3404,22 +3374,6 @@ class RolloutEnginePool:
 
         return result
 
-    def invalidate_inference_state(self) -> None:
-        """Close admission before backend-owned policy weight transactions."""
-        self._inference_sync_pending = True
-        for name in self.servers:
-            self.inference_manager.set_state(Role.ROLLOUT, name, LifecycleState.STARTING)
-
-    def complete_inference_weight_update(self) -> None:
-        """Called only after a backend-owned weight transaction succeeds."""
-        self._inference_sync_pending = False
-        self.refresh_inference_state()
-
-    def refresh_inference_state(self) -> None:
-        """Publish observed health, registration and policy versions."""
-        for name in self.servers:
-            self.inference_manager.refresh(Role.ROLLOUT, name)
-
     def list_all_scale_out_requests(
         self, model_name: Optional[str] = None, status_filter: Optional[str] = None
     ) -> list[dict]:
@@ -3608,12 +3562,6 @@ class RolloutEnginePool:
             ):
                 return False
             self._training_weight_updating = is_updating
-            if is_updating:
-                # Close admission now rather than at the next refresh: the
-                # window in between would route requests at engines whose
-                # weights are being replaced.
-                for name in self.servers:
-                    self.inference_manager.set_state(Role.ROLLOUT, name, LifecycleState.STARTING)
             return True
 
     async def sync_weights_for_scaled_out_engines(
@@ -4189,7 +4137,7 @@ class RolloutEnginePool:
             for node0_idx in list(group.router_removed):
                 if group.engines[node0_idx] is None:
                     del group.router_removed[node0_idx]
-        await asyncio.to_thread(self.refresh_inference_state)
+        self._topology_settled()
         return not kept
 
     async def _remove_engine(self, group, node0_idx: int, shutdown_timeout: float) -> None:
@@ -4240,7 +4188,7 @@ class RolloutEnginePool:
                 group.lifecycle_status = EngineGroupLifecycle.REMOVED
 
         if groups_to_remove:
-            self.refresh_inference_state()
+            self._topology_settled()
             logger.info(f"[ScaleIn] Cleaned up {len(groups_to_remove)} empty engine groups")
 
     def get_scale_in_status(self, request_id: str) -> Optional[dict]:

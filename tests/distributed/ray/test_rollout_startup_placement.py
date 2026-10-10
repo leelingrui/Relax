@@ -584,7 +584,7 @@ def test_manager_rollout_start_keeps_engines_it_could_not_stop(monkeypatch):
     )
 
     class _FailingPool:
-        def __init__(self, args, pg, *, inference_manager, startup_leftovers):
+        def __init__(self, args, pg, *, planner, events, startup_leftovers):
             startup_leftovers["default"] = stuck
             raise RuntimeError("engine bring-up failed")
 

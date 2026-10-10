@@ -3,8 +3,9 @@
 import asyncio
 import sys
 import threading
+import time
 from functools import partial
-from types import MethodType, ModuleType, SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -35,15 +36,20 @@ class FakePool:
         self.version = version
         self.calls: list[str] = []
 
-    def observe(self) -> ModelSnapshot:
-        state = LifecycleState.READY if self.onloaded else LifecycleState.SLEEPING
+    def observe(self, serving: bool = True) -> ModelSnapshot:
+        self.serving = serving
+        state = (
+            LifecycleState.READY
+            if self.onloaded and serving
+            else (LifecycleState.STARTING if self.onloaded else LifecycleState.SLEEPING)
+        )
         replica = ReplicaSnapshot(f"{self.model_spec.name}/replica-0", state, "http://engine-0", self.version)
         return ModelSnapshot(
             self.model_spec.name,
             (replica,),
             "http://router" if self.model_spec.needs_router else None,
             state,
-            admission=self.onloaded,
+            admission=state == LifecycleState.READY,
             required_weight_version=self.version,
         )
 
@@ -284,8 +290,8 @@ def test_manager_drops_an_observation_that_spans_offload_and_onload() -> None:
     def late_refresh() -> tuple[threading.Thread, threading.Event]:
         taken, land = threading.Event(), threading.Event()
 
-        def slow_observe() -> ModelSnapshot:
-            snapshot = observe()
+        def slow_observe(serving: bool = True) -> ModelSnapshot:
+            snapshot = observe(serving)
             taken.set()
             land.wait(5.0)
             return snapshot
@@ -538,17 +544,14 @@ def test_manager_rollout_offload_waits_for_a_request_admitted_by_the_gateway() -
     from starlette.responses import Response
 
     from relax.components.inference_gateway import InferenceGateway
-    from relax.distributed.ray.rollout import RolloutEnginePool
 
     manager, pools = _shared()
     policy = pools["rollout"]
     manager.activate(Role.ROLLOUT, "policy")
-    # The rollout service offloads through the real pool hook, over fake engines.
-    rollout_pool = SimpleNamespace(
-        status="onload", servers={"policy": None}, inference_manager=manager, health_monitoring_pause=lambda: None
+    paused = []
+    manager._rollout_pool = SimpleNamespace(
+        health_monitoring_pause=lambda: paused.append(True), weights_changing=lambda: False
     )
-    rollout_pool.offload_local = MethodType(RolloutEnginePool.offload_local, rollout_pool)
-    manager._rollout_pool = rollout_pool
     handle = SimpleNamespace(
         **{
             name: SimpleNamespace(remote=partial(asyncio.to_thread, getattr(manager, name)))
@@ -594,7 +597,7 @@ def test_manager_rollout_offload_waits_for_a_request_admitted_by_the_gateway() -
 
     asyncio.run(scenario())
     assert manager.snapshot(Role.ROLLOUT).models[0].state == LifecycleState.SLEEPING
-    assert manager.rollout_released() and rollout_pool.status == "offload"
+    assert manager.rollout_released() and paused == [True]
 
 
 def test_manager_gateway_retries_with_one_request_id_each_hold_the_drain() -> None:
@@ -1136,3 +1139,244 @@ def test_manager_model_activate_releases_the_model_when_its_load_fails() -> None
     assert not manager.resident(Role.GENRM)
     manager.lifecycle.switch([], [Role.TEACHER], timeout=0.01)
     assert pools["teacher"].onloaded
+
+
+class FakeEnginePool:
+    """The rollout engine pool primitives the Manager calls; none calls
+    back."""
+
+    def __init__(self) -> None:
+        self.fenced = False
+        self.lease_refused = False
+        self.calls: list[str] = []
+
+    def weights_changing(self) -> bool:
+        return self.fenced
+
+    def health_monitoring_pause(self) -> None:
+        self.calls.append("pause")
+
+    def set_weight_updating(self, is_updating: bool) -> bool:
+        self.calls.append(f"lease={is_updating}")
+        return not (is_updating and self.lease_refused)
+
+    def get_rollout_engines_and_lock(self, model_name=None):
+        return model_name
+
+
+def _rollout_role(*names: str) -> tuple[InferenceManager, FakeEnginePool, dict[str, FakePool]]:
+    """A Manager owning a rollout role of resident-free, sleeping models."""
+    pools = {name: FakePool(name, version="1") for name in names}
+    for pool in pools.values():
+        pool.onloaded = False
+    manager = _manager(rollout=pools)
+    engine_pool = FakeEnginePool()
+    manager._rollout_pool = engine_pool
+    for name in names:
+        manager._model(Role.ROLLOUT, name).resident = False
+    return manager, engine_pool, pools
+
+
+def _state(manager: InferenceManager, name: str = "policy") -> ModelSnapshot:
+    return next(model for model in manager.snapshot(Role.ROLLOUT).models if model.model_id == name)
+
+
+def _no_reentry(manager: InferenceManager) -> list[str]:
+    """Record every activate/deactivate entry; no pool may add one."""
+    calls: list[str] = []
+    for method in ("activate", "deactivate"):
+        original = getattr(manager, method)
+
+        def wrapper(*args, _original=original, _method=method, **kwargs):
+            calls.append(_method)
+            return _original(*args, **kwargs)
+
+        setattr(manager, method, wrapper)
+    return calls
+
+
+def test_manager_rollout_staged_onload_publishes_ready_only_with_kv_cache() -> None:
+    manager, _, pools = _rollout_role("policy", "draft")
+    calls = _no_reentry(manager)
+
+    manager.activate(Role.ROLLOUT, tags=["weights"])
+    for name, pool in pools.items():
+        assert pool.calls == ["onload"] and not pool.serving
+        assert _state(manager, name).state == LifecycleState.STARTING and not _state(manager, name).admission
+    with pytest.raises(RuntimeError, match="not ready"):
+        manager.admit_request(Role.ROLLOUT, "policy")
+
+    manager.activate(Role.ROLLOUT, tags=["kv_cache", "cuda_graph"])
+    for name, pool in pools.items():
+        assert pool.calls == ["onload", "onload"]
+        model = _state(manager, name)
+        assert (model.state, model.admission, model.required_weight_version) == (LifecycleState.READY, True, "1")
+    assert calls == ["activate", "activate"]
+
+
+def test_manager_rollout_activating_ready_models_does_not_load_again() -> None:
+    manager, _, pools = _rollout_role("policy")
+    manager.activate(Role.ROLLOUT)
+    manager.activate(Role.ROLLOUT)
+    manager.activate(Role.ROLLOUT, "policy", ["weights"])
+    assert pools["policy"].calls == ["onload"]
+    assert _state(manager).state == LifecycleState.READY
+
+
+def test_manager_rollout_partial_onload_failure_releases_what_it_loaded() -> None:
+    manager, _, pools = _rollout_role("policy", "draft")
+
+    def fail(tags=None):
+        pools["draft"].calls.append("onload")
+        raise RuntimeError("onload failed")
+
+    pools["draft"].onload = fail
+    with pytest.raises(RuntimeError, match="onload failed"):
+        manager.activate(Role.ROLLOUT)
+
+    assert pools["policy"].calls == ["onload", "offload"]
+    assert pools["draft"].calls == ["onload", "offload"]
+    assert not manager.resident(Role.ROLLOUT)
+    for model in manager.snapshot(Role.ROLLOUT).models:
+        assert model.state == LifecycleState.SLEEPING and not model.admission
+
+
+def test_manager_rollout_repeated_deactivate_and_activate_are_idempotent() -> None:
+    manager, engine_pool, pools = _rollout_role("policy", "draft")
+    calls = _no_reentry(manager)
+    manager.activate(Role.ROLLOUT)
+
+    manager.deactivate(Role.ROLLOUT)
+    manager.deactivate(Role.ROLLOUT)
+    assert engine_pool.calls == ["pause", "pause"]
+    for pool in pools.values():
+        assert pool.calls == ["onload", "offload"]
+    assert not manager.resident(Role.ROLLOUT)
+
+    manager.activate(Role.ROLLOUT)
+    manager.activate(Role.ROLLOUT)
+    for pool in pools.values():
+        assert pool.calls == ["onload", "offload", "onload"]
+    assert all(model.state == LifecycleState.READY for model in manager.snapshot(Role.ROLLOUT).models)
+    assert len(calls) == 5
+
+
+def test_manager_rollout_release_goes_by_what_each_model_holds() -> None:
+    manager, _, pools = _rollout_role("policy")
+    manager.activate(Role.ROLLOUT)
+    manager.deactivate(Role.ROLLOUT)
+    manager.activate(Role.ROLLOUT, "policy")
+    assert _state(manager).state == LifecycleState.READY
+
+    manager.deactivate(Role.ROLLOUT)
+    assert pools["policy"].calls == ["onload", "offload", "onload", "offload"]
+    assert not manager.resident(Role.ROLLOUT)
+
+
+def test_manager_backend_weight_update_closes_admission_until_it_ends() -> None:
+    manager, _, pools = _rollout_role("policy")
+    manager.activate(Role.ROLLOUT)
+    observe = pools["policy"].observe
+    taken, land = threading.Event(), threading.Event()
+
+    def slow_observe(serving: bool = True) -> ModelSnapshot:
+        snapshot = observe(serving)
+        taken.set()
+        land.wait(5.0)
+        return snapshot
+
+    # A READY observation taken before the update starts lands during it.
+    pools["policy"].observe = slow_observe
+    late = threading.Thread(target=manager.refresh, args=(Role.ROLLOUT, "policy"))
+    late.start()
+    assert taken.wait(5.0)
+    pools["policy"].observe = observe
+    assert manager.begin_weight_update(Role.ROLLOUT, inference_manager.WEIGHT_UPDATE_BACKEND)
+    land.set()
+    late.join(5.0)
+    assert _state(manager).state == LifecycleState.STARTING
+    with pytest.raises(RuntimeError, match="not ready"):
+        manager.admit_request(Role.ROLLOUT, "policy")
+
+    # Neither an observation nor a full reload reopens it meanwhile.
+    manager.refresh(Role.ROLLOUT, "policy")
+    manager.deactivate(Role.ROLLOUT)
+    manager.activate(Role.ROLLOUT)
+    assert _state(manager).state == LifecycleState.STARTING and not pools["policy"].serving
+
+    pools["policy"].version = "2"
+    manager.end_weight_update(Role.ROLLOUT, inference_manager.WEIGHT_UPDATE_BACKEND)
+    model = _state(manager)
+    assert (model.state, model.required_weight_version) == (LifecycleState.READY, "2")
+    # Idempotent.
+    manager.end_weight_update(Role.ROLLOUT, inference_manager.WEIGHT_UPDATE_BACKEND)
+    assert _state(manager).state == LifecycleState.READY
+
+
+def test_manager_fully_async_weight_update_takes_the_pool_lease() -> None:
+    manager, engine_pool, _ = _rollout_role("policy")
+    manager.activate(Role.ROLLOUT)
+    engine_pool.lease_refused = True
+    assert not manager.begin_weight_update(Role.ROLLOUT, inference_manager.WEIGHT_UPDATE_FULLY_ASYNC)
+    assert _state(manager).state == LifecycleState.READY
+
+    engine_pool.lease_refused = False
+    assert manager.begin_weight_update(Role.ROLLOUT, inference_manager.WEIGHT_UPDATE_FULLY_ASYNC)
+    assert _state(manager).state == LifecycleState.STARTING
+    manager.end_weight_update(Role.ROLLOUT, inference_manager.WEIGHT_UPDATE_FULLY_ASYNC)
+    assert engine_pool.calls == ["lease=True", "lease=True", "lease=False"]
+    assert _state(manager).state == LifecycleState.READY
+
+
+def test_manager_keeps_rollout_closed_while_the_pool_syncs_new_engines() -> None:
+    manager, engine_pool, pools = _rollout_role("policy")
+    manager.activate(Role.ROLLOUT)
+    engine_pool.fenced = True
+    manager.refresh(Role.ROLLOUT, "policy")
+    assert _state(manager).state == LifecycleState.STARTING and not pools["policy"].serving
+    engine_pool.fenced = False
+    manager.refresh(Role.ROLLOUT, "policy")
+    assert _state(manager).state == LifecycleState.READY
+
+
+def test_manager_topology_events_only_record_and_the_manager_observes() -> None:
+    manager, _, pools = _rollout_role("policy")
+    manager.activate(Role.ROLLOUT)
+    events = manager.topology_events(Role.ROLLOUT)
+    observed = threading.Event()
+    observe = pools["policy"].observe
+
+    def watched(serving: bool = True) -> ModelSnapshot:
+        snapshot = observe(serving)
+        observed.set()
+        return snapshot
+
+    pools["policy"].observe = watched
+    events.changed("policy")
+    assert _state(manager).state == LifecycleState.STARTING and not observed.is_set()
+    # Events of a model the Manager does not hold yet are ignored.
+    events.changed("unregistered")
+    events.settled("unregistered")
+
+    events.settled("policy")
+    assert observed.wait(5.0)
+    deadline = time.monotonic() + 5.0
+    while _state(manager).state != LifecycleState.READY and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert _state(manager).state == LifecycleState.READY
+
+
+def test_manager_rollout_operation_observes_what_the_operation_changed() -> None:
+    manager, engine_pool, pools = _rollout_role("policy")
+    manager.activate(Role.ROLLOUT)
+    events = manager.topology_events(Role.ROLLOUT)
+    manager._refresher = threading.current_thread()  # Keep the refresher thread out of it.
+
+    def scale(model_name):
+        events.changed(model_name)
+        events.settled(model_name)
+        return "done"
+
+    engine_pool.execute_scale_out = scale
+    assert manager.rollout_operation("execute_scale_out", "policy") == "done"
+    assert _state(manager).state == LifecycleState.READY

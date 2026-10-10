@@ -286,17 +286,22 @@ def create_test_manager(args=None, servers=None):
     from relax.engine.inference.config import InferenceModelSpec
     from relax.engine.inference.types import Role
 
-    manager.status = None
-    manager._inference_sync_pending = False
-    manager.inference_manager = InferenceManager()
-    manager._planner = manager.inference_manager.placement
+    # The Manager owning this pool, kept for tests; the pool itself only
+    # reports to its events.
+    owner = InferenceManager()
+    # Tests observe settled changes through owner._refresh_stale(), not the
+    # background refresher.
+    owner._refresher = threading.current_thread()
+    manager.owner = owner
+    manager._planner = owner.placement
+    manager._events = owner.topology_events(Role.ROLLOUT)
     for name, server in manager.servers.items():
         server.model_name = name
         server.model_spec = server.model_spec or InferenceModelSpec(name, "test-checkpoint", elastic_enabled=True)
-        server.ready_gate = manager._serving
     if manager.servers:
         with patch.object(ray, "get", mock_ray_get):
-            manager.inference_manager.register(Role.ROLLOUT, manager.servers)
+            owner.register(Role.ROLLOUT, manager.servers)
+    owner._rollout_pool = manager
     return manager
 
 

@@ -56,10 +56,11 @@ def _raise_dead(*_args, **_kwargs):
 class _ManagerStub:
     def __init__(self, set_weight_updating_fn=None, health_monitoring_pause_fn=None):
         self.health_monitoring_pause = _RemoteStub(health_monitoring_pause_fn or (lambda *a, **k: _ok()))
-        self.set_weight_updating = _RemoteStub(set_weight_updating_fn or (lambda *a, **k: _prepared()))
-        # ``end_update_weight`` re-observes health / Router / weight versions
-        # after releasing the lease, because the lease alone is not evidence.
-        self.refresh_inference_state = _RemoteStub(lambda *a, **k: _ok())
+        set_weight_updating = set_weight_updating_fn or (lambda *a, **k: _prepared())
+        # The manager takes the pool lease on begin and releases it, then
+        # re-observes the role, on end.
+        self.begin_weight_update = _RemoteStub(lambda role, source: set_weight_updating(True))
+        self.end_weight_update = _RemoteStub(lambda role, source: set_weight_updating(False))
         self.rollout_operation = _RemoteStub(lambda method, *a, **k: getattr(self, method).remote(*a, **k))
 
 

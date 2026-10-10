@@ -20,6 +20,7 @@ if HAS_DEPS:
     import ray
 
     from relax.backends.sglang.sglang_engine import EngineMemoryStateUnknown
+    from relax.distributed.ray.inference_manager import WEIGHT_UPDATE_BACKEND
     from relax.engine.inference.config import InferenceModelSpec
     from relax.engine.inference.types import LifecycleState, Role, WeightSource
 
@@ -37,14 +38,13 @@ def _observed_engine(version: str | None = "v1", **overrides: Any) -> Any:
 
 def _pool(groups: list[Any]) -> Any:
     pool = create_test_manager(servers={"default": make_rollout_server(engine_groups=groups)})
-    pool.status = "onload"
     pool.rollout_engine_lock = MagicMock()
     return pool
 
 
 def _model(pool: Any) -> Any:
-    pool.refresh_inference_state()
-    return pool.inference_manager.snapshot(Role.ROLLOUT).models[0]
+    pool.owner.refresh(Role.ROLLOUT, "default")
+    return pool.owner.snapshot(Role.ROLLOUT).models[0]
 
 
 @pytest.mark.parametrize("version", [None, "", "default"])
@@ -70,10 +70,10 @@ def test_rollout_observe_mixed_versions_block_admission(patch_ray_get: Any) -> N
 def test_rollout_weight_update_closes_admission_until_completion(patch_ray_get: Any) -> None:
     pool = _pool([make_engine_group(engines=[_observed_engine("v1")])])
     assert _model(pool).admission
-    pool.invalidate_inference_state()
+    pool.owner.begin_weight_update(Role.ROLLOUT, WEIGHT_UPDATE_BACKEND)
     assert not _model(pool).admission
-    pool.complete_inference_weight_update()
-    assert pool.inference_manager.snapshot(Role.ROLLOUT).models[0].admission
+    pool.owner.end_weight_update(Role.ROLLOUT, WEIGHT_UPDATE_BACKEND)
+    assert pool.owner.snapshot(Role.ROLLOUT).models[0].admission
 
 
 @pytest.mark.parametrize("decode_version,ready", [("v1", True), ("v2", False)])

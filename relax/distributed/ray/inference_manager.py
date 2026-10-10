@@ -17,7 +17,14 @@ running in the same process; training and scoring code reach it through
 An engine pool is a :class:`~relax.distributed.ray.rollout.RolloutServer`: it
 exposes ``onload``/``offload``/``recover``/``health_check``/``shutdown`` and
 reports its state with ``observe``. The Manager serializes lifecycle calls per
-model and is the only writer of the published snapshots.
+model and is the only writer of the published snapshots. Calls go one way,
+Manager to pool: a pool never calls into the Manager, and reports changes to
+its engines only through :class:`~relax.engine.inference.types.TopologyEvents`,
+which records them for the Manager to act on.
+
+Whether a model may serve is the Manager's to decide: its KV cache must be
+loaded and no weight update of its role may be running. A pool observes its
+engines with that verdict and never publishes READY on its own.
 
 Handing shared GPUs over takes two separate proofs. An empty request ledger
 proves that every caller has let go; it says nothing about the engines, which
@@ -33,7 +40,7 @@ import time
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from threading import Condition, RLock
+from threading import Condition, RLock, Thread
 from typing import Any
 from uuid import uuid4
 
@@ -60,11 +67,18 @@ from relax.engine.inference.types import (
     Role,
     RoleSnapshot,
     RoutingSpec,
+    TopologyEvents,
 )
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+# Weight updates that close a role's admission until they end; see
+# ``begin_weight_update``. A backend update replaces the weights in place; a
+# fully-async update also takes the rollout pool's topology lease.
+WEIGHT_UPDATE_BACKEND = "backend"
+WEIGHT_UPDATE_FULLY_ASYNC = "fully_async"
 
 # How long a shutdown lets admitted requests finish before aborting them and
 # stopping the engines.
@@ -122,6 +136,9 @@ class _Model:
     # runs, such a model still holds everything it loaded, so reactivating it
     # only reopens admission instead of loading again.
     drained_ready: bool = False
+    # Whether the loaded memory lets the model serve: false after a load
+    # without the KV cache, until a load with it.
+    memory_ready: bool = True
     # Bumped on every lifecycle transition; an observation taken before one is
     # stale and dropped.
     generation: int = 0
@@ -163,6 +180,13 @@ class InferenceManager:
         # Roles registered only with the models a failed ``create_role`` could
         # not stop; creating the role again stops them first.
         self._failed_starts: set[Role] = set()
+        # Running weight updates per role; see ``begin_weight_update``.
+        self._weight_updates: dict[Role, set[str]] = {}
+        # Models whose engines a pool reported settled, awaiting an
+        # observation by the refresher thread.
+        self._stale: set[tuple[Role, str]] = set()
+        self._stale_added = Condition(self._lock)
+        self._refresher: Thread | None = None
         self.lifecycle = LifecycleCoordinator(self)
 
     # ------------------------------------------------------------------
@@ -322,16 +346,84 @@ class InferenceManager:
 
     def _observe(self, role: Role, model_id: str) -> None:
         """Publish the pool's observation unless a lifecycle transition ran
-        while it was taken."""
+        while it was taken.
+
+        The pool observes with the Manager's verdict on whether the model may
+        serve, and a READY observation is held back if that verdict changed
+        meanwhile.
+        """
         entry = self._model(role, model_id)
+        fenced = self._pool_fenced(role)
         with self._lock:
             generation = entry.generation
-        model = entry.pool.observe()
+            serving = self._may_serve(role, entry) and not fenced
+        model = entry.pool.observe(serving=serving)
+        fenced = self._pool_fenced(role)
         with self._lock:
             if entry.generation != generation:
                 logger.info(f"Dropping a stale observation of {role.value}/{model_id}")
                 return
+            if model.state == LifecycleState.READY and (fenced or not self._may_serve(role, entry)):
+                model = _with_state(model, LifecycleState.STARTING)
             self.publish(role, model)
+
+    def _may_serve(self, role: Role, entry: _Model) -> bool:
+        """The Manager's verdict on admission: KV cache loaded, no weight
+        update of the role running.
+
+        Call under the lock.
+        """
+        return entry.memory_ready and not self._weight_updates.get(role)
+
+    def _pool_fenced(self, role: Role) -> bool:
+        """Whether the rollout pool is replacing weights on its own (a scale-
+        out syncing new engines).
+
+        Call without the lock: the pool takes its own.
+        """
+        return role is Role.ROLLOUT and self._rollout_pool is not None and self._rollout_pool.weights_changing()
+
+    # ------------------------------------------------------------------
+    # Pool topology events; see TopologyEvents.
+    # ------------------------------------------------------------------
+
+    def topology_events(self, role: Role | str) -> TopologyEvents:
+        """The events a pool of ``role`` reports to; they only record."""
+        return _RoleEvents(self, Role(role))
+
+    def _topology_changed(self, role: Role, model_id: str) -> None:
+        """Close admission at once; an observation reopens it."""
+        with self._lock:
+            if model_id in self._models.get(role, {}):
+                self.set_state(role, model_id, LifecycleState.STARTING)
+
+    def _topology_settled(self, role: Role, model_id: str) -> None:
+        """Queue an observation for the refresher thread."""
+        with self._lock:
+            if model_id not in self._models.get(role, {}):
+                return
+            self._stale.add((role, model_id))
+            self._stale_added.notify_all()
+            if self._refresher is None:
+                self._refresher = Thread(target=self._refresh_loop, name="inference-refresher", daemon=True)
+                self._refresher.start()
+
+    def _refresh_loop(self) -> None:
+        while True:
+            with self._lock:
+                while not self._stale:
+                    self._stale_added.wait()
+            self._refresh_stale()
+
+    def _refresh_stale(self) -> None:
+        """Observe every model a pool reported settled."""
+        with self._lock:
+            stale, self._stale = self._stale, set()
+        for role, model_id in sorted(stale):
+            try:
+                self._observe(role, model_id)
+            except Exception as exc:
+                logger.warning(f"Failed to observe {role.value}/{model_id} after a topology change: {exc!r}")
 
     # ------------------------------------------------------------------
     # Request admission.
@@ -466,15 +558,8 @@ class InferenceManager:
             model_ids = self.model_ids(role) if model_id is None else (model_id,)
             loading = [name for name in model_ids if not self._model(role, name).resident]
             try:
-                if model_id is not None:
-                    self._activate_model(role, model_id, tags)
-                elif role is Role.ROLLOUT and self._rollout_pool is not None:
-                    # The rollout pool tracks its own weight/KV status around the
-                    # per-model loads.
-                    self._rollout_pool.onload_local(tags)
-                else:
-                    for name in model_ids:
-                        self._activate_model(role, name, tags)
+                for name in model_ids:
+                    self._activate_model(role, name, tags)
             except Exception:
                 for name in loading:
                     try:
@@ -502,13 +587,11 @@ class InferenceManager:
             model_ids = self.model_ids(role) if model_id is None else (model_id,)
             # Drain the whole role before its first model lets go.
             self._drain_models([(role, name) for name in model_ids], timeout, force_abort)
-            if model_id is not None:
-                self._deactivate_model(role, model_id, timeout)
-            elif role is Role.ROLLOUT and self._rollout_pool is not None:
-                self._rollout_pool.offload_local()
-            else:
-                for name in model_ids:
-                    self._deactivate_model(role, name, timeout)
+            if model_id is None and role is Role.ROLLOUT and self._rollout_pool is not None:
+                # A restart must not race the release.
+                self._rollout_pool.health_monitoring_pause()
+            for name in model_ids:
+                self._deactivate_model(role, name, timeout)
         finally:
             # A load waiting for these GPUs re-checks now.
             self.lifecycle.notify_released()
@@ -524,6 +607,9 @@ class InferenceManager:
                 self._observe(role, model_id)
                 return
             entry.resident = True
+            # A weights-only load keeps the model closed until the KV cache
+            # follows, after the weight sync.
+            entry.memory_ready = _loads_kv_cache(tags)
             self._reopen(role, model_id, LifecycleState.ONLOADING)
             try:
                 entry.pool.onload(tags)
@@ -559,6 +645,57 @@ class InferenceManager:
                     entry.pool.recover()
                 finally:
                     self._observe(role, model_id)
+
+    def recover_rollout(self, model_name: str | None = None) -> Any:
+        """Restart dead rollout engines, then return what the weight sync needs
+        to reach them; see ``RolloutEnginePool.get_rollout_engines_and_lock``.
+
+        Before the first ``generate`` pass a recovery would only race the
+        initial bring-up, so it only pauses the health monitors.
+        """
+        pool = self._rollout_pool
+        pool.health_monitoring_pause()
+        names = self.model_ids(Role.ROLLOUT)
+        name = model_name if model_name is not None else next(iter(names), None)
+        if self._rollout_started and name in names:
+            self.recover(Role.ROLLOUT, name)
+        return pool.get_rollout_engines_and_lock(model_name)
+
+    @ray.method(concurrency_group="rollout")
+    def begin_weight_update(self, role: Role | str, source: str) -> bool:
+        """Close a role's admission until ``end_weight_update(source)``.
+
+        No model of the role publishes READY while any update runs, and
+        observations taken before this call are dropped. A fully-async update
+        first takes the rollout pool's topology lease; it returns False,
+        changing nothing, while an elastic scale-in holds it.
+        """
+        role = Role(role)
+        pool = self._rollout_pool if role is Role.ROLLOUT else None
+        if source == WEIGHT_UPDATE_FULLY_ASYNC and pool is not None and not pool.set_weight_updating(True):
+            return False
+        with self._lock:
+            self._weight_updates.setdefault(role, set()).add(source)
+            for model_id in self.model_ids(role):
+                self._model(role, model_id).generation += 1
+                self.set_state(role, model_id, LifecycleState.STARTING)
+        return True
+
+    @ray.method(concurrency_group="rollout")
+    def end_weight_update(self, role: Role | str, source: str) -> None:
+        """End one weight update and observe the role again; idempotent.
+
+        Ending an update proves nothing about the weights: the observation
+        publishes READY only with healthy, registered replicas of one weight
+        version.
+        """
+        role = Role(role)
+        with self._lock:
+            self._weight_updates.get(role, set()).discard(source)
+        if source == WEIGHT_UPDATE_FULLY_ASYNC and role is Role.ROLLOUT and self._rollout_pool is not None:
+            self._rollout_pool.set_weight_updating(False)
+        for model_id in self.model_ids(role):
+            self._observe(role, model_id)
 
     def health_check(self, role: Role | str, model_id: str) -> bool:
         entry = self._model(role, model_id)
@@ -610,9 +747,6 @@ class InferenceManager:
 
     def rollout_released(self) -> bool:
         return self.lifecycle.rollout_released()
-
-    def rollout_status(self) -> str | None:
-        return None if self._rollout_pool is None else self._rollout_pool.get_status()
 
     def slices(self, role: Role) -> tuple[PlacementSlice, ...]:
         prefix = f"{Role(role).value}/"
@@ -667,12 +801,19 @@ class InferenceManager:
             self._rollout_started = False
             leftovers: dict[str, Any] = {}
             try:
-                self._rollout_pool = RolloutEnginePool(
-                    args, placement_group, inference_manager=self, startup_leftovers=leftovers
+                pool = RolloutEnginePool(
+                    args,
+                    placement_group,
+                    planner=self.placement,
+                    events=self.topology_events(Role.ROLLOUT),
+                    startup_leftovers=leftovers,
                 )
             except Exception:
                 self._keep_failed_start(Role.ROLLOUT, leftovers)
                 raise
+            if pool.servers:
+                self.register(Role.ROLLOUT, pool.servers)
+            self._rollout_pool = pool
         return self._rollout_pool.get_primary_router_address()
 
     def begin_rollout(self) -> None:
@@ -683,15 +824,20 @@ class InferenceManager:
 
     @ray.method(concurrency_group="rollout")
     def rollout_operation(self, method: str, /, *args: Any, **kwargs: Any) -> Any:
-        """Run one public rollout engine-pool operation."""
+        """Run one public rollout engine-pool operation, then observe every
+        model whose engines it changed."""
         if self._rollout_pool is None:
             raise RuntimeError("The rollout engine pool has not been created on this manager")
+        if method == "recover_rollout_engines":
+            return self.recover_rollout(*args, **kwargs)
         if method.startswith("_") or not callable(getattr(self._rollout_pool, method, None)):
             raise ValueError(f"Unsupported rollout pool method: {method}")
-        if method == "recover_rollout_engines":
-            kwargs["rollout_started"] = self._rollout_started
-        result = getattr(self._rollout_pool, method)(*args, **kwargs)
-        return asyncio.run(result) if asyncio.iscoroutine(result) else result
+        try:
+            result = getattr(self._rollout_pool, method)(*args, **kwargs)
+            return asyncio.run(result) if asyncio.iscoroutine(result) else result
+        finally:
+            # Callers see the topology the operation left behind.
+            self._refresh_stale()
 
     def create_role(
         self, role: Role | str, models: Sequence[tuple[InferenceModelSpec, Any, dict[str, Any]]]
@@ -806,6 +952,29 @@ class InferenceManager:
                 errors.append(exc)
         if errors:
             raise RuntimeError("Failed to shut down one or more inference roles") from errors[0]
+
+
+@dataclass(frozen=True)
+class _RoleEvents:
+    """The :class:`TopologyEvents` of one role's pool; they only record."""
+
+    manager: InferenceManager
+    role: Role
+
+    def changed(self, model_id: str) -> None:
+        self.manager._topology_changed(self.role, model_id)
+
+    def settled(self, model_id: str) -> None:
+        self.manager._topology_settled(self.role, model_id)
+
+
+def _loads_kv_cache(tags: Sequence[str] | None) -> bool:
+    """Whether a load of ``tags`` leaves the model able to serve."""
+    if tags is None:
+        return True
+    from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+
+    return GPU_MEMORY_TYPE_KV_CACHE in tags
 
 
 def _with_state(model: ModelSnapshot, state: LifecycleState) -> ModelSnapshot:
