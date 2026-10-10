@@ -36,11 +36,13 @@ GPUs, until ``offload`` or ``shutdown`` has succeeded.
 """
 
 import asyncio
+import functools
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from threading import Condition, RLock, Thread
+from threading import Condition, Lock, RLock, Thread
 from typing import Any
 from uuid import uuid4
 
@@ -49,7 +51,7 @@ import ray
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.engine.inference.config import DeploymentSpec, InferenceModelSpec, InferenceRoleSpec
 from relax.engine.inference.discovery import new_manager_epoch
-from relax.engine.inference.lifecycle import SWITCH_DRAIN_TIMEOUT_S, LifecycleCoordinator
+from relax.engine.inference.lifecycle import SWITCH_DRAIN_TIMEOUT_S, LifecycleCoordinator, LoopAwareCondition
 from relax.engine.inference.phase_plans import PHASE_GENERATE, reject_shared_co_resident
 from relax.engine.inference.placement import (
     ModelPlacement,
@@ -169,7 +171,8 @@ class InferenceManager:
         self.manager_epoch = new_manager_epoch()
         self.placement = PlacementPlanner()
         self._lock = RLock()
-        self._requests_done = Condition(self._lock)
+        # Completions wake drains on threads and on the actor's event loops.
+        self._requests_done = LoopAwareCondition(self._lock)
         self._models: dict[Role, dict[str, _Model]] = {}
         self._specs: dict[Role, InferenceRoleSpec] = {}
         self._revision: dict[Role, int] = {}
@@ -486,50 +489,100 @@ class InferenceManager:
         """
         draining = set(models)
         with self._requests_done:
-            for role, model_id in draining:
-                entry = self._model(role, model_id)
-                if entry.resident and entry.closed_state is None:
-                    entry.drained_ready = entry.snapshot.state == LifecycleState.READY
-                    self._close(role, model_id, LifecycleState.DRAINING)
+            self._close_draining(draining)
             started = time.monotonic()
             deadline = started + timeout
-            while pending := sorted(
-                permit for permit, admission in self._inflight.items() if admission.model in draining
-            ):
+            while pending := self._pending(draining):
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     self._requests_done.wait(remaining)
                     continue
-                names = sorted(f"{role.value}/{model_id}" for role, model_id in draining)
-                waited = time.monotonic() - started
-                requests = [f"trace={self._inflight[permit].trace_id} permit={permit}" for permit in pending]
-                if not force_abort:
-                    logger.warning(
-                        f"{len(pending)} inference requests of {names} still in flight after {waited:.0f}s; "
-                        f"waiting for them: {requests}"
-                    )
-                    deadline = time.monotonic() + timeout
-                    continue
-                logger.warning(
-                    f"Aborting {len(pending)} inference requests of {names} after {waited:.0f}s: {requests}"
-                )
-                self._abort_requests(draining, pending)
+                if self._overdue(draining, pending, started, force_abort):
+                    break
+                deadline = time.monotonic() + timeout
+        if pending:
+            self._abort_requests(draining, pending)
+
+    async def drain_async(
+        self,
+        models: Sequence[tuple[Role, str]],
+        timeout: float,
+        force_abort: bool,
+        run: Callable[..., Awaitable[Any]],
+    ) -> None:
+        """``_drain_models`` for an event loop: it waits for completions
+        without holding a thread, and aborts through ``run``.
+
+        A drain cancelled while it waits leaves the models closed.
+        """
+        draining = set(models)
+        with self._requests_done:
+            self._close_draining(draining)
+        started = time.monotonic()
+        deadline = started + timeout
+        while True:
+            if await self._requests_done.wait_for(lambda: not self._pending(draining), deadline):
                 return
+            with self._requests_done:
+                pending = self._pending(draining)
+                if pending and self._overdue(draining, pending, started, force_abort):
+                    break
+            deadline = time.monotonic() + timeout
+        await run(self._abort_requests, draining, pending)
+
+    def _close_draining(self, draining: set[tuple[Role, str]]) -> None:
+        """Close admission on the resident ``draining`` models that are open;
+        call under the lock."""
+        for role, model_id in draining:
+            entry = self._model(role, model_id)
+            if entry.resident and entry.closed_state is None:
+                entry.drained_ready = entry.snapshot.state == LifecycleState.READY
+                self._close(role, model_id, LifecycleState.DRAINING)
+
+    def _pending(self, draining: set[tuple[Role, str]]) -> list[str]:
+        """The permits ``draining`` models still hold; call under the lock."""
+        return sorted(permit for permit, admission in self._inflight.items() if admission.model in draining)
+
+    def _overdue(self, draining: set[tuple[Role, str]], pending: list[str], started: float, force_abort: bool) -> bool:
+        """Report requests still in flight after a drain timeout; True when
+        they are to be aborted.
+
+        Call under the lock.
+        """
+        names = sorted(f"{role.value}/{model_id}" for role, model_id in draining)
+        waited = time.monotonic() - started
+        requests = [f"trace={self._inflight[permit].trace_id} permit={permit}" for permit in pending]
+        if force_abort:
+            logger.warning(f"Aborting {len(pending)} inference requests of {names} after {waited:.0f}s: {requests}")
+            return True
+        logger.warning(
+            f"{len(pending)} inference requests of {names} still in flight after {waited:.0f}s; "
+            f"waiting for them: {requests}"
+        )
+        return False
 
     def _abort_requests(self, models: set[tuple[Role, str]], permits: Sequence[str]) -> None:
-        """Abort everything the resident ``models`` run and forget ``permits``.
+        """Abort everything the resident ``models`` run, then forget
+        ``permits``.
 
-        Runs under the admission lock, so no request is admitted meanwhile. A
-        request still on its way to an engine is caught by the release itself,
-        which drains the engine before letting go of memory.
+        The engine calls run outside the admission lock, which admission and
+        completions must never wait behind; the models are already closed, so
+        nothing is admitted meanwhile. A request still on its way to an engine
+        is caught by the release itself, which drains the engine before letting
+        go of memory. A failed abort raises with ``permits`` still held.
         """
-        for role, model_id in sorted(models):
-            entry = self._model(role, model_id)
-            if entry.resident:
-                entry.pool.abort_requests()
-        for permit in permits:
-            self._inflight.pop(permit, None)
-        self._requests_done.notify_all()
+        with self._lock:
+            pools = [
+                self._model(role, model_id).pool
+                for role, model_id in sorted(models)
+                if self._model(role, model_id).resident
+            ]
+        for pool in pools:
+            pool.abort_requests()
+        with self._requests_done:
+            for permit in permits:
+                self._inflight.pop(permit, None)
+            self._requests_done.notify_all()
 
     # ------------------------------------------------------------------
     # Lifecycle.
@@ -653,15 +706,22 @@ class InferenceManager:
         Before the first ``generate`` pass a recovery would only race the
         initial bring-up, so it only pauses the health monitors.
         """
-        pool = self._rollout_pool
-        pool.health_monitoring_pause()
+        return self._recover_rollout(self.rollout_recovery_target(model_name), model_name)
+
+    def rollout_recovery_target(self, model_name: str | None = None) -> str | None:
+        """The rollout model ``recover_rollout`` restarts engines of, or None
+        before the first ``generate`` pass or for an unknown model."""
         names = self.model_ids(Role.ROLLOUT)
         name = model_name if model_name is not None else next(iter(names), None)
-        if self._rollout_started and name in names:
-            self.recover(Role.ROLLOUT, name)
+        return name if self._rollout_started and name in names else None
+
+    def _recover_rollout(self, target: str | None, model_name: str | None) -> Any:
+        pool = self._rollout_pool
+        pool.health_monitoring_pause()
+        if target is not None:
+            self.recover(Role.ROLLOUT, target)
         return pool.get_rollout_engines_and_lock(model_name)
 
-    @ray.method(concurrency_group="rollout")
     def begin_weight_update(self, role: Role | str, source: str) -> bool:
         """Close a role's admission until ``end_weight_update(source)``.
 
@@ -681,7 +741,6 @@ class InferenceManager:
                 self.set_state(role, model_id, LifecycleState.STARTING)
         return True
 
-    @ray.method(concurrency_group="rollout")
     def end_weight_update(self, role: Role | str, source: str) -> None:
         """End one weight update and observe the role again; idempotent.
 
@@ -788,7 +847,6 @@ class InferenceManager:
     # Role creation and teardown; the engines live in this process.
     # ------------------------------------------------------------------
 
-    @ray.method(concurrency_group="rollout")
     def create_rollout_role(self, args: Any, placement_group: Any) -> dict[str, Any]:
         """Create the rollout engines and return the primary Router address."""
         from relax.distributed.ray.rollout import RolloutEnginePool
@@ -822,7 +880,6 @@ class InferenceManager:
         self._rollout_started = True
         self.rollout_operation("health_monitoring_resume")
 
-    @ray.method(concurrency_group="rollout")
     def rollout_operation(self, method: str, /, *args: Any, **kwargs: Any) -> Any:
         """Run one public rollout engine-pool operation, then observe every
         model whose engines it changed."""
@@ -1015,11 +1072,282 @@ def _topology(model: ModelSnapshot) -> tuple:
     )
 
 
-# A drain blocks inside this actor until completions arrive as calls on this
-# same actor, so it needs several execution slots; rollout engine operations get
-# their own group because a scale-out runs for minutes.
-_MANAGER_CONCURRENCY = 8
-InferenceManagerActor = ray.remote(num_cpus=1, num_gpus=0, concurrency_groups={"rollout": 8})(InferenceManager)
+# The actor is async: each concurrency group is one event loop, and a slot is a
+# coroutine, not a thread. Admission and completion never wait, so they run on
+# their own loops: completions in particular must get in while a drain waits for
+# them. A call that waits (for a GPU lease, a drain or another call on the same
+# model) waits on its loop and takes a thread only for its work, which never
+# waits for another call; so the thread pools bound throughput, never progress.
+_MANAGER_CONCURRENCY = 4096
+REQUEST_PERMIT_GROUP = "request_permit"
+REQUEST_CONTROL_GROUP = "request_control"
+ROLLOUT_GROUP = "rollout"
+_CONCURRENCY_GROUPS = {REQUEST_PERMIT_GROUP: 1024, REQUEST_CONTROL_GROUP: 128, ROLLOUT_GROUP: 8}
+# Threads that run blocking work: engine RPCs and memory transitions.
+_LIFECYCLE_THREADS = 64
+_ROLLOUT_THREADS = 8
+
+_ModelKey = tuple[Role, str]
+
+
+class _BlockingRunner:
+    """Runs blocking Manager work on its own thread pool."""
+
+    def __init__(self, name: str, threads: int) -> None:
+        self.name = name
+        self.threads = threads
+        self._busy = 0
+        self._busy_lock = Lock()
+        self._executor = ThreadPoolExecutor(threads, thread_name_prefix=f"inference-{name}")
+
+    async def run(
+        self, fn: Callable[..., Any], /, *args: Any, releases: Sequence[Callable[[], None]] = (), **kwargs: Any
+    ) -> Any:
+        """Run ``fn`` on a thread, then ``releases`` on that thread.
+
+        Once submitted the work runs to its end even if the caller is
+        cancelled, and only then gives back what ``releases`` hold; if it
+        cannot be submitted, they are given back at once.
+        """
+
+        def work() -> Any:
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                for release in reversed(releases):
+                    release()
+                with self._busy_lock:
+                    self._busy -= 1
+
+        with self._busy_lock:
+            self._busy += 1
+            busy = self._busy
+        if busy > self.threads:
+            logger.warning(
+                f"All {self.threads} {self.name} threads of the inference manager are busy; "
+                f"{getattr(fn, '__name__', fn)} queues behind {busy - self.threads - 1} calls"
+            )
+        try:
+            future = asyncio.get_running_loop().run_in_executor(self._executor, work)
+        except BaseException:
+            for release in reversed(releases):
+                release()
+            with self._busy_lock:
+                self._busy -= 1
+            raise
+        return await asyncio.shield(future)
+
+
+class _ModelGates:
+    """Lets one blocking call at a time run per model; the others wait on an
+    event loop instead of a thread."""
+
+    def __init__(self) -> None:
+        self._changed = LoopAwareCondition()
+        self._busy: set[_ModelKey] = set()
+
+    async def acquire(self, keys: frozenset[_ModelKey]) -> None:
+        def claim() -> bool:
+            if keys & self._busy:
+                return False
+            self._busy |= keys
+            return True
+
+        await self._changed.wait_for(claim)
+
+    def release(self, keys: frozenset[_ModelKey]) -> None:
+        with self._changed:
+            self._busy -= keys
+            self._changed.notify_all()
+
+
+def _inline(name: str, group: str) -> Any:
+    """An actor method running ``InferenceManager.<name>`` on ``group``'s event
+    loop; only for calls that hold the admission lock briefly and never
+    wait."""
+
+    async def method(self: "_InferenceManagerActor", *args: Any, **kwargs: Any) -> Any:
+        return getattr(self.manager, name)(*args, **kwargs)
+
+    method.__name__ = method.__qualname__ = name
+    return ray.method(concurrency_group=group)(method)
+
+
+def _blocking(name: str, runner: str, group: str | None = None) -> Any:
+    """An actor method running ``InferenceManager.<name>`` on a thread of
+    ``runner``, in ``group`` or the default one; only for calls that wait for
+    no other call."""
+
+    async def method(self: "_InferenceManagerActor", *args: Any, **kwargs: Any) -> Any:
+        return await getattr(self, runner).run(getattr(self.manager, name), *args, **kwargs)
+
+    method.__name__ = method.__qualname__ = name
+    return method if group is None else ray.method(concurrency_group=group)(method)
+
+
+class _InferenceManagerActor:
+    """The Ray actor around one :class:`InferenceManager`.
+
+    It exposes the Manager's remote API under the same names and decides where
+    each call runs and waits. The Manager stays synchronous, so its in-process
+    callers and its own threads are unaffected.
+    """
+
+    def __init__(self) -> None:
+        self.manager = InferenceManager()
+        self._lifecycle = _BlockingRunner("lifecycle", _LIFECYCLE_THREADS)
+        self._rollout = _BlockingRunner("rollout", _ROLLOUT_THREADS)
+        self._gates = _ModelGates()
+
+    # Gateway fast path.
+    snapshot = _inline("snapshot", REQUEST_PERMIT_GROUP)
+    admit_request = _inline("admit_request", REQUEST_PERMIT_GROUP)
+    complete_request = _inline("complete_request", REQUEST_CONTROL_GROUP)
+    rollout_released = _inline("rollout_released", REQUEST_CONTROL_GROUP)
+
+    # Lifecycle. Each waits on the loop, then runs its work on a thread.
+    async def activate(self, role: Role | str, model_id: str | None = None, tags: list[str] | None = None) -> None:
+        role = Role(role)
+        await self._leased(
+            self._lifecycle, role, self._targets(role, model_id), self.manager.activate, role, model_id, tags
+        )
+
+    async def recover(self, role: Role | str, model_id: str) -> None:
+        role = Role(role)
+        await self._leased(self._lifecycle, role, self._targets(role, model_id), self.manager.recover, role, model_id)
+
+    async def deactivate(
+        self,
+        role: Role | str,
+        model_id: str | None = None,
+        timeout: float = SWITCH_DRAIN_TIMEOUT_S,
+        force_abort: bool = False,
+    ) -> None:
+        role = Role(role)
+        targets = self._targets(role, model_id)
+        try:
+            # Drain the whole role before its first model lets go.
+            await self.manager.drain_async(targets, timeout, force_abort, self._lifecycle.run)
+        except BaseException:
+            self.manager.lifecycle.notify_released()
+            raise
+        await self._gated(self._lifecycle, targets, self.manager.deactivate, role, model_id, timeout, force_abort)
+
+    async def drain(
+        self, roles: Sequence[Role | str], timeout: float = SWITCH_DRAIN_TIMEOUT_S, force_abort: bool = False
+    ) -> None:
+        targets = [key for role in roles for key in self._targets(Role(role), None)]
+        await self.manager.drain_async(targets, timeout, force_abort, self._lifecycle.run)
+
+    async def health_check(self, role: Role | str, model_id: str) -> bool:
+        role = Role(role)
+        return await self._gated(
+            self._lifecycle, self._targets(role, model_id), self.manager.health_check, role, model_id
+        )
+
+    async def shutdown(self, role: Role | str, model_id: str | None = None) -> None:
+        role = Role(role)
+        targets = self._targets(role, model_id)
+        try:
+            await self.manager.drain_async(targets, SHUTDOWN_DRAIN_TIMEOUT_S, True, self._lifecycle.run)
+        except Exception as exc:
+            # Stopping the engines fails whatever they still run.
+            logger.warning(f"Stopping {role.value} with requests still in flight: {exc}")
+        await self._gated(self._lifecycle, targets, self.manager.shutdown, role, model_id)
+
+    async def call(self, role: Role | str, model_id: str, method: str, /, *args: Any, **kwargs: Any) -> Any:
+        if method in _LIFECYCLE_METHODS:
+            return await getattr(self, method)(role, model_id, *args, **kwargs)
+        return await self._lifecycle.run(self.manager.call, role, model_id, method, *args, **kwargs)
+
+    async def enter_phase(self, phase_id: str, timeout: float = SWITCH_DRAIN_TIMEOUT_S) -> None:
+        await self.manager.lifecycle.enter_phase_async(phase_id, self._drain_roles, self._lifecycle.run, timeout)
+
+    async def leave_phase(self, phase_id: str, timeout: float = SWITCH_DRAIN_TIMEOUT_S) -> None:
+        await self.manager.lifecycle.leave_phase_async(phase_id, self._drain_roles, self._lifecycle.run, timeout)
+
+    # Role creation, teardown and queries wait for no other call.
+    shutdown_all = _blocking("shutdown_all", "_lifecycle")
+    create_role = _blocking("create_role", "_lifecycle")
+    refresh = _blocking("refresh", "_lifecycle")
+    roles = _blocking("roles", "_lifecycle")
+    registered_roles = _blocking("registered_roles", "_lifecycle")
+    role_spec = _blocking("role_spec", "_lifecycle")
+    model_ids = _blocking("model_ids", "_lifecycle")
+    model_spec = _blocking("model_spec", "_lifecycle")
+    model_placement = _blocking("model_placement", "_lifecycle")
+    slices = _blocking("slices", "_lifecycle")
+    resident = _blocking("resident", "_lifecycle")
+    plan_placement = _blocking("plan_placement", "_lifecycle")
+    allocations = _blocking("allocations", "_lifecycle")
+
+    # Rollout engine pool.
+    create_rollout_role = _blocking("create_rollout_role", "_rollout", ROLLOUT_GROUP)
+    begin_rollout = _blocking("begin_rollout", "_rollout", ROLLOUT_GROUP)
+    begin_weight_update = _blocking("begin_weight_update", "_rollout", ROLLOUT_GROUP)
+    end_weight_update = _blocking("end_weight_update", "_rollout", ROLLOUT_GROUP)
+
+    @ray.method(concurrency_group=ROLLOUT_GROUP)
+    async def rollout_operation(self, method: str, /, *args: Any, **kwargs: Any) -> Any:
+        if method != "recover_rollout_engines":
+            return await self._rollout.run(self.manager.rollout_operation, method, *args, **kwargs)
+        # A recovery restarts engines, which allocate memory: it waits for the
+        # lease like a load.
+        model_name = args[0] if args else kwargs.get("model_name")
+        target = self.manager.rollout_recovery_target(model_name)
+        if target is None:
+            return await self._rollout.run(self.manager._recover_rollout, None, model_name)
+        targets = self._targets(Role.ROLLOUT, target)
+        return await self._leased(
+            self._rollout, Role.ROLLOUT, targets, self.manager._recover_rollout, target, model_name
+        )
+
+    # ------------------------------------------------------------------
+
+    def _targets(self, role: Role, model_id: str | None) -> frozenset[_ModelKey]:
+        names = self.manager.model_ids(role) if model_id is None else (model_id,)
+        return frozenset((role, name) for name in names)
+
+    async def _drain_roles(self, roles: Sequence[Role], timeout: float) -> None:
+        targets = [key for role in roles for key in self._targets(role, None)]
+        await self.manager.drain_async(targets, timeout, False, self._lifecycle.run)
+
+    async def _gated(
+        self, runner: _BlockingRunner, targets: frozenset[_ModelKey], fn: Callable[..., Any], *args: Any
+    ) -> Any:
+        """Run ``fn`` on a thread once no other call runs on ``targets``."""
+        await self._gates.acquire(targets)
+        return await runner.run(fn, *args, releases=[functools.partial(self._gates.release, targets)])
+
+    async def _leased(
+        self,
+        runner: _BlockingRunner,
+        role: Role,
+        targets: frozenset[_ModelKey],
+        fn: Callable[..., Any],
+        *args: Any,
+    ) -> Any:
+        """Run the load ``fn`` on a thread under the GPU lease of ``role``.
+
+        The lease is taken first and the model gates second, the order every
+        load uses; a caller cancelled before the work is handed to the thread
+        gives back what it took.
+        """
+        lifecycle = self.manager.lifecycle
+        token = await lifecycle.acquire([role])
+        releases = [functools.partial(lifecycle.release, token)]
+        try:
+            await self._gates.acquire(targets)
+        except BaseException:
+            lifecycle.release(token)
+            raise
+        releases.append(functools.partial(self._gates.release, targets))
+        return await runner.run(lifecycle.owned(token, fn), *args, releases=releases)
+
+
+InferenceManagerActor = ray.remote(num_cpus=1, num_gpus=0, concurrency_groups=_CONCURRENCY_GROUPS)(
+    _InferenceManagerActor
+)
 
 
 def validate_task_layout(args: Any) -> None:
