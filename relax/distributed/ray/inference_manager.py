@@ -58,6 +58,10 @@ from relax.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+# How long a shutdown lets admitted requests finish before aborting them and
+# stopping the engines.
+SHUTDOWN_DRAIN_TIMEOUT_S = 30.0
+
 _LIFECYCLE_METHODS = frozenset({"activate", "deactivate", "recover", "health_check", "shutdown"})
 _QUERY_METHODS = frozenset({"get_urls", "get_engine_hosts_ports"})
 
@@ -101,6 +105,18 @@ class _Model:
     # anything, and a weights-only onload reports SLEEPING. Set before every
     # load and cleared only once an offload or shutdown has succeeded.
     resident: bool = True
+    # The state the Manager holds a closed model in (DRAINING, SLEEPING or
+    # DEAD), kept apart from what the pool reports. ``None`` leaves the state
+    # to observations; otherwise ``publish`` pins state to it with admission
+    # closed, and only a controlled activate or recover clears it.
+    closed_state: LifecycleState | None = None
+    # Whether a drain closed the model while it was READY. Until its offload
+    # runs, such a model still holds everything it loaded, so reactivating it
+    # only reopens admission instead of loading again.
+    drained_ready: bool = False
+    # Bumped on every lifecycle transition; an observation taken before one is
+    # stale and dropped.
+    generation: int = 0
 
 
 class InferenceManager:
@@ -205,6 +221,9 @@ class InferenceManager:
         with self._lock:
             entry = self._model(role, model.model_id)
             spec = entry.config
+            if entry.closed_state is not None:
+                # Keep the observed topology; the Manager's closure wins.
+                model = _with_state(model, entry.closed_state)
             # Direct eligibility is derived, never reported: only a READY
             # replica of a direct-routed model may take requests without the
             # Router, so sleeping, draining and restarting replicas drop out.
@@ -245,17 +264,24 @@ class InferenceManager:
         if state == LifecycleState.READY:
             raise ValueError("READY is only published from an observation")
         with self._lock:
-            current = self._model(role, model_id).snapshot
-            self.publish(
-                role,
-                replace(
-                    current,
-                    state=state,
-                    admission=False,
-                    replicas=tuple(replace(replica, state=state) for replica in current.replicas),
-                    pd_workers=tuple((kind, replace(worker, state=state)) for kind, worker in current.pd_workers),
-                ),
-            )
+            self.publish(role, _with_state(self._model(role, model_id).snapshot, state))
+
+    def _close(self, role: Role, model_id: str, state: LifecycleState) -> None:
+        """Keep the model closed in ``state`` until a controlled activate."""
+        with self._lock:
+            entry = self._model(role, model_id)
+            entry.closed_state = state
+            entry.generation += 1
+            self.set_state(role, model_id, state)
+
+    def _reopen(self, role: Role, model_id: str, state: LifecycleState) -> None:
+        """Start a controlled activate: lift the closure and move to ``state``;
+        the next observation decides whether the model is READY."""
+        with self._lock:
+            entry = self._model(role, model_id)
+            entry.closed_state = None
+            entry.generation += 1
+            self.set_state(role, model_id, state)
 
     def _model(self, role: Role | str, model_id: str) -> _Model:
         models = self._models.get(Role(role))
@@ -263,8 +289,22 @@ class InferenceManager:
             raise KeyError(f"Unknown inference model: {Role(role).value}/{model_id}")
         return models[model_id]
 
+    def refresh(self, role: Role | str, model_id: str) -> None:
+        """Publish the pool's current observation of one model."""
+        self._observe(Role(role), model_id)
+
     def _observe(self, role: Role, model_id: str) -> None:
-        self.publish(role, self._model(role, model_id).pool.observe())
+        """Publish the pool's observation unless a lifecycle transition ran
+        while it was taken."""
+        entry = self._model(role, model_id)
+        with self._lock:
+            generation = entry.generation
+        model = entry.pool.observe()
+        with self._lock:
+            if entry.generation != generation:
+                logger.info(f"Dropping a stale observation of {role.value}/{model_id}")
+                return
+            self.publish(role, model)
 
     # ------------------------------------------------------------------
     # Request admission.
@@ -287,21 +327,73 @@ class InferenceManager:
             if self._inflight.pop(request_id, None) is not None:
                 self._requests_done.notify_all()
 
-    def drain(self, roles: Sequence[Role | str], timeout: float = SWITCH_DRAIN_TIMEOUT_S) -> None:
-        """Close admission for ``roles`` and wait for their requests to end."""
-        roles = {Role(role) for role in roles}
-        for role in roles:
-            for model_id in self.model_ids(role):
-                self.set_state(role, model_id, LifecycleState.DRAINING)
-        deadline = time.monotonic() + timeout
+    def drain(
+        self, roles: Sequence[Role | str], timeout: float = SWITCH_DRAIN_TIMEOUT_S, force_abort: bool = False
+    ) -> None:
+        """Close admission for ``roles`` and wait for their requests to end;
+        see :meth:`_drain_models`."""
+        roles = [Role(role) for role in roles]
+        models = [(role, model_id) for role in roles for model_id in self.model_ids(role)]
+        self._drain_models(models, timeout, force_abort)
+
+    def _drain_models(self, models: Sequence[tuple[Role, str]], timeout: float, force_abort: bool = False) -> None:
+        """Close admission on the resident ``models`` and wait until every
+        request they admitted has ended.
+
+        Every release goes through here before its engines let go of memory, so
+        a request admitted just before the release never reaches a sleeping
+        engine. Closing and waiting happen under the admission lock, which the
+        wait gives up so ``complete_request`` can run. A model that is already
+        closed keeps its state.
+
+        Every ``timeout`` seconds that requests are still in flight, a warning
+        is logged and the wait goes on. With ``force_abort`` the engines abort
+        them instead and they are forgotten, so the release can go ahead; a
+        failed abort raises and leaves the model DRAINING and resident, so
+        conflicting roles keep waiting.
+        """
+        draining = set(models)
         with self._requests_done:
-            while any(role in roles for role, _ in self._inflight.values()):
+            for role, model_id in draining:
+                entry = self._model(role, model_id)
+                if entry.resident and entry.closed_state is None:
+                    entry.drained_ready = entry.snapshot.state == LifecycleState.READY
+                    self._close(role, model_id, LifecycleState.DRAINING)
+            started = time.monotonic()
+            deadline = started + timeout
+            while pending := sorted(rid for rid, model in self._inflight.items() if model in draining):
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"Inference requests still in flight after {timeout}s: {sorted(self._inflight)}"
+                if remaining > 0:
+                    self._requests_done.wait(remaining)
+                    continue
+                names = sorted(f"{role.value}/{model_id}" for role, model_id in draining)
+                waited = time.monotonic() - started
+                if not force_abort:
+                    logger.warning(
+                        f"{len(pending)} inference requests of {names} still in flight after {waited:.0f}s; "
+                        f"waiting for them: {pending}"
                     )
-                self._requests_done.wait(remaining)
+                    deadline = time.monotonic() + timeout
+                    continue
+                logger.warning(f"Aborting {len(pending)} inference requests of {names} after {waited:.0f}s: {pending}")
+                self._abort_requests(draining, pending)
+                return
+
+    def _abort_requests(self, models: set[tuple[Role, str]], request_ids: Sequence[str]) -> None:
+        """Abort everything the resident ``models`` run and forget
+        ``request_ids``.
+
+        Runs under the admission lock, so no request is admitted meanwhile. A
+        request still on its way to an engine is caught by the release itself,
+        which drains the engine before letting go of memory.
+        """
+        for role, model_id in sorted(models):
+            entry = self._model(role, model_id)
+            if entry.resident:
+                entry.pool.abort_requests()
+        for request_id in request_ids:
+            self._inflight.pop(request_id, None)
+        self._requests_done.notify_all()
 
     # ------------------------------------------------------------------
     # Lifecycle.
@@ -347,18 +439,32 @@ class InferenceManager:
                         logger.warning(f"Failed to release {role.value}/{name} after a failed load: {exc}")
                 raise
 
-    def deactivate(self, role: Role | str, model_id: str | None = None) -> None:
+    def deactivate(
+        self,
+        role: Role | str,
+        model_id: str | None = None,
+        timeout: float = SWITCH_DRAIN_TIMEOUT_S,
+        force_abort: bool = False,
+    ) -> None:
         """Release a role's or one model's memory; a released model is left
-        alone."""
+        alone.
+
+        Admission closes and the admitted requests end, or with ``force_abort``
+        are aborted after ``timeout``, before any engine releases memory; see
+        :meth:`_drain_models`.
+        """
         role = Role(role)
         try:
+            model_ids = self.model_ids(role) if model_id is None else (model_id,)
+            # Drain the whole role before its first model lets go.
+            self._drain_models([(role, name) for name in model_ids], timeout, force_abort)
             if model_id is not None:
-                self._deactivate_model(role, model_id)
+                self._deactivate_model(role, model_id, timeout)
             elif role is Role.ROLLOUT and self._rollout_pool is not None:
                 self._rollout_pool.offload_local()
             else:
-                for name in self.model_ids(role):
-                    self._deactivate_model(role, name)
+                for name in model_ids:
+                    self._deactivate_model(role, name, timeout)
         finally:
             # A load waiting for these GPUs re-checks now.
             self.lifecycle.notify_released()
@@ -368,26 +474,31 @@ class InferenceManager:
         with entry.lock:
             if entry.resident and entry.snapshot.state == LifecycleState.READY:
                 return
+            if entry.resident and entry.closed_state == LifecycleState.DRAINING and entry.drained_ready:
+                # Drained but never offloaded: its memory is still loaded.
+                self._reopen(role, model_id, LifecycleState.ONLOADING)
+                self._observe(role, model_id)
+                return
             entry.resident = True
-            self.set_state(role, model_id, LifecycleState.ONLOADING)
+            self._reopen(role, model_id, LifecycleState.ONLOADING)
             try:
                 entry.pool.onload(tags)
             finally:
                 self._observe(role, model_id)
 
-    def _deactivate_model(self, role: Role, model_id: str) -> None:
+    def _deactivate_model(self, role: Role, model_id: str, timeout: float = SWITCH_DRAIN_TIMEOUT_S) -> None:
         entry = self._model(role, model_id)
         with entry.lock:
             if not entry.resident:
                 return
-            self.set_state(role, model_id, LifecycleState.DRAINING)
+            self._drain_models([(role, model_id)], timeout)
             try:
                 entry.pool.offload()
             except Exception:
-                self.set_state(role, model_id, LifecycleState.DEAD)
+                self._close(role, model_id, LifecycleState.DEAD)
                 raise
             entry.resident = False
-            self.set_state(role, model_id, LifecycleState.SLEEPING)
+            self._close(role, model_id, LifecycleState.SLEEPING)
 
     def recover(self, role: Role | str, model_id: str) -> None:
         """Restart dead engines; they allocate memory, so this waits like a
@@ -397,7 +508,7 @@ class InferenceManager:
             entry = self._model(role, model_id)
             with entry.lock:
                 entry.resident = True
-                self.set_state(role, model_id, LifecycleState.STARTING)
+                self._reopen(role, model_id, LifecycleState.STARTING)
                 try:
                     entry.pool.recover()
                 finally:
@@ -412,7 +523,13 @@ class InferenceManager:
 
     def shutdown(self, role: Role | str, model_id: str | None = None) -> None:
         """Stop a whole role, or one of its models; a stopped model is left
-        alone."""
+        alone.
+
+        Admitted requests get a bounded grace period, then the engines abort
+        them. Stopping proceeds even if the abort fails: a killed engine fails
+        its requests, it never runs them on released memory, and teardown must
+        not hang on a client that never completes.
+        """
         role = Role(role)
         if model_id is None:
             self._shutdown_role(role)
@@ -421,7 +538,12 @@ class InferenceManager:
         with entry.lock:
             if not entry.resident and entry.snapshot.state == LifecycleState.DEAD:
                 return
-            self.set_state(role, model_id, LifecycleState.DEAD)
+            try:
+                self._drain_models([(role, model_id)], SHUTDOWN_DRAIN_TIMEOUT_S, force_abort=True)
+            except Exception as exc:
+                # Stopping the engines fails whatever they still run.
+                logger.warning(f"Stopping {role.value}/{model_id} with requests still in flight: {exc}")
+            self._close(role, model_id, LifecycleState.DEAD)
             try:
                 entry.pool.shutdown(self.placement)
                 entry.resident = False
@@ -587,7 +709,7 @@ class InferenceManager:
             return
         self.register(role, leftovers, observe=False)
         for model_id in leftovers:
-            self.set_state(role, model_id, LifecycleState.DEAD)
+            self._close(role, model_id, LifecycleState.DEAD)
         self._failed_starts.add(role)
 
     def _shutdown_role(self, role: Role) -> None:
@@ -638,6 +760,17 @@ class InferenceManager:
                 errors.append(exc)
         if errors:
             raise RuntimeError("Failed to shut down one or more inference roles") from errors[0]
+
+
+def _with_state(model: ModelSnapshot, state: LifecycleState) -> ModelSnapshot:
+    """``model`` with admission closed and it and its replicas in ``state``."""
+    return replace(
+        model,
+        state=state,
+        admission=False,
+        replicas=tuple(replace(replica, state=state) for replica in model.replicas),
+        pd_workers=tuple((kind, replace(worker, state=state)) for kind, worker in model.pd_workers),
+    )
 
 
 def _restarted(previous: ModelSnapshot, model: ModelSnapshot) -> bool:

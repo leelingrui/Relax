@@ -1,11 +1,14 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import sys
 import threading
-from types import ModuleType, SimpleNamespace
+from functools import partial
+from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
 
+from relax.distributed.ray import inference_manager
 from relax.distributed.ray.inference_manager import InferenceManager, ModelHandle
 from relax.engine.inference.config import InferenceModelSpec
 from relax.engine.inference.types import (
@@ -54,6 +57,12 @@ class FakePool:
 
     def shutdown(self, planner) -> None:
         self.calls.append("shutdown")
+
+    def health_check(self) -> bool:
+        return self.onloaded
+
+    def abort_requests(self) -> None:
+        self.calls.append("abort")
 
     def get_urls(self) -> list[str]:
         return ["http://engine-0"]
@@ -124,17 +133,137 @@ def test_manager_topology_revision_bumps_only_on_topology_change() -> None:
     assert manager.snapshot(Role.GENRM).topology_revision == revision + 1
 
 
-def test_manager_drain_closes_admission_and_waits_for_requests() -> None:
-    manager = _manager(genrm={"judge": FakePool("judge")})
+def _warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    logged: list[str] = []
+    monkeypatch.setattr(inference_manager, "logger", SimpleNamespace(warning=logged.append, info=lambda *_: None))
+    return logged
+
+
+def test_manager_drain_closes_admission_and_waits_for_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    warnings = _warnings(monkeypatch)
+    pool = FakePool("judge")
+    manager = _manager(genrm={"judge": pool})
     assert manager.admit_request(Role.GENRM, "judge", "req-1") == "req-1"
 
-    with pytest.raises(TimeoutError):
-        manager.drain([Role.GENRM], timeout=0.01)
+    drainer = _start(manager.drain, [Role.GENRM], 0.01)
+    # Without force_abort it warns every timeout and keeps waiting.
+    assert drainer.is_alive() and len(warnings) > 1 and "req-1" in warnings[-1]
+    assert "abort" not in pool.calls
     with pytest.raises(RuntimeError, match="not ready"):
         manager.admit_request(Role.GENRM, "judge")
 
     manager.complete_request("req-1")
-    manager.drain([Role.GENRM], timeout=0.01)
+    drainer.join(5.0)
+    assert not drainer.is_alive()
+
+
+def test_manager_drain_stays_closed_while_the_pool_reports_ready() -> None:
+    pool = FakePool("judge")
+    manager = _manager(genrm={"judge": pool})
+    manager.admit_request(Role.GENRM, "judge", "old")
+
+    drainer = _start(manager.drain, [Role.GENRM], 5.0)
+    for _ in range(3):
+        # The pool is still loaded and healthy, and says so.
+        assert manager.health_check(Role.GENRM, "judge")
+        manager.refresh(Role.GENRM, "judge")
+        manager.publish(Role.GENRM, pool.observe())
+        model = manager.snapshot(Role.GENRM).models[0]
+        assert (model.state, model.admission) == (LifecycleState.DRAINING, False)
+        with pytest.raises(RuntimeError, match="not ready"):
+            manager.admit_request(Role.GENRM, "judge", "new")
+    assert drainer.is_alive()
+
+    manager.complete_request("old")
+    drainer.join(5.0)
+    assert not drainer.is_alive()
+    manager.health_check(Role.GENRM, "judge")
+    with pytest.raises(RuntimeError, match="not ready"):
+        manager.admit_request(Role.GENRM, "judge", "new")
+
+    # Only a controlled activate reopens it.
+    manager.activate(Role.GENRM, "judge")
+    assert manager.admit_request(Role.GENRM, "judge", "new") == "new"
+
+
+def test_manager_reactivating_a_drained_model_reopens_without_loading_again() -> None:
+    manager, pools = _shared()
+    rollout = pools["rollout"]
+    manager.activate(Role.ROLLOUT, "policy")
+    manager.admit_request(Role.ROLLOUT, "policy", "req-1")
+    manager.drain([Role.ROLLOUT], timeout=0.01, force_abort=True)
+    assert rollout.calls[-1] == "abort"
+    loads = rollout.calls.count("onload")
+
+    manager.activate(Role.ROLLOUT, "policy", ["weights"])
+    # Resuming memory that was never released is not idempotent in SGLang.
+    assert rollout.calls.count("onload") == loads
+    assert manager.admit_request(Role.ROLLOUT, "policy", "req-2") == "req-2"
+
+    # Once offloaded, it loads again.
+    manager.complete_request("req-2")
+    manager.deactivate(Role.ROLLOUT)
+    manager.activate(Role.ROLLOUT, "policy")
+    assert rollout.calls.count("onload") == loads + 1
+
+
+def test_manager_drain_of_a_failed_offload_keeps_it_dead_and_loads_on_activate() -> None:
+    manager, pools = _shared()
+    judge = pools["genrm"]
+    manager.lifecycle.switch([], [Role.GENRM], timeout=0.01)
+    offload = judge.offload
+    judge.offload = lambda: (_ for _ in ()).throw(RuntimeError("release failed"))
+    with pytest.raises(RuntimeError, match="release failed"):
+        manager.deactivate(Role.GENRM, "judge")
+    judge.offload = offload
+
+    manager.drain([Role.GENRM])
+    assert manager.snapshot(Role.GENRM).models[0].state == LifecycleState.DEAD
+    loads = judge.calls.count("onload")
+    manager.activate(Role.GENRM, "judge")
+    assert judge.calls.count("onload") == loads + 1
+
+
+def test_manager_drops_an_observation_that_spans_offload_and_onload() -> None:
+    pool = FakePool("policy", version="1")
+    manager = _manager(rollout={"policy": pool})
+    observe = pool.observe
+
+    def late_refresh() -> tuple[threading.Thread, threading.Event]:
+        taken, land = threading.Event(), threading.Event()
+
+        def slow_observe() -> ModelSnapshot:
+            snapshot = observe()
+            taken.set()
+            land.wait(5.0)
+            return snapshot
+
+        pool.observe = slow_observe
+        thread = threading.Thread(target=manager.refresh, args=(Role.ROLLOUT, "policy"))
+        thread.start()
+        assert taken.wait(5.0)
+        pool.observe = observe
+        return thread, land
+
+    # A READY observation taken before the offload lands while asleep.
+    thread, land = late_refresh()
+    manager.deactivate(Role.ROLLOUT, "policy")
+    land.set()
+    thread.join(5.0)
+    assert manager.snapshot(Role.ROLLOUT).models[0].state == LifecycleState.SLEEPING
+    with pytest.raises(RuntimeError, match="not ready"):
+        manager.admit_request(Role.ROLLOUT, "policy")
+
+    # One taken before the offload lands after the next onload with new weights.
+    manager.activate(Role.ROLLOUT, "policy")
+    thread, land = late_refresh()
+    manager.deactivate(Role.ROLLOUT, "policy")
+    pool.version = "2"
+    manager.activate(Role.ROLLOUT, "policy")
+    land.set()
+    thread.join(5.0)
+    model = manager.snapshot(Role.ROLLOUT).models[0]
+    assert (model.state, model.required_weight_version) == (LifecycleState.READY, "2")
 
 
 def test_lifecycle_switch_offloads_outgoing_before_onloading_incoming() -> None:
@@ -350,6 +479,151 @@ def test_manager_split_roles_load_without_waiting() -> None:
     manager.activate(Role.GENRM, "judge")
     manager.activate(Role.ROLLOUT, "policy")
     assert judge.onloaded and policy.onloaded
+
+
+def test_manager_rollout_offload_waits_for_a_request_admitted_by_the_gateway() -> None:
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    from relax.components.inference_gateway import InferenceGateway
+    from relax.distributed.ray.rollout import RolloutEnginePool
+
+    manager, pools = _shared()
+    policy = pools["rollout"]
+    manager.activate(Role.ROLLOUT, "policy")
+    # The rollout service offloads through the real pool hook, over fake engines.
+    rollout_pool = SimpleNamespace(
+        status="onload", servers={"policy": None}, inference_manager=manager, health_monitoring_pause=lambda: None
+    )
+    rollout_pool.offload_local = MethodType(RolloutEnginePool.offload_local, rollout_pool)
+    manager._rollout_pool = rollout_pool
+    handle = SimpleNamespace(
+        **{
+            name: SimpleNamespace(remote=partial(asyncio.to_thread, getattr(manager, name)))
+            for name in ("snapshot", "admit_request", "complete_request")
+        }
+    )
+    gateway = InferenceGateway(Role.ROLLOUT, manager_handle=handle)
+
+    def request() -> Request:
+        async def receive():
+            return {"type": "http.request", "body": b'{"text": "hi"}', "more_body": False}
+
+        return Request({"type": "http", "method": "POST", "path": "/generate", "headers": []}, receive)
+
+    async def scenario() -> None:
+        admitted, forward = asyncio.Event(), asyncio.Event()
+        engine_loaded = []
+
+        async def hold_before_forwarding(*args, **kwargs):
+            # Admitted, not yet sent to the engine.
+            admitted.set()
+            await forward.wait()
+            engine_loaded.append(policy.onloaded)
+            return Response(), True
+
+        gateway._forward = hold_before_forwarding
+        proxied = asyncio.create_task(gateway.proxy(request(), "generate"))
+        await admitted.wait()
+        # What components/rollout.py runs after each generate.
+        offload = asyncio.create_task(asyncio.to_thread(manager.deactivate, Role.ROLLOUT))
+        await asyncio.sleep(0.1)
+
+        assert not offload.done() and policy.calls[-1] == "onload"
+        assert manager.snapshot(Role.ROLLOUT).models[0].state == LifecycleState.DRAINING
+        assert (await gateway.proxy(request(), "generate")).status_code == 503
+        with pytest.raises(TimeoutError, match="rollout"):
+            await asyncio.to_thread(manager.lifecycle.switch, [], [Role.GENRM], 0.01)
+
+        forward.set()
+        await proxied
+        await offload
+        assert engine_loaded == [True] and policy.calls[-1] == "offload"
+
+    asyncio.run(scenario())
+    assert manager.snapshot(Role.ROLLOUT).models[0].state == LifecycleState.SLEEPING
+    assert manager.rollout_released() and rollout_pool.status == "offload"
+
+
+def test_manager_deactivate_keeps_waiting_and_the_gpus_held_without_force_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings = _warnings(monkeypatch)
+    manager, pools = _shared()
+    judge = pools["genrm"]
+    manager.lifecycle.switch([], [Role.GENRM], timeout=0.01)
+    manager.admit_request(Role.GENRM, "judge", "req-1")
+
+    releaser = _start(manager.deactivate, Role.GENRM, None, 0.01)
+    assert releaser.is_alive() and len(warnings) > 1
+    # Admission stays closed and the memory is still held.
+    assert judge.calls[-1] == "onload"
+    assert manager.snapshot(Role.GENRM).models[0].state == LifecycleState.DRAINING
+    with pytest.raises(TimeoutError, match="genrm"):
+        manager.lifecycle.switch([], [Role.TEACHER], timeout=0.01)
+
+    manager.complete_request("req-1")
+    releaser.join(5.0)
+    assert not releaser.is_alive() and judge.calls[-1] == "offload"
+    manager.lifecycle.switch([], [Role.TEACHER], timeout=0.01)
+    assert pools["teacher"].onloaded
+
+
+def test_manager_force_abort_aborts_the_engines_before_releasing() -> None:
+    manager, pools = _shared()
+    judge = pools["genrm"]
+    manager.lifecycle.switch([], [Role.GENRM], timeout=0.01)
+    manager.admit_request(Role.GENRM, "judge", "req-1")
+
+    manager.deactivate(Role.GENRM, timeout=0.01, force_abort=True)
+
+    assert judge.calls[-2:] == ["abort", "offload"]
+    assert manager.snapshot(Role.GENRM).models[0].state == LifecycleState.SLEEPING
+    # The aborted request was forgotten; its late completion is harmless.
+    manager.complete_request("req-1")
+    manager.lifecycle.switch([], [Role.TEACHER], timeout=0.01)
+    assert pools["teacher"].onloaded
+
+
+def test_manager_failed_force_abort_keeps_the_gpus_held() -> None:
+    manager, pools = _shared()
+    judge = pools["genrm"]
+    manager.lifecycle.switch([], [Role.GENRM], timeout=0.01)
+    manager.admit_request(Role.GENRM, "judge", "req-1")
+    judge.abort_requests = lambda: (_ for _ in ()).throw(RuntimeError("abort failed"))
+
+    with pytest.raises(RuntimeError, match="abort failed"):
+        manager.deactivate(Role.GENRM, timeout=0.01, force_abort=True)
+
+    assert judge.calls[-1] == "onload"
+    assert manager.snapshot(Role.GENRM).models[0].state == LifecycleState.DRAINING
+    with pytest.raises(RuntimeError, match="not ready"):
+        manager.admit_request(Role.GENRM, "judge")
+    with pytest.raises(TimeoutError, match="genrm"):
+        manager.lifecycle.switch([], [Role.TEACHER], timeout=0.01)
+    assert not pools["teacher"].onloaded
+
+
+def test_manager_shutdown_waits_for_admitted_requests_before_stopping() -> None:
+    pool = FakePool("judge")
+    manager = _manager(genrm={"judge": pool})
+    manager.admit_request(Role.GENRM, "judge", "req-1")
+
+    stopper = _start(manager.shutdown, Role.GENRM, "judge")
+    assert stopper.is_alive() and "shutdown" not in pool.calls
+    manager.complete_request("req-1")
+    stopper.join(5.0)
+    assert not stopper.is_alive() and pool.calls == ["shutdown"]
+
+
+def test_manager_shutdown_aborts_requests_after_its_grace_period(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(inference_manager, "SHUTDOWN_DRAIN_TIMEOUT_S", 0.01)
+    pool = FakePool("judge")
+    manager = _manager(genrm={"judge": pool})
+    manager.admit_request(Role.GENRM, "judge", "req-1")
+
+    manager.shutdown(Role.GENRM, "judge")
+    assert pool.calls == ["abort", "shutdown"]
 
 
 def test_manager_failed_offload_keeps_the_gpus_held() -> None:

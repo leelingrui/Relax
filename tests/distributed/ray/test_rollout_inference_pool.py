@@ -107,6 +107,19 @@ def test_static_server_offload_and_onload_are_idempotent(patch_ray_get: Any) -> 
     assert server.observe().state == LifecycleState.READY
 
 
+def test_server_abort_requests_reaches_every_live_head_engine(patch_ray_get: Any) -> None:
+    first, second = _observed_engine(), _observed_engine()
+    for engine in (first, second):
+        engine.abort_requests.remote.return_value = AwaitableValue(None)
+    groups = [make_engine_group(engines=[first, None]), make_engine_group(engines=[second], rank_offset=2)]
+    server = make_rollout_server(engine_groups=groups)
+
+    server.abort_requests()
+
+    first.abort_requests.remote.assert_called_once_with()
+    second.abort_requests.remote.assert_called_once_with()
+
+
 def test_static_server_retries_offload_after_a_failed_release(patch_ray_get: Any, monkeypatch: Any) -> None:
     engine = _observed_engine(None)
     server = make_rollout_server(engine_groups=[make_engine_group(engines=[engine])])

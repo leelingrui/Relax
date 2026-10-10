@@ -35,8 +35,9 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 # Generation has finished by the time a role is switched out, so nothing should
-# still be in flight; the bound turns a request that never completes into a
-# failed switch instead of a hung training step.
+# still be in flight. A load waiting longer than this for its GPUs fails; a
+# drain logs a warning every time this elapses, or aborts the requests when
+# asked to.
 SWITCH_DRAIN_TIMEOUT_S = 600.0
 
 
@@ -51,7 +52,9 @@ class LifecyclePort(Protocol):
 
     def resident(self, role: Role) -> bool: ...
 
-    def drain(self, roles: Sequence[Role | str], timeout: float = SWITCH_DRAIN_TIMEOUT_S) -> None: ...
+    def drain(
+        self, roles: Sequence[Role | str], timeout: float = SWITCH_DRAIN_TIMEOUT_S, force_abort: bool = False
+    ) -> None: ...
 
     def activate(self, role: Role | str, model_id: str | None = None, tags: list[str] | None = None) -> None: ...
 

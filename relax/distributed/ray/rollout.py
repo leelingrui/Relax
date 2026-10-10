@@ -793,6 +793,14 @@ class RolloutServer:
             handles.extend(g.offload())
         return ray.get(handles) if handles else []
 
+    def abort_requests(self) -> None:
+        """Abort everything the live engines run; a forced drain calls it.
+
+        Each engine's abort is best-effort and never raises; a dead engine runs
+        nothing.
+        """
+        self._call_heads("abort_requests")
+
     def onload(self, tags: list[str] | None = None):
         """Resume memory occupation across all groups (concurrent)."""
         if self.static and self.onloaded:
@@ -3414,8 +3422,8 @@ class RolloutEnginePool:
 
     def refresh_inference_state(self) -> None:
         """Publish observed health, registration and policy versions."""
-        for name, server in self.servers.items():
-            self.inference_manager.publish(Role.ROLLOUT, server.observe())
+        for name in self.servers:
+            self.inference_manager.refresh(Role.ROLLOUT, name)
 
     def list_all_scale_out_requests(
         self, model_name: Optional[str] = None, status_filter: Optional[str] = None
