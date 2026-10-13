@@ -55,7 +55,13 @@ def rollout_metrics_module(monkeypatch):
         GPU_MEMORY_TYPE_KV_CACHE="kv",
         GPU_MEMORY_TYPE_WEIGHTS="weights",
     )
-    stub("relax.backends.sglang.sglang_engine", SGLangEngine=object, EngineMemoryStateUnknown=RuntimeError)
+    stub(
+        "relax.backends.sglang.sglang_engine",
+        SGLangEngine=object,
+        EngineMemoryStateUnknown=RuntimeError,
+        RouterWorkerCleanup=object,
+        remove_dead_router_worker=unused,
+    )
     stub("relax.utils.tracking_utils", init_tracking=unused)
     stub("relax.utils.opd.opd_utils", compute_mopd_metrics=lambda *args: {})
     stub("relax.utils.utils", get_ray_accelerator_kwargs=unused)

@@ -246,7 +246,9 @@ class HealthChecker:
 
         def _runner():
             try:
-                # Recovery may stop the training loop; it must not run on it.
+                # Recovery stops the shared async loop before shutting Ray down.
+                # Run checks on this thread's own loop so that recovery can join
+                # the shared loop thread instead of attempting to join itself.
                 asyncio.run(self._check_loop())
             except Exception as e:
                 logger.error(f"Health checker error: {e}")
@@ -266,7 +268,7 @@ class HealthChecker:
 
         self._stop_event.set()
         logger.debug("Signaling health checker to stop")
-        if self._thread is threading.current_thread():
+        if threading.current_thread() is self._thread:
             return
         self._thread.join(timeout)
 

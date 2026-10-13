@@ -390,3 +390,71 @@ def test_offload_retires_an_engine_whose_release_was_not_confirmed(
         server.offload()
     assert group.all_engines == [unknown, released] and server.onloaded
     kill.assert_not_called()
+
+
+def _recorded_group(engine: Any, record_value: Any = None) -> Any:
+    from ray.core.generated.gcs_pb2 import ActorTableData
+
+    from relax.distributed.ray import rollout
+
+    engine._get_local_state.return_value = ActorTableData.ALIVE
+    group = make_engine_group(engines=[engine])
+    value = record_value if record_value is not None else {"url": "http://w:1", "pid": 1, "node_id": "n"}
+    group.engine_init_records = {0: rollout._EngineInitRecord(value)}
+    return group
+
+
+def test_rollout_observe_confirmed_slots_publish_a_complete_observation(patch_ray_get: Any) -> None:
+    pool = _pool([_recorded_group(_observed_engine())])
+    model = _model(pool)
+    assert model.admission and model.issues == ()
+    assert pool.owner.snapshot(Role.ROLLOUT).to_dict()["observation"] == {"complete": True, "issues": []}
+
+
+def test_rollout_observe_skips_the_probe_while_init_is_pending(patch_ray_get: Any) -> None:
+    from unittest.mock import patch
+
+    from relax.distributed.ray import rollout
+
+    pending = object()
+    get = rollout.ray.get
+
+    def ray_get(ref: Any, **kwargs: Any) -> Any:
+        if ref is pending:
+            raise ray.exceptions.GetTimeoutError("init is still running")
+        return get(ref, **kwargs)
+
+    engine = _observed_engine()
+    pool = _pool([_recorded_group(engine, pending)])
+    engine.get_inference_observation.remote.reset_mock()
+    # Scoped inside the test: restoring after patch_ray_get would leak its mock.
+    with patch.object(rollout.ray, "get", ray_get):
+        model = _model(pool)
+    assert model.replicas[0].state == LifecycleState.STARTING
+    assert model.issues == (("default/0/0", "init_pending"),)
+    engine.get_inference_observation.remote.assert_not_called()
+    observation = pool.owner.snapshot(Role.ROLLOUT).to_dict()["observation"]
+    assert observation == {"complete": False, "issues": [{"scope": "default/0/0", "reason": "init_pending"}]}
+
+
+def test_rollout_observe_reports_a_dead_actor_still_in_its_slot(patch_ray_get: Any) -> None:
+    from ray.core.generated.gcs_pb2 import ActorTableData
+
+    engine = _observed_engine()
+    group = _recorded_group(engine)
+    pool = _pool([group])
+    engine._get_local_state.return_value = ActorTableData.DEAD
+    engine.get_inference_observation.remote.reset_mock()
+    model = _model(pool)
+    assert model.replicas[0].state == LifecycleState.DEAD
+    assert model.issues == (("default/0/0", "actor_dead_unreconciled"),)
+    engine.get_inference_observation.remote.assert_not_called()
+
+
+def test_rollout_topology_change_marks_the_observation_incomplete(patch_ray_get: Any) -> None:
+    pool = _pool([_recorded_group(_observed_engine())])
+    _model(pool)
+    pool._events.changed("default")
+    model = pool.owner.snapshot(Role.ROLLOUT).models[0]
+    assert model.issues == (("default", "topology_unsettled"),)
+    assert _model(pool).issues == ()

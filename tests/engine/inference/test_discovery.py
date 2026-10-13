@@ -109,3 +109,16 @@ def test_discovery_defaults_topology_revision_for_payload_without_it() -> None:
     payload.pop("topology_revision")
 
     assert role_snapshot_from_dict(payload).topology_revision == 0
+
+
+def test_discovery_observation_survives_round_trip_and_ignores_status_filter() -> None:
+    from dataclasses import replace
+
+    base = _snapshot()
+    model = replace(base.models[0], issues=(("teacher/0/1", "init_pending"),))
+    snapshot = replace(base, models=(model,))
+    observation = {"complete": False, "issues": [{"scope": "teacher/0/1", "reason": "init_pending"}]}
+    assert snapshot.to_dict(status_filter="dead")["observation"] == observation
+    assert snapshot.to_legacy_dict()["observation"] == observation
+    assert role_snapshot_from_dict(snapshot.to_dict()) == snapshot
+    assert _snapshot().to_dict()["observation"] == {"complete": True, "issues": []}

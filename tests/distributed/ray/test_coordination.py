@@ -712,13 +712,15 @@ class TestLegacyDiscoveryContract:
         assert len(group.engines) == 2
         assert [e["rank"] for e in engines] == [4, 5, 6, 7]
         assert [e["status"] for e in engines] == ["active", "active", "dead", "dead"]
-        assert engines[0]["url"] == "http://head:30000"
-        assert "url" not in engines[1]
         head.health_generate.remote.assert_not_called()
 
     def test_rollout_discovery_unknown_model_is_empty(self):
         manager = create_test_manager(servers={"default": make_rollout_server()})
-        assert manager.get_engines_info("missing") == {"models": {}, "total_engines": 0}
+        assert manager.get_engines_info("missing") == {
+            "models": {},
+            "total_engines": 0,
+            "observation": {"complete": True, "issues": []},
+        }
 
     def test_rollout_discovery_topology_revision_increments_on_slot_change(self, patch_ray_get):
         from relax.engine.inference.types import Role
@@ -751,11 +753,16 @@ class TestLegacyDiscoveryContract:
 
         assert updated.topology_revision > initial.topology_revision
 
-    def test_rollout_discovery_rpc_failure_still_reports_active(self, patch_ray_get):
+    def test_rollout_discovery_unobserved_engine_still_reports_active(self, patch_ray_get):
+        # Metadata comes from the init record, never a getter RPC; without one
+        # the slot is still listed as active and the observation is incomplete.
         engine = make_mock_engine()
-        engine.get_url.remote.side_effect = RuntimeError("unreachable")
         manager = create_test_manager(
             servers={"default": make_rollout_server(engine_groups=[make_engine_group(engines=[engine])])}
         )
         result = manager.get_engines_info()
-        assert result["models"]["default"]["engine_groups"][0]["engines"] == [{"rank": 0, "status": "active"}]
+        [row] = result["models"]["default"]["engine_groups"][0]["engines"]
+        assert (row["rank"], row["status"]) == (0, "active")
+        assert "url" not in row
+        assert result["observation"]["complete"] is False
+        engine.get_url.remote.assert_not_called()

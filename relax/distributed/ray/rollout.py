@@ -6,6 +6,7 @@ import asyncio
 import copy
 import dataclasses
 import enum
+import functools
 import logging
 import multiprocessing
 import os
@@ -18,10 +19,17 @@ from typing import Any, Callable, Optional
 import numpy as np
 import ray
 import requests
+import sglang_router
+from packaging.version import parse
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
-from relax.backends.sglang.sglang_engine import EngineMemoryStateUnknown, SGLangEngine
+from relax.backends.sglang.sglang_engine import (
+    EngineMemoryStateUnknown,
+    RouterWorkerCleanup,
+    SGLangEngine,
+    remove_dead_router_worker,
+)
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.inference.config import (
@@ -63,6 +71,7 @@ from relax.utils.metrics.metric_utils import (
     compute_pass_rate,
     compute_rollout_reward_metrics,
     compute_rollout_step,
+    compute_rollout_stop_reason_and_turn_metrics,
     compute_statistics,
     dict_add_prefix,
     has_repetition,
@@ -308,6 +317,103 @@ class EngineGroupLifecycle(str, enum.Enum):
 
 
 @dataclasses.dataclass
+class _EngineInitRecord:
+    # Replace only this generation's value, never a shared slot from a GET.
+    value: ray.ObjectRef | dict[str, str | int | None]
+    # Internal cleanup target, not readiness metadata exposed by /engines.
+    router_url: str | None = None
+    router_cleanup: RouterWorkerCleanup | None = None
+
+
+def _get_engine_actor_states() -> Any | None:
+    try:
+        from ray.actor import ActorHandle
+        from ray.core.generated.gcs_pb2 import ActorTableData
+
+        states = ActorTableData.ActorState
+        if not callable(getattr(ActorHandle, "_get_local_state", None)) or states.Name(states.ALIVE) != "ALIVE":
+            raise RuntimeError("Ray local actor state capability unavailable")
+        return states
+    except Exception:
+        logger.error("Engine observation requires Ray local actor state support", exc_info=True)
+        return None
+
+
+@functools.cache
+def _cached_engine_actor_states() -> Any | None:
+    """The Ray actor-state capability, probed once per process."""
+    return _get_engine_actor_states()
+
+
+def _read_local_actor_state(engine: Any, actor_states: Any | None) -> tuple[str, str | None]:
+    if actor_states is None:
+        return "UNKNOWN", "actor_state_unavailable"
+    try:
+        state = engine._get_local_state()
+    except Exception:
+        logger.debug("Failed to read local engine actor state", exc_info=True)
+        return "UNKNOWN", "actor_state_unavailable"
+    try:
+        name = actor_states.Name(state) if state is not None else "UNKNOWN"
+    except (ValueError, TypeError):
+        name = "UNKNOWN"
+    except Exception:
+        logger.debug("Failed to decode local engine actor state", exc_info=True)
+        return "UNKNOWN", "actor_state_unavailable"
+    if name == "ALIVE":
+        return name, None
+    if name == "DEAD":
+        return name, "actor_dead_unreconciled"
+    return name, "actor_state_unknown" if name == "UNKNOWN" else f"actor_state:{name}"
+
+
+def _read_engine_metadata(
+    group: "EngineGroup", slot: int, engine: Any, record: _EngineInitRecord | None, actor_states: Any | None
+) -> tuple[dict[str, str | int | None] | None, str, str | None]:
+    metadata, state, issue = None, "ABSENT", None
+    if engine is not None:
+        state, issue = _read_local_actor_state(engine, actor_states)
+        if state == "ALIVE":
+            if record is None:
+                issue = "missing_record"
+            else:
+                value = record.value
+                if isinstance(value, dict):
+                    metadata = value
+                else:
+                    try:
+                        value = ray.get(value, timeout=0)
+                    except ray.exceptions.GetTimeoutError:
+                        issue = "init_pending"
+                    except Exception:
+                        logger.debug("Failed to read engine initialization result", exc_info=True)
+                        issue = "init_unreadable"
+                    else:
+                        if (
+                            isinstance(value, dict)
+                            and {"url", "pid", "node_id"} <= value.keys()
+                            and (value["url"] is None or (isinstance(value["url"], str) and bool(value["url"])))
+                            and type(value["pid"]) is int
+                            and isinstance(value["node_id"], str)
+                        ):
+                            metadata = {key: value[key] for key in ("url", "pid", "node_id")}
+                            record.value = metadata
+                        else:
+                            issue = "metadata_invalid"
+            state, state_issue = _read_local_actor_state(engine, actor_states)
+            if state != "ALIVE":
+                metadata, issue = None, state_issue
+    # Every outcome, including missing records and failed reads, is generation checked.
+    if (
+        slot >= len(group.all_engines)
+        or group.all_engines[slot] is not engine
+        or group.engine_init_records.get(slot) is not record
+    ):
+        metadata, issue = None, "generation_changed"
+    return dict(metadata) if metadata is not None else None, state, issue
+
+
+@dataclasses.dataclass
 class EngineGroup:
     """A group of homogeneous SGLang engines with the same configuration.
 
@@ -348,6 +454,7 @@ class EngineGroup:
     # the handle that was removed: a retried scale-in skips the Router for an
     # engine it could not stop, which may no longer answer.
     router_removed: dict[int, Any] = dataclasses.field(default_factory=dict, repr=False)
+    engine_init_records: dict[int, _EngineInitRecord] = dataclasses.field(default_factory=dict)
 
     def notify_topology_change(self) -> None:
         if self.on_topology_change is not None:
@@ -435,6 +542,8 @@ class EngineGroup:
         for i in (rank for replica in self.spec.replicas for rank in replica.node_ranks):
             if self.all_engines[i] is not None:
                 continue
+
+            self.engine_init_records.pop(i, None)
 
             global_rank = self.rank_offset + i
             num_gpus = self.ray_num_gpus
@@ -539,16 +648,27 @@ class EngineGroup:
                 base_port=base_port,
             )
 
-        init_handles = [
-            engine.init.remote(
+        init_handles = []
+        for rank, engine in rollout_engines:
+            # Match _compute_server_args: group overrides win over allocation.
+            engine_addr = addr_and_ports[rank] | self.sglang_overrides
+            init_ref = engine.init.remote(
                 **(addr_and_ports[rank]),
                 router_ip=self.router_ip,
                 router_port=self.router_port,
                 skip_dcs_registration=self.skip_dcs_registration,
                 skip_router_registration=self.skip_router_registration,
             )
-            for rank, engine in rollout_engines
-        ]
+            self.engine_init_records[rank - self.rank_offset] = _EngineInitRecord(
+                init_ref,
+                router_url=(
+                    f"http://{_wrap_ipv6(engine_addr['host'])}:{engine_addr['port']}"
+                    if "host" in engine_addr and "port" in engine_addr
+                    else None
+                ),
+                router_cleanup=RouterWorkerCleanup(engine._actor_id.hex()),
+            )
+            init_handles.append(init_ref)
         return init_handles, port_cursors
 
     def onload(self, tags: list[str] | None = None):
@@ -723,6 +843,58 @@ class RolloutServer:
         """Recover dead engines across all active groups, overlapping init."""
         groups = list(self.engine_groups)
         dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in groups]
+
+        # FullyAsync can keep updating surviving DCS recipients while cleanup
+        # is retried. Do not return None slots to the synchronous weight updater.
+        for group, dead_indices in zip(groups, dead_per_group, strict=True):
+            if not (
+                getattr(group.args, "fully_async", False)
+                and group.is_scaled_out
+                and group.pg is not None
+                and group.skip_router_registration
+                and group.lifecycle_status is EngineGroupLifecycle.ACTIVE
+                and group.router_ip
+                and group.router_port
+                and not getattr(group.args, "use_slime_router", False)
+                and group.sglang_overrides.get("dp_size", getattr(group.args, "sglang_dp_size", 1)) == 1
+                and parse(sglang_router.__version__) >= parse("0.3.0")
+            ):
+                continue
+            for slot in dead_indices:
+                if slot % group.nodes_per_engine:
+                    continue
+                record = group.engine_init_records.get(slot)
+                removed = False
+                try:
+                    if record is not None:
+                        worker_url = record.value["url"] if isinstance(record.value, dict) else record.router_url
+                        if worker_url is None:
+                            metadata = (
+                                record.value if isinstance(record.value, dict) else ray.get(record.value, timeout=0)
+                            )
+                            worker_url = metadata["url"]
+                        if isinstance(worker_url, str) and worker_url and record.router_cleanup is not None:
+                            removed = remove_dead_router_worker(
+                                f"http://{group.router_ip}:{group.router_port}",
+                                worker_url,
+                                record.router_cleanup,
+                            )
+                except Exception as error:
+                    logger.warning("Cannot read dead engine init metadata for cleanup (%s)", type(error).__name__)
+                if not removed:
+                    self.num_new_engines = 0
+                    logger.warning(
+                        "[Recovery] Deferred recreation until old Router entry is removed: rank=%s",
+                        group.rank_offset + slot,
+                    )
+                    return
+                logger.info(
+                    "[Recovery] Removed old Router entry before recreation: rank=%s url=%s actor=%s worker_id=%s",
+                    group.rank_offset + slot,
+                    worker_url,
+                    record.router_cleanup.actor_id,
+                    record.router_cleanup.worker_id,
+                )
 
         all_handles = []
         port_cursors: dict[int, int] = {}
@@ -947,18 +1119,35 @@ class RolloutServer:
         """
         serving = self.onloaded and serving
         policy = self.model_spec is None or self.model_spec.needs_weight_update
+        actor_states = _cached_engine_actor_states()
         replicas = []
+        issues: list[tuple[str, str]] = []
         router_members_ready = True
         pd_workers: dict[str, list[ReplicaSnapshot]] = {"prefill": [], "decode": []}
-        for group in tuple(self.engine_groups):
+        for group_index, group in enumerate(tuple(self.engine_groups)):
             if group.worker_type == "placeholder":
                 continue
             for replica_index in range(0, len(group.all_engines), group.nodes_per_engine):
                 nodes = group.all_engines[replica_index : replica_index + group.nodes_per_engine]
                 head = nodes[0] if nodes else None
                 alive = len(nodes) == group.nodes_per_engine and all(node is not None for node in nodes)
+                # Local evidence first: a dead actor or an unfinished init is
+                # known without a probe, which would only wait on that actor.
+                slots = range(replica_index, replica_index + len(nodes))
+                records = [group.engine_init_records.get(slot) for slot in slots]
+                skip_probe = False
+                for slot, node, record in zip(slots, nodes, records, strict=True):
+                    if node is None:
+                        continue
+                    _, state, issue = _read_engine_metadata(group, slot, node, record, actor_states)
+                    if issue is None:
+                        continue
+                    issues.append((f"{self.model_name}/{group_index}/{group.rank_offset + slot}", issue))
+                    if state == "DEAD":
+                        alive = False
+                    skip_probe = skip_probe or issue == "init_pending"
                 observation = {}
-                if alive:
+                if alive and not skip_probe:
                     try:
                         result = ray.get(head.get_inference_observation.remote(ensure_router=serving), timeout=45)
                         observation = result if isinstance(result, dict) else {}
@@ -967,6 +1156,18 @@ class RolloutServer:
                         # separates that from a real engine death.
                         logger.warning(f"Observation of {group.replica_identity(replica_index)} failed: {e!r}")
                         alive = False
+                if any(
+                    slot >= len(group.all_engines)
+                    or group.all_engines[slot] is not node
+                    or group.engine_init_records.get(slot) is not record
+                    for slot, node, record in zip(slots, nodes, records, strict=True)
+                ):
+                    # The slot was replaced while it was observed; the evidence
+                    # belongs to the old generation.
+                    issues.append(
+                        (f"{self.model_name}/{group_index}/{group.rank_offset + replica_index}", "generation_changed")
+                    )
+                    observation = {}
                 version = observation.get("weight_version")
                 ready = bool(
                     alive
@@ -1014,6 +1215,7 @@ class RolloutServer:
             ready,
             required_weight_version=next(iter(versions)) if policy and len(versions) == 1 else None,
             pd_workers=tuple((kind, worker) for kind, workers in pd_workers.items() for worker in workers),
+            issues=tuple(issues),
         )
 
 
@@ -1078,6 +1280,7 @@ class RolloutEnginePool:
         self._weight_sync_lock = Lock.options(
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
+        self._engine_actor_states = _get_engine_actor_states()
         if self.args.debug_train_only:
             self.servers: dict[str, RolloutServer] = {}
         else:
@@ -1923,7 +2126,28 @@ class RolloutEnginePool:
                 placement_group_view(binding, PlacementOwner.MANAGER),
             )[0]
 
-            # Step 2: Create EngineGroup (skip router registration during init)
+            # Step 2: Create EngineGroup (skip router registration during init).
+            # Inherit model/config overrides from the original regular group. Runtime may have
+            # remapped ``args.hf_checkpoint`` to a node-local SHM path; reusing it on a fresh elastic
+            # node makes SGLang treat the missing dir as a HF repo ID. Prefer a non-scaled baseline
+            # group so retries don't copy state from a partially initialized dynamic group.
+            template_group = next(
+                (
+                    group
+                    for group in srv.engine_groups
+                    if group.worker_type == "regular"
+                    and not group.is_scaled_out
+                    and group.lifecycle_status is EngineGroupLifecycle.ACTIVE
+                ),
+                next(
+                    (
+                        group
+                        for group in srv.engine_groups
+                        if group.worker_type == "regular" and group.lifecycle_status is EngineGroupLifecycle.ACTIVE
+                    ),
+                    srv.engine_groups[0],
+                ),
+            )
             new_group = EngineGroup(
                 args=self.args,
                 pg=binding,
@@ -1933,6 +2157,7 @@ class RolloutEnginePool:
                 worker_type="regular",
                 rank_offset=engine_offset,
                 gpu_offset=placement.reserved_offset,
+                sglang_overrides=dict(template_group.sglang_overrides),
                 router_ip=srv.router_ip,
                 router_port=srv.router_port,
                 model_id=srv.model_name,
@@ -2025,7 +2250,7 @@ class RolloutEnginePool:
             request.update_status(ScaleOutStatus.FAILED, f"Model '{request.model_name}' not found")
             return
 
-        new_engines = []
+        new_pairs: list[tuple[Any, ray.ObjectRef]] = []
         failed_engine_actors = []
         failure_reasons: list[ScaleOutFailure] = []
         try:
@@ -2076,7 +2301,7 @@ class RolloutEnginePool:
                         skip_router_registration=True,
                     )
                     await asyncio.wait_for(init_handle, timeout=per_engine_timeout)
-                    new_engines.append(engine)
+                    new_pairs.append((engine, init_handle))
                 except Exception as e:
                     request.failed_engines.append(f"engine_{i}")
                     failed_engine_actors.append(engine)
@@ -2086,14 +2311,14 @@ class RolloutEnginePool:
                     logger.warning(f"Failed to connect to external engine {addr}: {e}")
 
             # Step 2: Apply partial success policy
-            if request.failed_engines and new_engines:
+            if request.failed_engines and new_pairs:
                 policy = self.args.scale_out_partial_success_policy
                 if policy == "rollback_all":
                     logger.warning(
                         f"Partial failure ({len(request.failed_engines)} failed), "
                         f"rolling back all per policy '{policy}'"
                     )
-                    await self._rollback_engines(new_engines + failed_engine_actors)
+                    await self._rollback_engines([engine for engine, _ in new_pairs] + failed_engine_actors)
                     # rollback_all commits 0 engines, so treat it like a full
                     # failure: surface the aggregated root cause, not just the policy.
                     reason_str = scale_utils._aggregate_scale_out_reasons(failure_reasons)
@@ -2109,11 +2334,11 @@ class RolloutEnginePool:
                 else:
                     logger.warning(
                         f"Partial failure ({len(request.failed_engines)} failed), "
-                        f"keeping {len(new_engines)} successful engines per policy '{policy}'"
+                        f"keeping {len(new_pairs)} successful engines per policy '{policy}'"
                     )
                     await self._rollback_engines(failed_engine_actors)
 
-            if not new_engines:
+            if not new_pairs:
                 await self._rollback_engines(failed_engine_actors)
                 connect_reason = scale_utils._aggregate_scale_out_reasons(failure_reasons)
                 request.failure_categories = scale_utils._scale_out_failure_categories(failure_reasons)
@@ -2129,7 +2354,7 @@ class RolloutEnginePool:
             result = await self._finalize_engine_group_registration(
                 request=request,
                 srv=srv,
-                engines=new_engines,
+                engine_init_pairs=new_pairs,
                 rank_offset=total_engines,
                 router_ip=router_ip,
                 router_port=router_port,
@@ -2137,7 +2362,7 @@ class RolloutEnginePool:
             )
 
             if result.success:
-                request.engine_ids = [f"engine_{total_engines + i}" for i in range(len(new_engines))]
+                request.engine_ids = [f"engine_{total_engines + i}" for i in range(len(new_pairs))]
                 self._update_scale_out_final_status(
                     request, srv, request.engine_ids, request.failed_engines, failure_reasons
                 )
@@ -2145,10 +2370,10 @@ class RolloutEnginePool:
                 if request.engine_ids:
                     request.update_status(ScaleOutStatus.ACTIVE)
                     logger.info(
-                        f"External scale-out completed: {len(new_engines)} engines connected to model '{request.model_name}'"
+                        f"External scale-out completed: {len(new_pairs)} engines connected to model '{request.model_name}'"
                     )
             else:
-                await self._rollback_engines(new_engines)
+                await self._rollback_engines([engine for engine, _ in new_pairs])
                 if result.reason is not None:
                     request.failure_categories = scale_utils._scale_out_failure_categories([result.reason])
                 request.update_status(
@@ -2163,7 +2388,7 @@ class RolloutEnginePool:
             request.update_status(ScaleOutStatus.FAILED, f"External scale-out failed: {failure.message()}")
             logger.exception(f"External scale-out failed for request {request.request_id}")
             # Clean up all engines
-            all_actors = new_engines + failed_engine_actors
+            all_actors = [engine for engine, _ in new_pairs] + failed_engine_actors
             if all_actors:
                 await self._rollback_engines(all_actors)
 
@@ -2173,8 +2398,9 @@ class RolloutEnginePool:
         self,
         request: ScaleOutRequest,
         srv: RolloutServer,
-        engines: list,
+        engines: list | None = None,
         *,
+        engine_init_pairs: list[tuple[Any, ray.ObjectRef]] | None = None,
         engine_group: EngineGroup | None = None,
         rank_offset: int = 0,
         router_ip: str | None = None,
@@ -2193,6 +2419,7 @@ class RolloutEnginePool:
             request: The scale-out request.
             srv: The target RolloutServer.
             engines: List of engine actors (already started/connected).
+            engine_init_pairs: Successful actor/init-ref pairs (for external mode).
             engine_group: Pre-created EngineGroup (for ray_native mode). If None, creates one.
             rank_offset: Rank offset for new engines (used when creating EngineGroup).
             router_ip: Router IP address.
@@ -2206,6 +2433,8 @@ class RolloutEnginePool:
             precheck transport / DCS / router) so the caller can surface the
             real root cause instead of a generic message.
         """
+        if engine_init_pairs is not None:
+            engines = [engine for engine, _ in engine_init_pairs]
         replica_str = f"Replica {replica_idx}" if replica_idx is not None else "Engines"
         remaining_timeout = max(10.0, request.timeout_secs - (time.time() - request.created_at))
 
@@ -2276,6 +2505,7 @@ class RolloutEnginePool:
                 args=self.args,
                 pg=None,  # External mode doesn't need placement group
                 all_engines=engines,
+                engine_init_records={i: _EngineInitRecord(ref) for i, (_, ref) in enumerate(engine_init_pairs or [])},
                 num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
                 num_new_engines=len(engines),
                 worker_type="regular",
@@ -3309,7 +3539,8 @@ class RolloutEnginePool:
         """
         if status_filter not in (None, "active", "dead"):
             raise ValueError("status_filter must be one of: active, dead")
-        result = {"models": {}, "total_engines": 0}
+        issues: list[dict[str, str]] = []
+        result = {"models": {}, "total_engines": 0, "observation": {"complete": True, "issues": issues}}
 
         models_to_query = {model_name: self._get_server(model_name)} if model_name else self.servers
 
@@ -3324,7 +3555,7 @@ class RolloutEnginePool:
                 "total_engines": 0,
             }
 
-            for i, group in enumerate(srv.engine_groups):
+            for i, group in enumerate(list(srv.engine_groups)):
                 group_info = {
                     "group_index": i,
                     "worker_type": group.worker_type,
@@ -3333,37 +3564,25 @@ class RolloutEnginePool:
                     "engines": [],
                 }
 
-                # Batch-fetch URLs and pid/node_id for all live engines in this group via remote calls
-                live_indices = [j for j, e in enumerate(group.all_engines) if e is not None]
-                engine_urls = {}
-                engine_pids = {}
-                engine_node_ids = {}
-                if live_indices:
-                    try:
-                        url_refs = [group.all_engines[j].get_url.remote() for j in live_indices]
-                        pid_node_refs = [group.all_engines[j].get_pid_and_node_id.remote() for j in live_indices]
-                        urls = ray.get(url_refs, timeout=10)
-                        pid_nodes = ray.get(pid_node_refs, timeout=10)
-                        engine_urls = dict(zip(live_indices, urls))
-                        engine_pids = {idx: pn["pid"] for idx, pn in zip(live_indices, pid_nodes)}
-                        engine_node_ids = {idx: pn["node_id"] for idx, pn in zip(live_indices, pid_nodes)}
-                    except Exception:
-                        logger.debug("Failed to batch-fetch engine URLs/pids, skipping URL info")
-
-                for j, engine in enumerate(group.all_engines):
+                for j, engine in enumerate(list(group.all_engines)):
                     status = "active" if engine is not None else "dead"
+                    record = group.engine_init_records.get(j)
+                    # Observe every slot, so a filtered view still reports an incomplete pool.
+                    metadata, state, issue = _read_engine_metadata(group, j, engine, record, self._engine_actor_states)
+                    if issue is not None:
+                        issues.append({"scope": f"{name}/{i}/{group.rank_offset + j}", "reason": issue})
                     if status_filter is not None and status_filter != status:
                         continue
                     engine_info = {
                         "rank": group.rank_offset + j,
                         "status": status,
                     }
-                    if j in engine_urls and engine_urls[j] is not None:
-                        engine_info["url"] = engine_urls[j]
-                    if j in engine_pids:
-                        engine_info["pid"] = engine_pids[j]
-                    if j in engine_node_ids:
-                        engine_info["node_id"] = engine_node_ids[j]
+                    engine_info["actor_state"] = state
+                    if metadata is not None:
+                        engine_info["pid"] = metadata["pid"]
+                        engine_info["node_id"] = metadata["node_id"]
+                        if metadata["url"] is not None:
+                            engine_info["url"] = metadata["url"]
                     group_info["engines"].append(engine_info)
 
                 model_info["engine_groups"].append(group_info)
@@ -3372,6 +3591,7 @@ class RolloutEnginePool:
             result["models"][name] = model_info
             result["total_engines"] += model_info["total_engines"]
 
+        result["observation"]["complete"] = not issues
         return result
 
     def list_all_scale_out_requests(
@@ -5176,6 +5396,9 @@ def compute_metrics_from_samples(
     rollout_id: int | None = None,
     include_rloo_diagnostics: bool = True,
 ):
+    if not samples:
+        return {}
+
     rewarded_samples = [sample for sample in samples if sample.reward is not None]
     reward_cat_key = args.log_reward_category
     reward_category_samples = (
@@ -5204,9 +5427,7 @@ def compute_metrics_from_samples(
     log_dict |= compute_mopd_metrics(args, rewarded_samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
-    log_dict["num_turn/mean"] = np.mean([s.metadata.get("rollout_turns", 1) for s in samples]).item()
-    log_dict["num_turn/max"] = np.max([s.metadata.get("rollout_turns", 1) for s in samples]).item()
-    log_dict["num_turn/min"] = np.min([s.metadata.get("rollout_turns", 1) for s in samples]).item()
+    log_dict |= compute_rollout_stop_reason_and_turn_metrics(samples)
     if rollout_id is not None and args.partial_rollout and not args.fully_async:
         staleness_gaps = [rollout_id - sample.metadata.get("start_rollout_id", rollout_id) for sample in samples]
         log_dict["staleness/avg"] = np.mean(staleness_gaps).item()
