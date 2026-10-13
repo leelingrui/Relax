@@ -1479,9 +1479,13 @@ class FSDPTrainRayActor(TrainRayActor):
             phase_lap("actor_offload")
         if offload_engine:
             import ray
+            import torch.distributed as dist
 
             from relax.engine.inference.types import Role
+            from relax.utils.distributed_utils import get_gloo_group
 
+            # Wait for every actor to finish offloading before restoring rollout memory.
+            dist.barrier(group=get_gloo_group())
             onload_error = None
             try:
                 ray.get(self.inference_manager.activate.remote(Role.ROLLOUT))
@@ -2311,7 +2315,6 @@ class FSDPTrainRayActor(TrainRayActor):
             "trajectory_slots",
             "trajectory_refs",
             "advantages",
-            "raw_reward",
             "total_lengths",
             "skip_optimizer_step",
         ]

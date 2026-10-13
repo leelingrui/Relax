@@ -52,6 +52,7 @@ def role_snapshot_from_dict(payload: Mapping[str, Any]) -> RoleSnapshot:
                 admission=bool(model_payload.get("admission", False)),
                 required_weight_version=model_payload.get("required_weight_version"),
                 pd_workers=pd_workers,
+                issues=tuple((issue["scope"], issue["reason"]) for issue in model_payload.get("issues", ())),
             )
         )
     routing_payload = payload.get("routing", {})

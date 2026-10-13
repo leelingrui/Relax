@@ -95,6 +95,9 @@ class ModelSnapshot:
     # PD prefill/decode workers as ``(worker_type, worker)``. Diagnostic only:
     # requests use the Router, so these are never replicas or direct targets.
     pd_workers: tuple[tuple[str, ReplicaSnapshot], ...] = ()
+    # ``(scope, reason)`` for every engine slot this observation could not
+    # confirm; any issue makes the view incomplete, so scaling must wait.
+    issues: tuple[tuple[str, str], ...] = ()
 
     def to_dict(self, status_filter: str | None = None) -> dict[str, Any]:
         if status_filter not in (None, "active", "dead"):
@@ -117,6 +120,7 @@ class ModelSnapshot:
                 for worker_type, worker in self.pd_workers
                 if keep(worker)
             ],
+            "issues": [{"scope": scope, "reason": reason} for scope, reason in self.issues],
         }
 
 
@@ -174,7 +178,14 @@ class RoleSnapshot:
             "phase": self.phase,
             "routing": self.routing.to_dict(),
             "models": {model.model_id: model.to_dict(status_filter) for model in self.models},
+            "observation": self.observation(),
         }
+
+    def observation(self) -> dict[str, Any]:
+        """Whether every engine slot of the role was confirmed, independent of
+        any status filter."""
+        issues = [{"scope": scope, "reason": reason} for model in self.models for scope, reason in model.issues]
+        return {"complete": not issues, "issues": issues}
 
     def to_legacy_dict(self, status_filter: str | None = None) -> dict[str, Any]:
         """Project discovery to the legacy rollout ``/engines`` shape.
@@ -212,7 +223,7 @@ class RoleSnapshot:
                 "total_engines": len(engines),
             }
             total_engines += len(engines)
-        return {"models": models, "total_engines": total_engines}
+        return {"models": models, "total_engines": total_engines, "observation": self.observation()}
 
 
 @dataclass(frozen=True)

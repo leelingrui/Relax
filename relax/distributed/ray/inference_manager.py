@@ -395,10 +395,15 @@ class InferenceManager:
         return _RoleEvents(self, Role(role))
 
     def _topology_changed(self, role: Role, model_id: str) -> None:
-        """Close admission at once; an observation reopens it."""
+        """Close admission at once; an observation reopens it.
+
+        Until then the published replicas predate the change, so the view is
+        marked incomplete.
+        """
         with self._lock:
             if model_id in self._models.get(role, {}):
-                self.set_state(role, model_id, LifecycleState.STARTING)
+                model = _with_state(self._model(role, model_id).snapshot, LifecycleState.STARTING)
+                self.publish(role, replace(model, issues=((model_id, "topology_unsettled"),)))
 
     def _topology_settled(self, role: Role, model_id: str) -> None:
         """Queue an observation for the refresher thread."""
