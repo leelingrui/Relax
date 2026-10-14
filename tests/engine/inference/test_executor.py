@@ -272,6 +272,36 @@ async def test_executor_aborts_a_cancelled_request(entry) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "suffixes"),
+    [
+        ({"input_ids": [[1], [2]], "sampling_params": {}}, ["_0", "_1"]),
+        # n > 1 samples run under fresh random rids; the offload drain reclaims them.
+        ({"input_ids": [1], "sampling_params": {"n": 2}}, []),
+    ],
+)
+async def test_gateway_aborts_the_rids_the_engine_runs(monkeypatch, payload: dict, suffixes: list[str]) -> None:
+    monkeypatch.setattr(executor_module, "_RETRY_BACKOFF_S", 0.0)
+    manager = _Manager()
+
+    async def lost(request, base):
+        raise httpx.ReadTimeout("reply lost", request=request)
+
+    async def adapt(key, messages, sampling_params=None):
+        return dict(payload)
+
+    engine = _Engine(lost)
+    call = _gateway_entry(manager, httpx.AsyncClient(transport=httpx.MockTransport(engine)), adapt)
+
+    status, _ = await call()
+
+    assert status == 502
+    ((target, sent),) = engine.generates
+    assert engine.aborts == [(target, sent["rid"] + suffix) for suffix in suffixes]
+    manager.assert_each_permit_returned_once()
+
+
+@pytest.mark.asyncio
 async def test_executor_returns_the_permit_when_tokenization_fails(entry) -> None:
     manager, engine = _Manager(), _Engine()
 

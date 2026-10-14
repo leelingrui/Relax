@@ -639,8 +639,8 @@ def test_manager_gateway_retries_with_one_request_id_each_hold_the_drain() -> No
         assert await admitted.get() == "first"
         second = asyncio.create_task(gateway.proxy(request(), "generate"))
         assert await admitted.get() == "second"
-        # The caller's ID reaches the engine as its rid.
-        assert rids == ["retry", "retry"]
+        # The caller's ID only traces; each attempt runs under its own engine rid.
+        assert len(set(rids)) == 2 and "retry" not in rids
 
         released["first"].set()
         await first
