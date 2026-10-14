@@ -1371,9 +1371,13 @@ def validate_task_layout(args: Any) -> None:
     resource = getattr(args, "resource", None) or {}
     engines = not getattr(args, "debug_train_only", False)
 
-    def stand_in(name: str, role: str) -> tuple[str, tuple[int, ...], tuple[int, ...]] | None:
+    # Nothing is placed yet, so a stand-in carries the logical layout alone.
+    def stand_in(name: str, role: str) -> PlacementGroupView | None:
         num_gpus = int(resource[role][1]) if role in resource else 0
-        return (f"preflight/{name}", tuple(range(num_gpus)), tuple(range(num_gpus))) if num_gpus else None
+        if not num_gpus:
+            return None
+        gpus = tuple(range(num_gpus))
+        return PlacementGroupView(gpus, gpus, PlacementOwner.CONTROLLER, identity=f"preflight/{name}")
 
     # Sync colocate hands the actor placement group to rollout and GenRM; the
     # colocated teacher builds that same group first.

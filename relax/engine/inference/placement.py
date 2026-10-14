@@ -71,22 +71,20 @@ class PlacementBinding(NamedTuple):
 
     Entry ``i`` of ``bundle_indices``, ``gpu_ids`` and ``node_ids`` describes
     logical slot ``i``. ``node_ids`` holds Ray node ids, which -- unlike node
-    IPs or hostnames -- name one machine exactly once; it is ``None`` only for
-    a binding that was never probed (a legacy 3-tuple).
+    IPs or hostnames -- name one machine exactly once.
     """
 
     pg: Any
     bundle_indices: tuple[int, ...]
     gpu_ids: tuple[int, ...]
-    node_ids: tuple[str, ...] | None = None
+    node_ids: tuple[str, ...]
 
     @classmethod
-    def coerce(cls, value: Any) -> "PlacementBinding":
-        """Accept a binding or a legacy ``(pg, bundle_indices, gpu_ids)``."""
-        if isinstance(value, cls):
-            return value
-        pg, bundle_indices, gpu_ids = value
-        return cls(pg, tuple(bundle_indices), tuple(gpu_ids), None)
+    def require(cls, value: Any) -> "PlacementBinding":
+        """Return ``value`` if it is a probed binding, else raise."""
+        if not isinstance(value, cls):
+            raise TypeError(f"Expected a probed PlacementBinding, got {type(value).__name__}")
+        return value
 
 
 @dataclass(frozen=True)
@@ -112,7 +110,7 @@ class PlacementGroupView:
             tuple(binding.gpu_ids),
             owner,
             identity=binding.pg,
-            node_ids=None if binding.node_ids is None else tuple(binding.node_ids),
+            node_ids=tuple(binding.node_ids),
             bundle_count=bundle_count if isinstance(bundle_count, int) else None,
         )
 

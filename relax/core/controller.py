@@ -766,7 +766,7 @@ class Controller:
             if pgs is None:
                 role_nodes[role] = set()
                 continue
-            binding = PlacementBinding.coerce(pgs)
+            binding = PlacementBinding.require(pgs)
             pg, bundle_indices = binding.pg, binding.bundle_indices
             if id(pg) not in seen_pgs:
                 refs = [

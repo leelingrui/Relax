@@ -69,7 +69,7 @@ class RayTrainGroup:
 
         # Use placement group to lock resources for models of same type
         assert pg is not None
-        binding = PlacementBinding.coerce(pg)
+        binding = PlacementBinding.require(pg)
         pg, reordered_bundle_indices = binding.pg, binding.bundle_indices
 
         env_vars = {

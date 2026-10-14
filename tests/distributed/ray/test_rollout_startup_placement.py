@@ -700,14 +700,12 @@ def test_rollout_startup_bad_binding_removes_only_a_group_it_created(startup, mo
     assert removed == [pg.pg] and startup.groups == []
 
 
-def test_placement_group_view_requires_a_binding_for_a_group_it_created():
-    legacy = (MagicMock(), [0, 1], [0, 1])
+def test_placement_group_view_requires_a_probed_binding():
+    unprobed = (MagicMock(), [0, 1], [0, 1])
 
-    with pytest.raises(ValueError, match="node binding"):
-        module.placement_group_view(legacy, PlacementOwner.MANAGER)
-    # A borrowed legacy group is still planned, on its logical layout only.
-    view = module.placement_group_view(legacy, PlacementOwner.CONTROLLER)
-    assert view.node_ids is None and view.gpu_ids == (0, 1)
+    for owner in (PlacementOwner.MANAGER, PlacementOwner.CONTROLLER):
+        with pytest.raises(TypeError, match="probed PlacementBinding"):
+            module.placement_group_view(unprobed, owner)
 
 
 def test_placement_preview_checks_the_binding_before_startup():
