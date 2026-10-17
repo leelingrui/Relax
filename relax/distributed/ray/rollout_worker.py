@@ -68,9 +68,13 @@ class RolloutWorker:
         # Ray/cloudpickle may reconstruct class globals outside the module namespace.
         sys.modules[__name__]._LOCAL_INFERENCE_MANAGER = inference_manager_handle
         if args.use_agentic_rollout:
-            from relax.agentic.rollout import init_agentic_resident_pipeline
+            from relax.agentic.rollout import bind_agentic_router, init_agentic_resident_pipeline
 
             init_agentic_resident_pipeline(args, data_source, self.workload.data_system_client)
+            # Managed static PD publishes its Router only after the engines
+            # are registered, so the Session owners may not have it yet.
+            if args.sglang_router_ip is not None:
+                bind_agentic_router(args.sglang_router_ip, args.sglang_router_port)
 
     def reload_function_by_name(self, module_name: str) -> dict:
         return self.workload.reload_function_by_name(module_name)

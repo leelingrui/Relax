@@ -76,6 +76,9 @@ def _is_colocate(config: Namespace) -> bool:
 logger = get_logger(__name__)
 
 ACTOR_ROLLOUT_PG_ROLES = ["actor", "rollout", GENRM_ROLE]
+# Bounds the inference manager's engine and Router cleanup so it finishes
+# before the driver's 60s signal-exit watchdog.
+INFERENCE_SHUTDOWN_TIMEOUT_S = 35.0
 # ``auto`` may resolve to a node-local full checkpoint on a single-node engine,
 # while ``runai_streamer`` keeps the model source on raw S3.  Be conservative:
 # cleanup is enabled only when the configured plan cannot retain SHM weights.
@@ -1189,7 +1192,7 @@ class Controller:
         # started in its own process.
         if self._inference_manager_handle is not None:
             try:
-                ray.get(self._inference_manager_handle.shutdown_all.remote())
+                ray.get(self._inference_manager_handle.shutdown_all.remote(), timeout=INFERENCE_SHUTDOWN_TIMEOUT_S)
             except Exception as e:
                 logger.warning(f"Failed to shut down the inference manager: {e}")
 
@@ -1436,7 +1439,7 @@ class Controller:
             # A failed stop (stuck engine, dead manager) must not abort recovery:
             # ray.shutdown() below still reclaims the GPUs.
             try:
-                ray.get(self._inference_manager_handle.shutdown_all.remote())
+                ray.get(self._inference_manager_handle.shutdown_all.remote(), timeout=INFERENCE_SHUTDOWN_TIMEOUT_S)
                 logger.info("[Global Restart] Inference engines and owned routers shut down")
             except Exception as e:
                 logger.warning(f"[Global Restart] Failed to shut down the inference manager: {e}")

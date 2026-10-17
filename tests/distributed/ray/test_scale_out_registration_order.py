@@ -141,6 +141,61 @@ async def test_ray_native_replica_uses_manager_owned_planned_slice():
 
 
 @pytest.mark.asyncio
+async def test_ray_native_multinode_replica_allocates_one_slot_per_actor():
+    args = make_mock_args(num_gpus_per_node=8, rollout_num_gpus_per_engine=16)
+    manager = create_test_manager(args=args)
+    server = make_rollout_server()
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
+    engines = [make_mock_engine(), make_mock_engine()]
+    group = SimpleNamespace(
+        engines=engines,
+        start_engines=MagicMock(return_value=([AwaitableValue(None)] * 2, {})),
+    )
+    captured = {}
+
+    def capture_group(**kwargs):
+        captured.update(kwargs)
+        return group
+
+    manager._finalize_engine_group_registration = AsyncMock(return_value=EngineFinalizeResult(True, group=group))
+
+    info_actor = MagicMock()
+    # Two nodes of eight GPUs, probed bundle by bundle.
+    info_actor.get_ip_gpu_and_node_id.remote.side_effect = [
+        AwaitableValue((f"10.0.0.{index // 8 + 1}", index % 8, f"node-{index // 8}")) for index in range(16)
+    ]
+    info_actor_class = MagicMock()
+    info_actor_class.options.return_value.remote.return_value = info_actor
+
+    with (
+        patch("relax.distributed.ray.rollout.EngineGroup", side_effect=capture_group),
+        patch("relax.distributed.ray.rollout.ray.kill"),
+    ):
+        result = await manager._bring_up_single_replica(
+            request=request,
+            srv=server,
+            pg=object(),
+            replica_idx=0,
+            num_gpus=16,
+            gpus_per_engine=16,
+            engine_offset=2,
+            sort_key=lambda item: item,
+            InfoActor=info_actor_class,
+        )
+
+    assert result.success is True
+    assert captured["all_engines"] == [None, None]
+    manager._finalize_engine_group_registration.assert_awaited_once_with(
+        request=request,
+        srv=server,
+        engines=engines,
+        engine_group=group,
+        replica_idx=0,
+        log_prefix="[ScaleOut]",
+    )
+
+
+@pytest.mark.asyncio
 async def test_ray_native_scale_out_inherits_canonical_model_override():
     args = make_mock_args(hf_checkpoint="/dev/shm/node-local-model")
     template = make_engine_group(args=args)
