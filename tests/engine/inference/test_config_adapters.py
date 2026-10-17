@@ -6,14 +6,12 @@ from relax.engine.inference import config_adapters
 
 
 def test_teacher_env_matches_rollout_genrm_stability_envs(monkeypatch):
-    # RELAX_OPD_PREEXPANDED_PATCH is passed through from the driver env (default
-    # "0"); set it so the test verifies the pass-through, not the default value.
-    monkeypatch.setenv("RELAX_OPD_PREEXPANDED_PATCH", "1")
+    monkeypatch.setenv("SGLANG_MM_AVOID_RETOKENIZE", "false")
     args = SimpleNamespace(fp16=True)
 
     env = config_adapters._build_teacher_engine_env(args)
 
-    assert env["RELAX_OPD_PREEXPANDED_PATCH"] == "1"
+    assert env["SGLANG_MM_AVOID_RETOKENIZE"] == "true"
     assert env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] == "false"
     assert env["SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"] == "true"
     assert env["SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK"] == "true"

@@ -2879,9 +2879,18 @@ class MegatronTrainRayActor(TrainRayActor):
             ray.get(onload_handles)
 
         if self.args.use_fault_tolerance:
-            if dist.get_rank() == 0:
-                ray.get(self.inference_manager.rollout_operation.remote("recover_rollout_engines"))
-            dist.barrier(group=get_gloo_group())
+            process_group = get_gloo_group()
+            recovery_error = [None]
+            if dist.get_rank(process_group) == 0:
+                try:
+                    ray.get(self.inference_manager.rollout_operation.remote("recover_rollout_engines"))
+                except Exception as error:
+                    recovery_error[0] = f"{type(error).__name__}: {error}"
+            # Propagate failure before any rank starts weight sync. A rank-0
+            # exception must not leave its peers waiting at a barrier.
+            dist.broadcast_object_list(recovery_error, src=0, group=process_group)
+            if recovery_error[0] is not None:
+                raise RuntimeError(f"Rollout engine recovery failed: {recovery_error[0]}")
 
         rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
             self.inference_manager.rollout_operation.remote("get_rollout_engines_and_lock")

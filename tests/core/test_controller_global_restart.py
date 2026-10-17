@@ -103,7 +103,7 @@ def _patched_restart_controller(monkeypatch, events):
     monkeypatch.setattr(module.serve, "delete", lambda name: events.append(name))
     monkeypatch.setattr(module.serve, "shutdown", lambda: events.append("serve_shutdown"))
     monkeypatch.setattr(module.serve, "start", lambda **kwargs: None)
-    monkeypatch.setattr(module.ray, "get", lambda ref: ref)
+    monkeypatch.setattr(module.ray, "get", lambda ref, timeout=None: ref)
     monkeypatch.setattr(module.ray, "shutdown", lambda: events.append("ray_shutdown"))
     monkeypatch.setattr(module.ray, "init", lambda **kwargs: events.append("ray_init"))
     monkeypatch.setattr(module.tq, "close", lambda: events.append("tq"))
@@ -136,3 +136,24 @@ def test_global_restart_continues_when_inference_shutdown_fails(monkeypatch):
     controller._run_global_restart()
 
     assert events.index("dcs_coordinator") < events.index("ray_shutdown") < events.index("ray_init")
+
+
+def test_inference_shutdown_is_bounded_on_restart_and_shutdown(monkeypatch):
+    """Router cleanup must finish before the driver's signal-exit watchdog."""
+    import relax.core.controller as module
+
+    events = []
+    controller = _patched_restart_controller(monkeypatch, events)
+    timeouts = []
+    monkeypatch.setattr(module.ray, "get", lambda ref, timeout=None: timeouts.append(timeout))
+
+    controller._run_global_restart()
+
+    controller._inference_manager_handle = MagicMock()
+    controller._teacher_manager = None
+    controller._shutdown_agentic_rollout_services = lambda: None
+    controller._cleanup_s3_model_weights_after_init = lambda: None
+    monkeypatch.setattr(module, "shutdown_managed_opd_teacher", lambda manager: None)
+    controller.shutdown()
+
+    assert timeouts.count(module.INFERENCE_SHUTDOWN_TIMEOUT_S) == 2
