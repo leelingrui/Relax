@@ -46,7 +46,8 @@ class AdmittedRequest:
 
     ``dispatched`` means an engine may have seen the request; ``finished``
     means the upstream reported its outcome. A dispatched request that never
-    finished is aborted on release.
+    finished is aborted on release, by ``engine_rids`` when set (the IDs the
+    engine actually runs, e.g. ``rid_0..rid_k`` for a batch), else by ``rid``.
     """
 
     model_id: str
@@ -54,6 +55,7 @@ class AdmittedRequest:
     via_router: bool
     permit: str
     rid: str
+    engine_rids: tuple[str, ...] | None = None
     dispatched: bool = False
     finished: bool = False
     released: bool = False
@@ -191,6 +193,9 @@ class InferenceRequestExecutor:
         aborted itself. An ACK only proves the scheduler received it, never
         that the request left the running batch.
         """
+        rids = (request.rid,) if request.engine_rids is None else request.engine_rids
+        if not rids:
+            return
         if request.via_router:
             try:
                 urls = await self._worker_base_urls(request.target)
@@ -199,16 +204,18 @@ class InferenceRequestExecutor:
                 return
         else:
             urls = [request.target]
+        # SGLang matches an abort against one exact rid.
+        targets = [(url, rid) for url in urls for rid in rids]
         results = await asyncio.gather(
             *(
-                self.client.post(f"{url}/abort_request", json={"rid": request.rid}, timeout=_ABORT_TIMEOUT_S)
-                for url in urls
+                self.client.post(f"{url}/abort_request", json={"rid": rid}, timeout=_ABORT_TIMEOUT_S)
+                for url, rid in targets
             ),
             return_exceptions=True,
         )
-        for url, result in zip(urls, results, strict=False):
+        for (url, rid), result in zip(targets, results, strict=False):
             if isinstance(result, BaseException):
-                logger.warning("Abort of %s at %s failed: %s", request.rid, url, result)
+                logger.warning("Abort of %s at %s failed: %s", rid, url, result)
 
     async def _worker_base_urls(self, target: str) -> list[str]:
         from relax.utils.http_utils import router_worker_base_urls

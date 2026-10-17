@@ -537,7 +537,7 @@ def test_start_engines_records_original_refs_and_preserves_live_slots(monkeypatc
     group.skip_router_registration = group.is_scaled_out
     if mode == "native_recover":
         group.sglang_overrides = {"host": "::1", "port": 32000}
-    group.pg = (object(), list(range(8)), list(range(8)))
+    group.pg = rollout.PlacementBinding(object(), tuple(range(8)), tuple(range(8)), ("node-0",) * 8)
     group.args = SimpleNamespace(
         num_gpus_per_node=8,
         rollout_num_gpus=8,
@@ -611,7 +611,7 @@ def test_start_engines_preserves_submitted_record_on_later_synchronous_failure(m
         rollout_external=True,
         hf_checkpoint="/test/model",
     )
-    group.pg = (object(), list(range(8)), list(range(8)))
+    group.pg = rollout.PlacementBinding(object(), tuple(range(8)), tuple(range(8)), ("node-0",) * 8)
     first_ref = InitResult(pending=True)
     first.init.remote.return_value = first_ref
     second.init.remote.side_effect = RuntimeError("second init submission failed")

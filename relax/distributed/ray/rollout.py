@@ -423,7 +423,7 @@ class EngineGroup:
     """
 
     args: Any
-    pg: Any  # PlacementBinding, or a legacy (placement_group, bundle_indices, gpu_ids)
+    pg: Any  # PlacementBinding
     all_engines: list
     num_gpus_per_engine: int
     num_new_engines: int
@@ -522,7 +522,7 @@ class EngineGroup:
             # Engines run only on a slice the planner resolved and checked;
             # re-deriving it here would bypass that check.
             raise ValueError(f"Engine group {self.model_id}/{self.worker_type} has no planned placement slice")
-        binding = PlacementBinding.coerce(self.pg)
+        binding = PlacementBinding.require(self.pg)
         pg, reordered_gpu_ids = binding.pg, binding.gpu_ids
 
         validate_server_group_gpu_indices(
@@ -3767,8 +3767,11 @@ class RolloutEnginePool:
 
         return result
 
-    def set_weight_updating(self, is_updating: bool) -> bool:
+    def _set_weight_updating(self, is_updating: bool) -> bool:
         """Acquire or release the fully-async topology lease.
+
+        Only ``InferenceManager.begin_weight_update`` / ``end_weight_update``
+        drive it, so the lease and the Manager's admission stay in step.
 
         A DRAINING group owns the scale-in fence, so a new update must retry.
         An update admitted first may finish; scale-in waits for this owner to
@@ -5038,21 +5041,8 @@ def _placement_requests(
 
 
 def placement_group_view(pg: Any, owner: PlacementOwner) -> PlacementGroupView:
-    """The planner view of a ready placement group, with its node binding.
-
-    A group this control plane created is always probed, so a binding without
-    node ids there is a bug, not a degraded mode. One handed in by a caller may
-    predate probing; it is planned on its logical layout, loudly.
-    """
-    binding = PlacementBinding.coerce(pg)
-    if binding.node_ids is None:
-        if owner.removable:
-            raise ValueError("A placement group created by this control plane must carry its node binding")
-        logger.warning(
-            "Placement group %s has no node binding; only its logical layout is checked",
-            binding.pg,
-        )
-    return PlacementGroupView.from_binding(binding, owner)
+    """The planner view of a ready placement group, with its node binding."""
+    return PlacementGroupView.from_binding(PlacementBinding.require(pg), owner)
 
 
 def placement_preview(
@@ -5068,10 +5058,14 @@ def placement_preview(
     """What :func:`start_servers` would plan, for a dry run before any engine
     starts.
 
-    Takes the same placement arguments. Without ``pg`` the view stands in for
-    the dedicated group ``start_servers`` would create, sized to fit.
+    Takes the same placement arguments; ``pg`` may also be a view standing in
+    for a group not created yet. Without ``pg`` the view stands in for the
+    dedicated group ``start_servers`` would create, sized to fit.
     """
     requests = _placement_requests(args, models, role=role, bundle_offset=bundle_offset, phase=phase)
+    if isinstance(pg, PlacementGroupView):
+        # A preflight stand-in for a group that does not exist yet.
+        return pg, requests
     if pg is not None:
         return placement_group_view(pg, PlacementOwner.CONTROLLER), requests
     size = sum(model.total_num_gpus for model in models)

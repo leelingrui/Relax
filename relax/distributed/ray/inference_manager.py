@@ -406,10 +406,19 @@ class InferenceManager:
                 self.publish(role, replace(model, issues=((model_id, "topology_unsettled"),)))
 
     def _topology_settled(self, role: Role, model_id: str) -> None:
-        """Queue an observation for the refresher thread."""
+        """Queue an observation for the refresher thread.
+
+        Until it is published, the replicas on view predate the change (a
+        scale-out reports only this), so the view is marked incomplete;
+        admission stays as it is.
+        """
         with self._lock:
             if model_id not in self._models.get(role, {}):
                 return
+            snapshot = self._model(role, model_id).snapshot
+            unsettled = (model_id, "topology_unsettled")
+            if unsettled not in snapshot.issues:
+                self.publish(role, replace(snapshot, issues=(*snapshot.issues, unsettled)))
             self._stale.add((role, model_id))
             self._stale_added.notify_all()
             if self._refresher is None:
@@ -737,7 +746,7 @@ class InferenceManager:
         """
         role = Role(role)
         pool = self._rollout_pool if role is Role.ROLLOUT else None
-        if source == WEIGHT_UPDATE_FULLY_ASYNC and pool is not None and not pool.set_weight_updating(True):
+        if source == WEIGHT_UPDATE_FULLY_ASYNC and pool is not None and not pool._set_weight_updating(True):
             return False
         with self._lock:
             self._weight_updates.setdefault(role, set()).add(source)
@@ -757,7 +766,7 @@ class InferenceManager:
         with self._lock:
             self._weight_updates.get(role, set()).discard(source)
         if source == WEIGHT_UPDATE_FULLY_ASYNC and role is Role.ROLLOUT and self._rollout_pool is not None:
-            self._rollout_pool.set_weight_updating(False)
+            self._rollout_pool._set_weight_updating(False)
         for model_id in self.model_ids(role):
             self._observe(role, model_id)
 
@@ -1034,9 +1043,8 @@ def _loads_kv_cache(tags: Sequence[str] | None) -> bool:
     """Whether a load of ``tags`` leaves the model able to serve."""
     if tags is None:
         return True
-    from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-
-    return GPU_MEMORY_TYPE_KV_CACHE in tags
+    # SGLang's ``GPU_MEMORY_TYPE_KV_CACHE``; the CPU control plane does not import SGLang.
+    return "kv_cache" in tags
 
 
 def _with_state(model: ModelSnapshot, state: LifecycleState) -> ModelSnapshot:
@@ -1371,9 +1379,13 @@ def validate_task_layout(args: Any) -> None:
     resource = getattr(args, "resource", None) or {}
     engines = not getattr(args, "debug_train_only", False)
 
-    def stand_in(name: str, role: str) -> tuple[str, tuple[int, ...], tuple[int, ...]] | None:
+    # Nothing is placed yet, so a stand-in carries the logical layout alone.
+    def stand_in(name: str, role: str) -> PlacementGroupView | None:
         num_gpus = int(resource[role][1]) if role in resource else 0
-        return (f"preflight/{name}", tuple(range(num_gpus)), tuple(range(num_gpus))) if num_gpus else None
+        if not num_gpus:
+            return None
+        gpus = tuple(range(num_gpus))
+        return PlacementGroupView(gpus, gpus, PlacementOwner.CONTROLLER, identity=f"preflight/{name}")
 
     # Sync colocate hands the actor placement group to rollout and GenRM; the
     # colocated teacher builds that same group first.

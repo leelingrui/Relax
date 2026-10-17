@@ -65,6 +65,7 @@ def _capture_engine_runtime_env(monkeypatch, args, sglang_overrides):
     )
 
     from relax.engine.inference.placement import (
+        PlacementBinding,
         PlacementGroupView,
         PlacementOwner,
         PlacementPlanner,
@@ -72,7 +73,7 @@ def _capture_engine_runtime_env(monkeypatch, args, sglang_overrides):
     )
 
     group = make_engine_group(args=args, engines=[None], num_gpus_per_engine=1)
-    group.pg = (object(), [0], [0])
+    group.pg = PlacementBinding(object(), (0,), (0,), ("node-0",))
     (group.placement,) = PlacementPlanner().plan(
         (PlacementRequest("rollout/group-0", "regular", 1, 1, 1),),
         PlacementGroupView((0,), (0,), PlacementOwner.CONTROLLER, identity=group.pg[0]),

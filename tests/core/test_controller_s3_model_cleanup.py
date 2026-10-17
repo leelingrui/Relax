@@ -508,3 +508,23 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
 
 async def _async_noop():
     return None
+
+
+def test_controller_aborted_rollout_shuts_down_rollout_engines(monkeypatch):
+    instance = controller.Controller.__new__(controller.Controller)
+    shutdowns = []
+    instance._inference_manager_handle = SimpleNamespace(
+        shutdown=SimpleNamespace(remote=lambda role: shutdowns.append(role) or "shutdown_ref")
+    )
+    service = SimpleNamespace(_deployed=True, _stop_heartbeat_thread=lambda: None)
+    gets = []
+    monkeypatch.setattr(controller.ray, "get", lambda ref, timeout=None: gets.append(ref))
+    monkeypatch.setattr(controller.serve, "delete", lambda _role: None)
+    warnings = []
+    monkeypatch.setattr(controller.logger, "warning", warnings.append)
+
+    instance._cleanup_aborted_service("rollout", service, deploy=True)
+
+    assert shutdowns == [controller.Role.ROLLOUT]
+    assert gets == ["shutdown_ref"]
+    assert warnings == []

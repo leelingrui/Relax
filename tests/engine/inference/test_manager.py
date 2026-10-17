@@ -639,8 +639,8 @@ def test_manager_gateway_retries_with_one_request_id_each_hold_the_drain() -> No
         assert await admitted.get() == "first"
         second = asyncio.create_task(gateway.proxy(request(), "generate"))
         assert await admitted.get() == "second"
-        # The caller's ID reaches the engine as its rid.
-        assert rids == ["retry", "retry"]
+        # The caller's ID only traces; each attempt runs under its own engine rid.
+        assert len(set(rids)) == 2 and "retry" not in rids
 
         released["first"].set()
         await first
@@ -1156,7 +1156,7 @@ class FakeEnginePool:
     def health_monitoring_pause(self) -> None:
         self.calls.append("pause")
 
-    def set_weight_updating(self, is_updating: bool) -> bool:
+    def _set_weight_updating(self, is_updating: bool) -> bool:
         self.calls.append(f"lease={is_updating}")
         return not (is_updating and self.lease_refused)
 
@@ -1366,6 +1366,24 @@ def test_manager_topology_events_only_record_and_the_manager_observes() -> None:
     assert _state(manager).state == LifecycleState.READY
 
 
+def test_manager_settled_topology_is_incomplete_until_observed() -> None:
+    manager, _, _ = _rollout_role("policy")
+    manager.activate(Role.ROLLOUT)
+    manager._refresher = threading.current_thread()  # Keep the refresher thread out of it.
+
+    # A scale-out reports only that it settled: until the Manager observes,
+    # discovery must not present the old replicas as the complete view.
+    manager.topology_events(Role.ROLLOUT).settled("policy")
+    model = _state(manager)
+    assert model.issues == (("policy", "topology_unsettled"),)
+    assert model.state == LifecycleState.READY and model.admission
+    assert not manager.snapshot(Role.ROLLOUT).observation()["complete"]
+
+    manager._refresh_stale()
+    assert _state(manager).issues == ()
+    assert manager.snapshot(Role.ROLLOUT).observation()["complete"]
+
+
 def test_manager_rollout_operation_observes_what_the_operation_changed() -> None:
     manager, engine_pool, pools = _rollout_role("policy")
     manager.activate(Role.ROLLOUT)
@@ -1380,3 +1398,13 @@ def test_manager_rollout_operation_observes_what_the_operation_changed() -> None
     engine_pool.execute_scale_out = scale
     assert manager.rollout_operation("execute_scale_out", "policy") == "done"
     assert _state(manager).state == LifecycleState.READY
+
+
+def test_manager_rollout_operation_refuses_the_weight_update_lease() -> None:
+    manager, engine_pool, _ = _rollout_role("policy")
+
+    with pytest.raises(ValueError, match="Unsupported rollout pool method"):
+        manager.rollout_operation("_set_weight_updating", True)
+    with pytest.raises(ValueError, match="Unsupported rollout pool method"):
+        manager.rollout_operation("set_weight_updating", True)
+    assert engine_pool.calls == []

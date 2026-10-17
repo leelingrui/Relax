@@ -43,6 +43,15 @@ from .update_weight_from_distributed import (
 logger = get_logger(__name__)
 
 
+def _shares_training_gpus(args: Any) -> bool:
+    """Whether same-node engines run on their training ranks' own GPUs.
+
+    Hybrid gives rollout its own GPUs and hands weights to them over CUDA IPC
+    across GPUs, so only plain colocation must pair ranks with engines by GPU.
+    """
+    return not getattr(args, "hybrid", False)
+
+
 class UpdateWeightFromTensor:
     """Update rollout engines from tensor dict:
 
@@ -179,9 +188,13 @@ class UpdateWeightFromTensor:
 
         colocate_gpu_offsets = engine_gpu_offsets[:colocate_engine_nums]
         colocate_gpu_counts = engine_gpu_counts[:colocate_engine_nums]
-        self._check_colocate_alignment(
-            gathered_actor_devices, rollout_engines[:colocate_engine_nums], colocate_gpu_offsets, colocate_gpu_counts
-        )
+        if _shares_training_gpus(self.args):
+            self._check_colocate_alignment(
+                gathered_actor_devices,
+                rollout_engines[:colocate_engine_nums],
+                colocate_gpu_offsets,
+                colocate_gpu_counts,
+            )
 
         if self._route_experts:
             placement = (tuple(colocate_gpu_offsets), tuple(colocate_gpu_counts))

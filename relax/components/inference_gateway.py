@@ -75,6 +75,44 @@ def _response_headers(response: httpx.Response, *, body: bool = True) -> dict[st
     return {key: value for key, value in response.headers.items() if key.lower() not in dropped}
 
 
+def _sampling_n(payload: Mapping[str, Any]) -> int:
+    sampling_params = payload.get("sampling_params")
+    if isinstance(sampling_params, list):
+        sampling_params = sampling_params[0] if sampling_params else None
+    if isinstance(sampling_params, dict):
+        return int(sampling_params.get("n") or 1)
+    return int(payload.get("n") or 1)
+
+
+def _batch_size(payload: Mapping[str, Any]) -> int | None:
+    """Batch size of a batched native or completions payload, else ``None``."""
+    for key in ("text", "prompt"):
+        value = payload.get(key)
+        if isinstance(value, list) and value and not isinstance(value[0], int):
+            return len(value)
+    input_ids = payload.get("input_ids")
+    if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
+        return len(input_ids)
+    return None
+
+
+def _engine_rids(payload: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """Return the rids SGLang runs ``payload["rid"]`` under, or ``None`` when
+    it runs that single rid.
+
+    SGLang suffixes a string rid as ``rid_0..rid_k`` for a batch and gives
+    every ``n > 1`` sample a fresh random rid, which no abort can name; those
+    are left to the drain before offload.
+    """
+    if _sampling_n(payload) > 1:
+        return ()
+    rid = payload["rid"]
+    if isinstance(rid, list):
+        return tuple(rid)
+    size = _batch_size(payload)
+    return None if size is None else tuple(f"{rid}_{i}" for i in range(size))
+
+
 class InferenceGateway:
     """Role-neutral HTTP ingress which routes through a Manager snapshot.
 
@@ -212,7 +250,12 @@ class InferenceGateway:
             if path == "generate":
                 payload.pop("model", None)
             # Both native and OpenAI requests must carry the ID used by abort.
-            admitted.rid = payload["rid"] = payload.get("rid") or trace_id
+            # It is drawn per request, not taken from the trace ID: concurrent
+            # retries may share that ID, and two requests under one rid collide.
+            payload["rid"] = payload.get("rid") or uuid4().hex
+            if isinstance(payload["rid"], str):
+                admitted.rid = payload["rid"]
+            admitted.engine_rids = _engine_rids(payload)
             response = await self._forward_admitted(
                 request, path, admitted, json.dumps(payload).encode(), wrap_response=wrap_response
             )

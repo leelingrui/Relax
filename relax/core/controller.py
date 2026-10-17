@@ -667,12 +667,16 @@ class Controller:
                 service._stop_heartbeat_thread()
             except Exception as e:
                 logger.warning(f"[{role}] Failed to stop heartbeat during phase abort: {e}")
-            if str(role) == "rollout" and getattr(service, "_deployed", False):
+            if (
+                str(role) == "rollout"
+                and getattr(service, "_deployed", False)
+                and self._inference_manager_handle is not None
+            ):
+                # The inference manager owns the rollout engines and their monitors.
                 try:
-                    rollout_manager = run(service.get_rollout_manager())
-                    ray.get(rollout_manager.dispose.remote(), timeout=30)
+                    ray.get(self._inference_manager_handle.shutdown.remote(Role.ROLLOUT), timeout=60)
                 except Exception as e:
-                    logger.warning(f"[{role}] Failed to dispose rollout manager during phase abort: {e}")
+                    logger.warning(f"[{role}] Failed to shut down rollout engines during phase abort: {e}")
             try:
                 serve.delete(role)
             except Exception as e:
@@ -766,7 +770,7 @@ class Controller:
             if pgs is None:
                 role_nodes[role] = set()
                 continue
-            binding = PlacementBinding.coerce(pgs)
+            binding = PlacementBinding.require(pgs)
             pg, bundle_indices = binding.pg, binding.bundle_indices
             if id(pg) not in seen_pgs:
                 refs = [

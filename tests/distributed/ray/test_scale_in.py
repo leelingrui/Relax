@@ -455,7 +455,7 @@ class TestScaleInExecution:
         await removal_started.wait()
 
         assert group.lifecycle_status is EngineGroupLifecycle.DRAINING
-        assert manager.set_weight_updating(True) is False
+        assert manager._set_weight_updating(True) is False
         assert manager._training_weight_updating is False
 
         finish_removal.set()
@@ -484,10 +484,10 @@ class TestScaleInExecution:
             await asyncio.sleep(0)
 
         manager._remove_live_engines.assert_not_called()
-        assert manager.set_weight_updating(True) is False
+        assert manager._set_weight_updating(True) is False
 
         if owner == "_training_weight_updating":
-            assert manager.set_weight_updating(False) is True
+            assert manager._set_weight_updating(False) is True
         else:
             manager._scale_out_weight_updating = False
         await scale_in_task
@@ -544,7 +544,7 @@ class TestScaleInExecution:
         assert request.status is ScaleInStatus.FAILED
         assert group.lifecycle_status is EngineGroupLifecycle.DRAINING
         assert group.eviction_requested is True
-        assert manager.set_weight_updating(True) is False
+        assert manager._set_weight_updating(True) is False
         manager._remove_live_engines.assert_not_called()
 
     @pytest.mark.asyncio

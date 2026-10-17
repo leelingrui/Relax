@@ -548,4 +548,6 @@ def test_placement_view_from_binding_carries_node_identity():
         2,
     )
     assert view.key == "pg:probed"
-    assert PlacementBinding.coerce((pg, [0], [3])) == PlacementBinding(pg, (0,), (3,), None)
+    assert PlacementBinding.require(binding) is binding
+    with pytest.raises(TypeError, match="probed PlacementBinding"):
+        PlacementBinding.require((pg, [0], [3]))
