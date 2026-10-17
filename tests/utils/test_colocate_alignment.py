@@ -133,3 +133,12 @@ def test_megatron_updater_refuses_misaligned_engines(monkeypatch):
 
     engine.get_device_identity.remote.return_value = {"node_id": "a", "devices": ["uuid:a-0", "uuid:a-1"]}
     module.UpdateWeightFromTensor._check_colocate_alignment(_ranks(("a", 2)), [engine], [0], [2])
+
+
+def test_megatron_updater_checks_alignment_only_when_ranks_share_engine_gpus():
+    pytest.importorskip("megatron.core")
+    from relax.backends.megatron.weight_update import update_weight_from_tensor as module
+
+    # Hybrid hands weights to rollout's own GPUs over IPC; plain colocation must pair GPUs.
+    assert module._shares_training_gpus(SimpleNamespace(hybrid=False, colocate=True))
+    assert not module._shares_training_gpus(SimpleNamespace(hybrid=True, colocate=True))

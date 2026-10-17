@@ -1366,6 +1366,24 @@ def test_manager_topology_events_only_record_and_the_manager_observes() -> None:
     assert _state(manager).state == LifecycleState.READY
 
 
+def test_manager_settled_topology_is_incomplete_until_observed() -> None:
+    manager, _, _ = _rollout_role("policy")
+    manager.activate(Role.ROLLOUT)
+    manager._refresher = threading.current_thread()  # Keep the refresher thread out of it.
+
+    # A scale-out reports only that it settled: until the Manager observes,
+    # discovery must not present the old replicas as the complete view.
+    manager.topology_events(Role.ROLLOUT).settled("policy")
+    model = _state(manager)
+    assert model.issues == (("policy", "topology_unsettled"),)
+    assert model.state == LifecycleState.READY and model.admission
+    assert not manager.snapshot(Role.ROLLOUT).observation()["complete"]
+
+    manager._refresh_stale()
+    assert _state(manager).issues == ()
+    assert manager.snapshot(Role.ROLLOUT).observation()["complete"]
+
+
 def test_manager_rollout_operation_observes_what_the_operation_changed() -> None:
     manager, engine_pool, pools = _rollout_role("policy")
     manager.activate(Role.ROLLOUT)

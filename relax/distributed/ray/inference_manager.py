@@ -406,10 +406,19 @@ class InferenceManager:
                 self.publish(role, replace(model, issues=((model_id, "topology_unsettled"),)))
 
     def _topology_settled(self, role: Role, model_id: str) -> None:
-        """Queue an observation for the refresher thread."""
+        """Queue an observation for the refresher thread.
+
+        Until it is published, the replicas on view predate the change (a
+        scale-out reports only this), so the view is marked incomplete;
+        admission stays as it is.
+        """
         with self._lock:
             if model_id not in self._models.get(role, {}):
                 return
+            snapshot = self._model(role, model_id).snapshot
+            unsettled = (model_id, "topology_unsettled")
+            if unsettled not in snapshot.issues:
+                self.publish(role, replace(snapshot, issues=(*snapshot.issues, unsettled)))
             self._stale.add((role, model_id))
             self._stale_added.notify_all()
             if self._refresher is None:
@@ -1034,9 +1043,8 @@ def _loads_kv_cache(tags: Sequence[str] | None) -> bool:
     """Whether a load of ``tags`` leaves the model able to serve."""
     if tags is None:
         return True
-    from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-
-    return GPU_MEMORY_TYPE_KV_CACHE in tags
+    # SGLang's ``GPU_MEMORY_TYPE_KV_CACHE``; the CPU control plane does not import SGLang.
+    return "kv_cache" in tags
 
 
 def _with_state(model: ModelSnapshot, state: LifecycleState) -> ModelSnapshot:
