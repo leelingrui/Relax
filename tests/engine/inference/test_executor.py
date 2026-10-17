@@ -272,6 +272,36 @@ async def test_executor_aborts_a_cancelled_request(entry) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancels", [1, 2])
+async def test_executor_returns_a_permit_whose_reply_was_cancelled(entry, cancels: int) -> None:
+    """Cancelled after the Manager recorded the permit, before its reply."""
+    manager = _Manager()
+    admit, recorded, reply = manager.admit_request.remote, asyncio.Event(), asyncio.Event()
+
+    async def record_then_hold_reply(*args):
+        permit = await admit(*args)
+        recorded.set()
+        await reply.wait()
+        return permit
+
+    manager.admit_request = SimpleNamespace(remote=record_then_hold_reply)
+    engine = _Engine()
+    task = asyncio.create_task(entry(manager, engine)())
+    await recorded.wait()
+    for _ in range(cancels):
+        task.cancel()
+        await asyncio.sleep(0)
+    assert not task.done()  # Still waiting to claim the permit.
+    reply.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert engine.generates == []
+    assert manager.admitted == ["permit-0"]
+    manager.assert_each_permit_returned_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("payload", "suffixes"),
     [

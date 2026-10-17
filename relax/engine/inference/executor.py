@@ -109,14 +109,47 @@ class InferenceRequestExecutor:
         refuses the admission (503, e.g. the model is draining).
         """
         target, model_id, via_router = await self.resolve(model=model, route_key=route_key)
+        call = asyncio.ensure_future(self.manager_call("admit_request", self.role, model_id, trace_id))
         try:
-            permit = await self.manager_call("admit_request", self.role, model_id, trace_id)
+            permit = await asyncio.shield(call)
+        except asyncio.CancelledError:
+            # The Manager may already hold the permit while its reply is in
+            # flight; no caller cleanup sees it yet, so return it here.
+            await self._return_unclaimed_permit(call, trace_id)
+            raise
         except Exception as exc:
             logger.warning("Inference request %s admission failed: %s", trace_id, exc)
             raise RoutingError(
                 "unavailable", "Inference request is not admitted", status_code=503, model_id=model_id
             ) from exc
         return AdmittedRequest(model_id=model_id, target=target, via_router=via_router, permit=permit, rid=trace_id)
+
+    async def _return_unclaimed_permit(self, call: asyncio.Future, trace_id: str) -> None:
+        """Wait for an admission its caller abandoned, then return its permit.
+
+        Further cancellations are absorbed: the caller re-raises its own once
+        the permit is back, so a drain never waits on a leaked admission.
+        """
+        while True:
+            try:
+                permit = await asyncio.shield(call)
+                break
+            except asyncio.CancelledError:
+                if call.cancelled():
+                    return  # Cancelled before the Manager was called.
+            except Exception:
+                return  # Refused: no permit was recorded.
+        complete = asyncio.ensure_future(self.manager_call("complete_request", permit))
+        while True:
+            try:
+                await asyncio.shield(complete)
+                return
+            except asyncio.CancelledError:
+                if complete.cancelled():
+                    return
+            except Exception as exc:
+                logger.warning("Failed to return abandoned permit %s of request %s: %s", permit, trace_id, exc)
+                return
 
     async def send(self, request: AdmittedRequest, build: Callable[[str], httpx.Request]) -> httpx.Response:
         """Send ``build(target)`` and return the unread, streamed response.

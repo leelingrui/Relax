@@ -144,6 +144,9 @@ class _EngineInitRecord:
     # Internal cleanup target, not readiness metadata exposed by /engines.
     router_url: str | None = None
     router_cleanup: RouterWorkerCleanup | None = None
+    # A DCS replacement serves only once every PP source confirmed it received
+    # a full weight sync; a per-bucket weight version does not prove that.
+    awaiting_weight_sync: bool = False
 
 
 def _get_engine_actor_states() -> Any | None:
@@ -768,6 +771,10 @@ class RolloutServer:
                 continue
             handles, port_cursors = g.start_engines(port_cursors)
             all_handles.extend(handles)
+            if getattr(g.args, "fully_async", False) and not self.static:
+                for slot in dead_per_group[g_idx]:
+                    if (record := g.engine_init_records.get(slot)) is not None:
+                        record.awaiting_weight_sync = True
 
         for g_idx in reversed(groups_to_remove):
             group = groups.pop(g_idx)
@@ -1004,10 +1011,21 @@ class RolloutServer:
                     if state == "DEAD":
                         alive = False
                     skip_probe = skip_probe or issue == "init_pending"
+                # Recorded by the head, which alone joins DCS and the Router.
+                confirmed = records[0] is None or not records[0].awaiting_weight_sync
+                if not confirmed:
+                    issues.append(
+                        (
+                            f"{self.model_name}/{group_index}/{group.rank_offset + replica_index}",
+                            "weight_sync_unconfirmed",
+                        )
+                    )
                 observation = {}
                 if alive and not skip_probe:
                     try:
-                        result = ray.get(head.get_inference_observation.remote(ensure_router=serving), timeout=45)
+                        result = ray.get(
+                            head.get_inference_observation.remote(ensure_router=serving and confirmed), timeout=45
+                        )
                         observation = result if isinstance(result, dict) else {}
                     except Exception as e:
                         # Also covers a live engine whose probe failed; the reason
@@ -1029,6 +1047,7 @@ class RolloutServer:
                 version = observation.get("weight_version")
                 ready = bool(
                     alive
+                    and confirmed
                     and observation.get("healthy")
                     and observation.get("router_registered")
                     and (not policy or version not in (None, "", "default"))
@@ -1285,6 +1304,29 @@ class RolloutEnginePool:
         lock around update_weights_fully_async.
         """
         return self._weight_sync_lock
+
+    def confirm_weight_sync(self, actor_ids: list[str]) -> int:
+        """Release replacements every PP source fully synced for publication.
+
+        ``actor_ids`` are the DCS recipients common to all PP sources of one
+        completed sync. A replacement is matched by its actor, so a later
+        generation in the same slot is never confirmed by an earlier sync.
+        Returns how many were released.
+        """
+        synced = set(actor_ids)
+        released = 0
+        for srv in self.servers.values():
+            for group in srv.engine_groups:
+                changed = False
+                for slot, record in group.engine_init_records.items():
+                    engine = group.all_engines[slot] if slot < len(group.all_engines) else None
+                    if record.awaiting_weight_sync and engine is not None and engine._actor_id.hex() in synced:
+                        record.awaiting_weight_sync = False
+                        changed = True
+                        released += 1
+                if changed:
+                    group.notify_topology_change()
+        return released
 
     def clear_num_new_engines(self, model_name: str | None = None):
         # when fault tolerance is not enabled, we need to manually clear num_new_engines after update_weights
