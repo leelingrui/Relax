@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from ray import serve
 from starlette.types import Receive, Scope, Send
 
-from relax.engine.inference.executor import AdmittedRequest, InferenceRequestExecutor
+from relax.engine.inference.executor import AdmittedRequest, InferenceRequestExecutor, assign_backend_rids
 from relax.engine.inference.routing import RoutingError
 from relax.engine.inference.types import Role, RoleSnapshot
 from relax.utils.logging_utils import get_logger
@@ -73,44 +73,6 @@ def _response_headers(response: httpx.Response, *, body: bool = True) -> dict[st
     the Gateway rewrites."""
     dropped = _HOP_BY_HOP_HEADERS if body else _HOP_BY_HOP_HEADERS | {"content-length", "content-encoding"}
     return {key: value for key, value in response.headers.items() if key.lower() not in dropped}
-
-
-def _sampling_n(payload: Mapping[str, Any]) -> int:
-    sampling_params = payload.get("sampling_params")
-    if isinstance(sampling_params, list):
-        sampling_params = sampling_params[0] if sampling_params else None
-    if isinstance(sampling_params, dict):
-        return int(sampling_params.get("n") or 1)
-    return int(payload.get("n") or 1)
-
-
-def _batch_size(payload: Mapping[str, Any]) -> int | None:
-    """Batch size of a batched native or completions payload, else ``None``."""
-    for key in ("text", "prompt"):
-        value = payload.get(key)
-        if isinstance(value, list) and value and not isinstance(value[0], int):
-            return len(value)
-    input_ids = payload.get("input_ids")
-    if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
-        return len(input_ids)
-    return None
-
-
-def _engine_rids(payload: Mapping[str, Any]) -> tuple[str, ...] | None:
-    """Return the rids SGLang runs ``payload["rid"]`` under, or ``None`` when
-    it runs that single rid.
-
-    SGLang suffixes a string rid as ``rid_0..rid_k`` for a batch and gives
-    every ``n > 1`` sample a fresh random rid, which no abort can name; those
-    are left to the drain before offload.
-    """
-    if _sampling_n(payload) > 1:
-        return ()
-    rid = payload["rid"]
-    if isinstance(rid, list):
-        return tuple(rid)
-    size = _batch_size(payload)
-    return None if size is None else tuple(f"{rid}_{i}" for i in range(size))
 
 
 class InferenceGateway:
@@ -249,13 +211,15 @@ class InferenceGateway:
                 wrap_response = True
             if path == "generate":
                 payload.pop("model", None)
-            # Both native and OpenAI requests must carry the ID used by abort.
-            # It is drawn per request, not taken from the trace ID: concurrent
-            # retries may share that ID, and two requests under one rid collide.
-            payload["rid"] = payload.get("rid") or uuid4().hex
-            if isinstance(payload["rid"], str):
-                admitted.rid = payload["rid"]
-            admitted.engine_rids = _engine_rids(payload)
+            # Engines run this execution's own IDs, which abort names. A caller's
+            # rid is only traced: equal or prefix rids of concurrent requests
+            # would collide in SGLang's abort match.
+            caller_rid = payload.get("rid")
+            assign_backend_rids(admitted, payload)
+            if caller_rid is not None:
+                self._logger.info(
+                    "Inference request %s (caller rid %s) runs as %s", admitted.trace_id, caller_rid, admitted.rid
+                )
             response = await self._forward_admitted(
                 request, path, admitted, json.dumps(payload).encode(), wrap_response=wrap_response
             )

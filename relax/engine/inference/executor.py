@@ -18,7 +18,8 @@ no idempotent request protocol, so it is aborted and the failure reported.
 import asyncio
 import inspect
 import itertools
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,10 +45,11 @@ _NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 class AdmittedRequest:
     """One request holding a Manager permit.
 
-    ``dispatched`` means an engine may have seen the request; ``finished``
-    means the upstream reported its outcome. A dispatched request that never
-    finished is aborted on release, by ``engine_rids`` when set (the IDs the
-    engine actually runs, e.g. ``rid_0..rid_k`` for a batch), else by ``rid``.
+    ``rid`` is the backend ID namespace of this one execution; see
+    :func:`assign_backend_rids`. ``dispatched`` means an engine may have seen
+    the request; ``finished`` means the upstream reported its outcome. A
+    dispatched request that never finished is aborted on release, by
+    ``engine_rids`` when set (its logical IDs), else by ``rid``.
     """
 
     model_id: str
@@ -56,9 +58,47 @@ class AdmittedRequest:
     permit: str
     rid: str
     engine_rids: tuple[str, ...] | None = None
+    # The caller's ID for logs; never sent to an engine.
+    trace_id: str | None = None
     dispatched: bool = False
     finished: bool = False
     released: bool = False
+
+
+# SGLang's scheduler aborts every request whose rid starts with the aborted
+# one, so each execution owns a namespace no other rid can share or prefix: a
+# plain random rid cannot start with this marker.
+_BACKEND_RID_PREFIX = "relax-inf-"
+
+
+def new_backend_rid() -> str:
+    return f"{_BACKEND_RID_PREFIX}{uuid.uuid4().hex}"
+
+
+def _batch_size(payload: Mapping[str, Any]) -> int | None:
+    """Prompts of a batched native or completions payload, else ``None``."""
+    for key in ("text", "prompt"):
+        value = payload.get(key)
+        if isinstance(value, list) and value and not isinstance(value[0], int):
+            return len(value)
+    input_ids = payload.get("input_ids")
+    if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
+        return len(input_ids)
+    return None
+
+
+def assign_backend_rids(request: AdmittedRequest, payload: dict[str, Any]) -> None:
+    """Replace ``payload["rid"]`` with this execution's logical IDs.
+
+    A batch gets an explicit list, which SGLang keeps as is instead of
+    normalizing a string rid; a single prompt keeps the bare namespace. Abort
+    names these logical IDs, which also covers ``n > 1``: the TokenizerManager
+    aborts a logical ID's parallel-sampling children.
+    """
+    size = _batch_size(payload)
+    rids = (request.rid,) if size is None else tuple(f"{request.rid}_{index}" for index in range(size))
+    payload["rid"] = rids[0] if size is None else list(rids)
+    request.engine_rids = rids
 
 
 class InferenceRequestExecutor:
@@ -122,7 +162,14 @@ class InferenceRequestExecutor:
             raise RoutingError(
                 "unavailable", "Inference request is not admitted", status_code=503, model_id=model_id
             ) from exc
-        return AdmittedRequest(model_id=model_id, target=target, via_router=via_router, permit=permit, rid=trace_id)
+        return AdmittedRequest(
+            model_id=model_id,
+            target=target,
+            via_router=via_router,
+            permit=permit,
+            rid=new_backend_rid(),
+            trace_id=trace_id,
+        )
 
     async def _return_unclaimed_permit(self, call: asyncio.Future, trace_id: str) -> None:
         """Wait for an admission its caller abandoned, then return its permit.
@@ -267,4 +314,4 @@ class InferenceRequestExecutor:
         return Envs.GENRM_ENGINE_RETRY_ATTEMPTS if self.role == Role.GENRM else 1
 
 
-__all__ = ["AdmittedRequest", "InferenceRequestExecutor"]
+__all__ = ["AdmittedRequest", "InferenceRequestExecutor", "assign_backend_rids", "new_backend_rid"]

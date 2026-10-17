@@ -303,14 +303,18 @@ async def test_executor_returns_a_permit_whose_reply_was_cancelled(entry, cancel
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("payload", "suffixes"),
+    ("payload", "batch"),
     [
-        ({"input_ids": [[1], [2]], "sampling_params": {}}, ["_0", "_1"]),
-        # n > 1 samples run under fresh random rids; the offload drain reclaims them.
-        ({"input_ids": [1], "sampling_params": {"n": 2}}, []),
+        ({"input_ids": [1], "sampling_params": {}}, None),
+        ({"input_ids": [[1], [2]], "sampling_params": {}}, 2),
+        # A one-item batch is still a batch: its logical ID is sent explicitly.
+        ({"input_ids": [[1]], "sampling_params": {}}, 1),
+        # n > 1: aborting the logical ID aborts its parallel-sampling children.
+        ({"input_ids": [1], "sampling_params": {"n": 2}}, None),
+        ({"input_ids": [[1], [2]], "sampling_params": {"n": 2}}, 2),
     ],
 )
-async def test_gateway_aborts_the_rids_the_engine_runs(monkeypatch, payload: dict, suffixes: list[str]) -> None:
+async def test_gateway_aborts_the_logical_rids_the_engine_runs(monkeypatch, payload: dict, batch: int | None) -> None:
     monkeypatch.setattr(executor_module, "_RETRY_BACKOFF_S", 0.0)
     manager = _Manager()
 
@@ -327,7 +331,40 @@ async def test_gateway_aborts_the_rids_the_engine_runs(monkeypatch, payload: dic
 
     assert status == 502
     ((target, sent),) = engine.generates
-    assert engine.aborts == [(target, sent["rid"] + suffix) for suffix in suffixes]
+    if batch is None:
+        assert isinstance(sent["rid"], str)
+        logical = [sent["rid"]]
+    else:
+        assert isinstance(sent["rid"], list) and len(sent["rid"]) == batch
+        logical = sent["rid"]
+    assert engine.aborts == [(target, rid) for rid in logical]
+    manager.assert_each_permit_returned_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller_rids", [("job", "job_extra"), ("job", "job")])
+async def test_executions_own_backend_rids_no_other_request_can_match(
+    entry, monkeypatch, caller_rids: tuple[str, str]
+) -> None:
+    """SGLang aborts every rid starting with the aborted one."""
+    sent = []
+
+    async def adapt(key, messages, sampling_params=None):
+        return {"input_ids": [1], "sampling_params": {}, "rid": caller_rids[len(sent)]}
+
+    async def record(request, base):
+        sent.append(json.loads(request.content)["rid"])
+        return httpx.Response(200, json={"text": " 1 "})
+
+    manager, engine = _Manager(), _Engine(record)
+    call = entry(manager, engine, adapt)
+    await call()
+    await call()
+
+    first, second = sent
+    assert first not in caller_rids and second not in caller_rids
+    assert not first.startswith(second) and not second.startswith(first)
+    assert all(rid.startswith(executor_module._BACKEND_RID_PREFIX) for rid in sent)
     manager.assert_each_permit_returned_once()
 
 

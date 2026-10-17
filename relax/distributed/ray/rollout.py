@@ -1001,10 +1001,13 @@ class RolloutServer:
                 slots = range(replica_index, replica_index + len(nodes))
                 records = [group.engine_init_records.get(slot) for slot in slots]
                 skip_probe = False
+                head_metadata = None
                 for slot, node, record in zip(slots, nodes, records, strict=True):
                     if node is None:
                         continue
-                    _, state, issue = _read_engine_metadata(group, slot, node, record, actor_states)
+                    metadata, state, issue = _read_engine_metadata(group, slot, node, record, actor_states)
+                    if slot == replica_index:
+                        head_metadata = metadata
                     if issue is None:
                         continue
                     issues.append((f"{self.model_name}/{group_index}/{group.rank_offset + slot}", issue))
@@ -1021,6 +1024,7 @@ class RolloutServer:
                         )
                     )
                 observation = {}
+                probe_failed = False
                 if alive and not skip_probe:
                     try:
                         result = ray.get(
@@ -1028,10 +1032,16 @@ class RolloutServer:
                         )
                         observation = result if isinstance(result, dict) else {}
                     except Exception as e:
-                        # Also covers a live engine whose probe failed; the reason
-                        # separates that from a real engine death.
+                        # The actor is alive with valid metadata, so its state is
+                        # unknown, not dead: keep this generation's endpoint for
+                        # diagnosis and report the observation incomplete.
                         logger.warning(f"Observation of {group.replica_identity(replica_index)} failed: {e!r}")
-                        alive = False
+                        probe_failed = True
+                        issues.append(
+                            (f"{self.model_name}/{group_index}/{group.rank_offset + replica_index}", "probe_failed")
+                        )
+                        if isinstance(head_metadata, dict):
+                            observation = {"base_url": head_metadata.get("url")}
                 if any(
                     slot >= len(group.all_engines)
                     or group.all_engines[slot] is not node
@@ -1053,7 +1063,7 @@ class RolloutServer:
                     and (not policy or version not in (None, "", "default"))
                     and group.lifecycle_status == EngineGroupLifecycle.ACTIVE
                 )
-                if (observation.get("router_registered") and not ready) or not alive:
+                if (observation.get("router_registered") and not ready) or not alive or probe_failed:
                     # An unreachable worker may still be registered at the Router.
                     router_members_ready = False
                 replica = ReplicaSnapshot(
@@ -1992,6 +2002,8 @@ class RolloutEnginePool:
         try:
             # Step 1: Probe GPU topology
             logger.info(f"[ScaleOut] Replica {replica_idx}: probing GPU topology for {num_gpus} GPUs...")
+            from relax.distributed.ray.placement_group import INFO_ACTOR_RUNTIME_ENV as info_actor_runtime_env
+
             accelerator_kwargs = get_ray_accelerator_kwargs(1)
             for i in range(num_gpus):
                 info_actors.append(
@@ -2000,6 +2012,7 @@ class RolloutEnginePool:
                             placement_group=pg,
                             placement_group_bundle_index=i,
                         ),
+                        runtime_env=info_actor_runtime_env,
                         **accelerator_kwargs,
                     ).remote()
                 )

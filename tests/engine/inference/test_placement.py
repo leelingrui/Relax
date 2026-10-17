@@ -10,6 +10,7 @@ replays, how phases share GPUs, and who is allowed to remove a placement group.
 import pytest
 
 from relax.engine.inference.placement import (
+    PlacementBinding,
     PlacementConflictError,
     PlacementGroupView,
     PlacementOwner,
@@ -551,3 +552,50 @@ def test_placement_view_from_binding_carries_node_identity():
     assert PlacementBinding.require(binding) is binding
     with pytest.raises(TypeError, match="probed PlacementBinding"):
         PlacementBinding.require((pg, [0], [3]))
+
+
+@pytest.mark.parametrize(
+    ("physical", "local", "accepted"),
+    [
+        # Inherited CUDA_VISIBLE_DEVICES=4,7: local 0, 1 are physical 4, 7.
+        ((4, 7), (0, 1), True),
+        ((4, 5), (0, 1), True),
+        # The engine would drive local 0, 1, but this slot holds local 0, 2.
+        ((4, 7), (0, 2), False),
+    ],
+)
+def test_placement_binding_checks_consecutive_visible_devices(physical, local, accepted):
+    planner = PlacementPlanner()
+    view = PlacementGroupView(
+        (0, 1),
+        physical,
+        PlacementOwner.CONTROLLER,
+        identity=_FakePlacementGroup("bound"),
+        node_ids=("node-a", "node-a"),
+        local_gpu_ids=local,
+    )
+    request = _request(num_gpus=2, num_gpus_per_engine=2, bundle_offset=0)
+
+    if accepted:
+        (slice_,) = planner.plan((request,), view)
+        # Ownership stays physical: the slice reserves the GPUs the bundles hold.
+        assert slice_.gpu_ids == (physical[0],)
+    else:
+        with pytest.raises(ValueError, match="consecutive GPUs"):
+            planner.plan((request,), view)
+
+
+def test_placement_binding_without_visible_indices_still_needs_consecutive_physical_gpus():
+    planner = PlacementPlanner()
+    view = _bound_view(_node("node-a", (4, 7)))
+
+    with pytest.raises(ValueError, match="consecutive GPUs"):
+        planner.plan((_request(num_gpus=2, num_gpus_per_engine=2, bundle_offset=0),), view)
+
+
+def test_placement_binding_carries_probed_visible_indices_into_the_view():
+    binding = PlacementBinding(object(), (1, 0), (7, 4), ("node-a", "node-a"), (1, 0))
+
+    view = PlacementGroupView.from_binding(binding, PlacementOwner.MANAGER)
+
+    assert view.local_gpu_ids == (1, 0) and view.gpu_ids == (7, 4)

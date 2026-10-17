@@ -538,3 +538,24 @@ def test_recovery_marks_dcs_replacements_until_their_sync_is_confirmed(
 
     assert group.engine_init_records[1].awaiting_weight_sync is fully_async
     assert 0 not in group.engine_init_records or not group.engine_init_records[0].awaiting_weight_sync
+
+
+def test_rollout_observe_keeps_a_failed_probe_as_incomplete_evidence(patch_ray_get: Any, monkeypatch: Any) -> None:
+    from relax.utils.metrics import sglang_exporter
+
+    engine = _observed_engine()
+    engine.get_inference_observation.remote.return_value = None
+    engine.get_inference_observation.remote.side_effect = ray.exceptions.GetTimeoutError("probe timed out")
+    pool = _pool([_recorded_group(engine)])
+
+    model = _model(pool)
+
+    # Unknown, not dead: it serves nothing, but its endpoint stays known.
+    (replica,) = model.replicas
+    assert replica.state == LifecycleState.STARTING and replica.base_url == "http://w:1"
+    assert not model.admission
+    assert ("default/0/0", "probe_failed") in model.issues
+    discovery = pool.owner.snapshot(Role.ROLLOUT).to_dict()
+    assert discovery["observation"]["complete"] is False
+    engines, complete = sglang_exporter._discover_engines(discovery)
+    assert [found.url for found in engines] == ["http://w:1"] and complete is False

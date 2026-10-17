@@ -267,7 +267,7 @@ def test_placement_sorts_nodes_numerically_then_gpu_and_releases_only_info_actor
         info.options.return_value.remote.side_effect = info_actors
         result = create_placement_group(4)
 
-    assert result == (pg, (2, 1, 0, 3), (1, 3, 0, 2), ("n2", "n2", "n10", "n10"))
+    assert result == (pg, (2, 1, 0, 3), (1, 3, 0, 2), ("n2", "n2", "n10", "n10"), None)
     factory.assert_called_once_with([{"GPU": 1, "CPU": 1}] * 4, strategy="PACK")
     assert [entry.kwargs["placement_group_bundle_index"] for entry in strategy.call_args_list] == [0, 1, 2, 3]
     assert all(entry.kwargs["placement_group"] is pg for entry in strategy.call_args_list)
@@ -292,3 +292,34 @@ def test_service_reuses_shared_pg_without_factory_or_cleanup():
         assert service._ensure_placement_group() is shared_pg
     factory.assert_not_called()
     remove.assert_not_called()
+
+
+@pytest.mark.parametrize(("visible", "gpu", "index"), [(None, 5, 5), ("4,7", 7, 1), ("4,7", 4, 0)])
+def test_visible_device_index_matches_the_engine_mapping(monkeypatch, visible, gpu, index):
+    from relax.utils import device as device_utils
+
+    monkeypatch.setattr(device_utils, "get_visible_devices", lambda: visible)
+    assert device_utils.visible_device_index(gpu) == index
+
+
+def test_placement_binding_keeps_visible_indices_in_bundle_order(monkeypatch):
+    from relax.distributed.ray import placement_group as placement
+
+    monkeypatch.delenv("RELAX_INITIAL_NODE_GROUP", raising=False)
+    pg = MagicMock()
+    # CUDA_VISIBLE_DEVICES=4,7 on the node: GPU 7 is local 1, GPU 4 local 0.
+    probes = [("192.0.2.2", 7, "n2", 1), ("192.0.2.2", 4, "n2", 0)]
+    with (
+        patch.object(placement.device_utils, "get_ray_accelerator_name", return_value="GPU"),
+        patch.object(placement, "get_ray_accelerator_kwargs", return_value={"num_gpus": 1}),
+        patch.object(placement, "placement_group", return_value=pg),
+        patch.object(placement, "InfoActor") as info,
+        patch.object(placement, "PlacementGroupSchedulingStrategy"),
+        patch.object(placement.ray, "get", side_effect=[None, probes]),
+        patch.object(placement.ray, "kill"),
+    ):
+        binding = create_placement_group(2)
+
+    assert binding == (pg, (1, 0), (4, 7), ("n2", "n2"), (0, 1))
+    # The probe sees the visible devices an engine inherits.
+    assert all(call.kwargs["runtime_env"] is placement.INFO_ACTOR_RUNTIME_ENV for call in info.options.call_args_list)
