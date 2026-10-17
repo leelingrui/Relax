@@ -746,7 +746,7 @@ class InferenceManager:
         """
         role = Role(role)
         pool = self._rollout_pool if role is Role.ROLLOUT else None
-        if source == WEIGHT_UPDATE_FULLY_ASYNC and pool is not None and not pool.set_weight_updating(True):
+        if source == WEIGHT_UPDATE_FULLY_ASYNC and pool is not None and not pool._set_weight_updating(True):
             return False
         with self._lock:
             self._weight_updates.setdefault(role, set()).add(source)
@@ -766,7 +766,7 @@ class InferenceManager:
         with self._lock:
             self._weight_updates.get(role, set()).discard(source)
         if source == WEIGHT_UPDATE_FULLY_ASYNC and role is Role.ROLLOUT and self._rollout_pool is not None:
-            self._rollout_pool.set_weight_updating(False)
+            self._rollout_pool._set_weight_updating(False)
         for model_id in self.model_ids(role):
             self._observe(role, model_id)
 

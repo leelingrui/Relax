@@ -3767,8 +3767,11 @@ class RolloutEnginePool:
 
         return result
 
-    def set_weight_updating(self, is_updating: bool) -> bool:
+    def _set_weight_updating(self, is_updating: bool) -> bool:
         """Acquire or release the fully-async topology lease.
+
+        Only ``InferenceManager.begin_weight_update`` / ``end_weight_update``
+        drive it, so the lease and the Manager's admission stay in step.
 
         A DRAINING group owns the scale-in fence, so a new update must retry.
         An update admitted first may finish; scale-in waits for this owner to

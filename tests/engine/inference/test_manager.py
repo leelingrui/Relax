@@ -1156,7 +1156,7 @@ class FakeEnginePool:
     def health_monitoring_pause(self) -> None:
         self.calls.append("pause")
 
-    def set_weight_updating(self, is_updating: bool) -> bool:
+    def _set_weight_updating(self, is_updating: bool) -> bool:
         self.calls.append(f"lease={is_updating}")
         return not (is_updating and self.lease_refused)
 
@@ -1398,3 +1398,13 @@ def test_manager_rollout_operation_observes_what_the_operation_changed() -> None
     engine_pool.execute_scale_out = scale
     assert manager.rollout_operation("execute_scale_out", "policy") == "done"
     assert _state(manager).state == LifecycleState.READY
+
+
+def test_manager_rollout_operation_refuses_the_weight_update_lease() -> None:
+    manager, engine_pool, _ = _rollout_role("policy")
+
+    with pytest.raises(ValueError, match="Unsupported rollout pool method"):
+        manager.rollout_operation("_set_weight_updating", True)
+    with pytest.raises(ValueError, match="Unsupported rollout pool method"):
+        manager.rollout_operation("set_weight_updating", True)
+    assert engine_pool.calls == []

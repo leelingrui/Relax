@@ -365,7 +365,7 @@ class TestHandleEvictions:
         assert healthy_group.all_engines[0] is None
         dcs_failed_engine.shutdown.remote.assert_called_once()
         healthy_engine.shutdown.remote.assert_called_once()
-        assert manager.set_weight_updating(True) is True
+        assert manager._set_weight_updating(True) is True
 
     @pytest.mark.parametrize("request_kind", ["scale_out", "scale_in"])
     def test_eviction_claim_blocks_new_scale_request(self, patch_ray_get, request_kind):
@@ -431,7 +431,7 @@ class TestHandleEvictions:
             assert removal_started.wait(timeout=5)
 
             assert group.lifecycle_status is EngineGroupLifecycle.DRAINING
-            assert manager.set_weight_updating(True) is False
+            assert manager._set_weight_updating(True) is False
             allow_removal.set()
             eviction_thread.join(timeout=5)
             assert not eviction_thread.is_alive()
@@ -507,7 +507,7 @@ class TestHandleEvictions:
             manager._handle_evictions([("default", group, 0)])
 
         assert group.lifecycle_status is EngineGroupLifecycle.DRAINING
-        assert manager.set_weight_updating(True) is False
+        assert manager._set_weight_updating(True) is False
         engine.unregister_from_router.remote.assert_not_called()
 
     def test_duplicate_eviction_has_single_removal_owner(self, patch_ray_get):
@@ -658,7 +658,7 @@ class TestGetEnginesInfo:
         assert info["total_engines"] == 3
 
 
-# ==================== set_weight_updating ==================================
+# ==================== _set_weight_updating =================================
 
 
 class TestSetWeightUpdating:
@@ -669,7 +669,7 @@ class TestSetWeightUpdating:
         srv = make_rollout_server(engine_groups=[g])
         manager = create_test_manager(servers={"default": srv})
 
-        assert manager.set_weight_updating(True) is True
+        assert manager._set_weight_updating(True) is True
         assert manager._is_weight_updating is True
         e1.set_weight_updating.remote.assert_not_called()
         e2.set_weight_updating.remote.assert_not_called()
@@ -680,8 +680,8 @@ class TestSetWeightUpdating:
         srv = make_rollout_server(engine_groups=[g])
         manager = create_test_manager(servers={"default": srv})
 
-        manager.set_weight_updating(True)
-        manager.set_weight_updating(False)
+        manager._set_weight_updating(True)
+        manager._set_weight_updating(False)
         assert manager._is_weight_updating is False
 
     def test_skips_dead_engines(self, patch_ray_get):
@@ -690,7 +690,7 @@ class TestSetWeightUpdating:
         manager = create_test_manager(servers={"default": srv})
 
         # Should not raise
-        manager.set_weight_updating(True)
+        manager._set_weight_updating(True)
 
 
 class TestLegacyDiscoveryContract:
