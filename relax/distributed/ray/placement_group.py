@@ -15,13 +15,14 @@ from relax.core.node_group_affinity import (
 from relax.engine.inference.placement import PlacementBinding
 from relax.engine.sft.runtime import is_offline_mode
 from relax.utils import device as device_utils
-from relax.utils.device import ray_get_device_ids
+from relax.utils.device import ray_get_device_ids, visible_device_index
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_ray_accelerator_kwargs
 
 from .actor_group import RayTrainGroup
+from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 
 
 logger = get_logger(__name__)
@@ -61,8 +62,20 @@ class InfoActor:
 
     def get_ip_gpu_and_node_id(self):
         """Where this bundle landed: node IP (for ordering), GPU id, Ray node
-        id (for identity)."""
-        return ray.util.get_node_ip_address(), ray_get_device_ids()[0], ray.get_runtime_context().get_node_id()
+        id (for identity), and the local device index an engine on this node
+        addresses that GPU by.
+
+        Run with :data:`INFO_ACTOR_RUNTIME_ENV`, this actor sees the visible
+        devices an engine inherits, so the index is the engine's own mapping.
+        """
+        gpu_id = ray_get_device_ids()[0]
+        node_id = ray.get_runtime_context().get_node_id()
+        return ray.util.get_node_ip_address(), gpu_id, node_id, visible_device_index(int(gpu_id))
+
+
+# Engines keep the node's visible devices (Ray does not narrow them); the probe
+# must see the same ones to report the indices they address.
+INFO_ACTOR_RUNTIME_ENV = {"env_vars": dict.fromkeys(NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, "1")}
 
 
 def sort_key(x):
@@ -91,17 +104,20 @@ def build_placement_binding(pg, probes, sort_key=sort_key) -> PlacementBinding:
     probes.
 
     ``probes[i]`` is ``InfoActor.get_ip_gpu_and_node_id()`` run on bundle
-    ``i``. The IP only decides the order; node identity is the Ray node id.
+    ``i``. The IP only decides the order; node identity is the Ray node id. A
+    probe without the local device index leaves ``local_gpu_ids`` unknown.
     """
     ordered = sorted(
-        ((index, ip, gpu_id) for index, (ip, gpu_id, _) in enumerate(probes)),
+        ((index, probe[0], probe[1]) for index, probe in enumerate(probes)),
         key=sort_key,
     )
+    local_known = all(len(probe) > 3 for probe in probes)
     return PlacementBinding(
         pg,
         tuple(index for index, _, _ in ordered),
         tuple(probes[index][1] for index, _, _ in ordered),
         tuple(probes[index][2] for index, _, _ in ordered),
+        tuple(int(probes[index][3]) for index, _, _ in ordered) if local_known else None,
     )
 
 
@@ -156,6 +172,7 @@ def create_placement_group(num_gpus: int, node_group_affinity: bool = True) -> P
                     placement_group=pg,
                     placement_group_bundle_index=i,
                 ),
+                runtime_env=INFO_ACTOR_RUNTIME_ENV,
                 **accelerator_kwargs,
             ).remote()
         )

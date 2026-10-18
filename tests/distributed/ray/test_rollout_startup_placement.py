@@ -526,6 +526,112 @@ def test_manager_shutdown_retries_a_model_left_by_a_failed_start(monkeypatch):
     assert len(attempts) == 2 and Role.TEACHER not in manager.registered_roles()
 
 
+def test_manager_role_shutdown_waits_for_a_start_still_running(monkeypatch):
+    """A failed deploy stops the role while its engines may still be starting;
+    returning before they register would let the caller free their GPUs."""
+    import threading
+
+    from relax.distributed.ray.inference_manager import InferenceManager
+
+    args = _args()
+    config = InferenceModelSpec(
+        "a",
+        "/tmp/teacher",
+        engine_groups=[EngineGroupSpec("regular", 2, 2, {})],
+        weight_source=WeightSource.STATIC,
+    ).resolved(args)
+    starting, release = threading.Event(), threading.Event()
+    stopped = []
+
+    def start_servers(*a, **k):
+        starting.set()
+        assert release.wait(10)
+        return {"a": SimpleNamespace(model_spec=config, shutdown=stopped.append)}
+
+    monkeypatch.setattr(module, "start_servers", start_servers)
+    manager = InferenceManager()
+    monkeypatch.setattr(manager, "_observe", lambda role, model_id: None)
+    placement = {"pg": _pg(4), "bundle_offset": 0, "phase": "teacher", "base_port": 26000}
+    create = threading.Thread(target=manager.create_role, args=(Role.TEACHER, [(config, args, placement)]))
+    create.start()
+    assert starting.wait(10)
+    shutdown = threading.Thread(target=manager.shutdown, args=(Role.TEACHER,))
+    shutdown.start()
+    shutdown.join(0.2)
+    assert shutdown.is_alive() and not stopped
+
+    release.set()
+    create.join(10)
+    shutdown.join(10)
+
+    assert not shutdown.is_alive() and len(stopped) == 1
+    assert Role.TEACHER not in manager.registered_roles()
+
+
+def test_manager_refuses_starts_from_a_rolled_back_or_earlier_deployment(monkeypatch):
+    """A backend start can reach the Manager after its deployment was rolled
+    back or replaced; it was never counted and must not start engines."""
+    from relax.distributed.ray.inference_manager import InferenceManager
+
+    args = _args()
+    config = InferenceModelSpec(
+        "a",
+        "/tmp/teacher",
+        engine_groups=[EngineGroupSpec("regular", 2, 2, {})],
+        weight_source=WeightSource.STATIC,
+    ).resolved(args)
+    started = []
+
+    def start_servers(*a, **k):
+        started.append(True)
+        return {"a": SimpleNamespace(model_spec=config, shutdown=lambda planner: None)}
+
+    monkeypatch.setattr(module, "start_servers", start_servers)
+    manager = InferenceManager()
+    monkeypatch.setattr(manager, "_observe", lambda role, model_id: None)
+    placement = {"pg": _pg(4), "bundle_offset": 0, "phase": "teacher", "base_port": 26000}
+    models = [(config, args, placement)]
+    manager.open_starts(Role.TEACHER, "deploy-1")
+    manager.shutdown(Role.TEACHER, None, True)
+
+    # The rolled-back deployment's own start, delivered late.
+    for token in ("deploy-1", None):
+        with pytest.raises(RuntimeError, match="not from its current deployment"):
+            manager.create_role(Role.TEACHER, models, start_token=token)
+    assert not started
+
+    # The next deployment starts it; the earlier one still cannot.
+    manager.open_starts(Role.TEACHER, "deploy-2")
+    with pytest.raises(RuntimeError, match="not from its current deployment"):
+        manager.create_role(Role.TEACHER, models, start_token="deploy-1")
+    assert manager.create_role(Role.TEACHER, models, start_token="deploy-2") == ("a",)
+    # A plain shutdown keeps the current deployment's starts open.
+    manager.shutdown(Role.TEACHER)
+    assert manager.create_role(Role.TEACHER, models, start_token="deploy-2") == ("a",)
+    assert len(started) == 2
+
+
+def test_manager_accepts_any_start_of_a_role_no_deployment_owns(monkeypatch):
+    from relax.distributed.ray.inference_manager import InferenceManager
+
+    args = _args()
+    config = InferenceModelSpec(
+        "a",
+        "/tmp/teacher",
+        engine_groups=[EngineGroupSpec("regular", 2, 2, {})],
+        weight_source=WeightSource.STATIC,
+    ).resolved(args)
+    monkeypatch.setattr(
+        module,
+        "start_servers",
+        lambda *a, **k: {"a": SimpleNamespace(model_spec=config, shutdown=lambda planner: None)},
+    )
+    manager = InferenceManager()
+    monkeypatch.setattr(manager, "_observe", lambda role, model_id: None)
+    placement = {"pg": _pg(4), "bundle_offset": 0, "phase": "teacher", "base_port": 26000}
+    assert manager.create_role(Role.TEACHER, [(config, args, placement)]) == ("a",)
+
+
 def test_manager_create_role_retries_the_stop_of_a_half_started_model(startup):
     """Partial start, a first stop that fails, then a retry that frees it."""
     from relax.distributed.ray.inference_manager import InferenceManager

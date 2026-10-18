@@ -28,8 +28,19 @@ def resolve_model(snapshot: RoleSnapshot, *, model: str | None = None, route_key
 
     An unmapped route key falls through to the default model; only a request
     that none of the three resolves is rejected.
+
+    OpenAI clients send the served model's real name (e.g. "Qwen3-8B"), which
+    the router used to accept. A single-model role keeps serving it through
+    its default model; only a multi-model role must be named exactly.
     """
     selected = model
+    if (
+        selected is not None
+        and len(snapshot.models) == 1
+        and snapshot.routing.default_model is not None
+        and selected != snapshot.models[0].model_id
+    ):
+        selected = None
     if selected is None and route_key is not None:
         selected = dict(snapshot.routing.route_key_to_model).get(route_key)
     if selected is None:

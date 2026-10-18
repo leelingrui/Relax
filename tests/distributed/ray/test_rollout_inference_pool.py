@@ -458,3 +458,104 @@ def test_rollout_topology_change_marks_the_observation_incomplete(patch_ray_get:
     model = pool.owner.snapshot(Role.ROLLOUT).models[0]
     assert model.issues == (("default", "topology_unsettled"),)
     assert _model(pool).issues == ()
+
+
+def _replacement_engine(actor_id: str) -> Any:
+    """An engine joining the Router only when the observation asks it to."""
+    engine = make_mock_engine(weight_version="v2")
+    engine._actor_id.hex.return_value = actor_id
+
+    def observe(ensure_router: bool = False) -> AwaitableValue:
+        return AwaitableValue(
+            {
+                "healthy": True,
+                "router_registered": ensure_router,
+                "weight_version": "v2",
+                "base_url": f"http://{actor_id}:1",
+            }
+        )
+
+    engine.get_inference_observation.remote.side_effect = observe
+    return engine
+
+
+def test_recovered_replica_waits_for_every_pp_source_before_publication(patch_ray_get: Any) -> None:
+    seed, recovered = _recorded_group(_replacement_engine("seed")), _recorded_group(_replacement_engine("recovered"))
+    # A recovered generation, which has already seen version v2 from one bucket.
+    recovered.engine_init_records[0].awaiting_weight_sync = True
+    pool = _pool([seed, recovered])
+
+    # One PP source sent to {seed, recovered}, another pruned the replacement.
+    synced = sorted({"seed", "recovered"} & {"seed"})
+    assert pool.confirm_weight_sync(synced) == 0
+    model = _model(pool)
+    head = recovered.all_engines[0]
+    assert head.get_inference_observation.remote.call_args.kwargs == {"ensure_router": False}
+    # The seed still serves; the replacement neither joins the Router nor is READY.
+    assert [replica.state for replica in model.replicas] == [LifecycleState.READY, LifecycleState.STARTING]
+    assert ("default/1/0", "weight_sync_unconfirmed") in model.issues
+
+    assert pool.confirm_weight_sync(["recovered"]) == 1
+    model = _model(pool)
+    assert head.get_inference_observation.remote.call_args.kwargs == {"ensure_router": True}
+    assert model.admission and model.issues == ()
+    assert [replica.state for replica in model.replicas] == [LifecycleState.READY, LifecycleState.READY]
+
+
+def test_weight_sync_confirmation_never_releases_a_later_generation(patch_ray_get: Any) -> None:
+    group = _recorded_group(_replacement_engine("generation-2"))
+    group.engine_init_records[0].awaiting_weight_sync = True
+    pool = _pool([group])
+    # A sync that reached the slot's previous generation does not count.
+    assert pool.confirm_weight_sync(["generation-1"]) == 0
+    assert group.engine_init_records[0].awaiting_weight_sync
+
+
+@pytest.mark.parametrize("fully_async", [False, True])
+def test_recovery_marks_dcs_replacements_until_their_sync_is_confirmed(
+    patch_ray_get: Any, monkeypatch: Any, fully_async: bool
+) -> None:
+    from conftest import make_mock_args
+
+    from relax.distributed.ray import rollout
+
+    args = make_mock_args(num_gpus_per_node=1, fully_async=fully_async, offload_rollout=False)
+    survivor = make_mock_engine()
+    group = make_engine_group(args=args, engines=[survivor, None])
+    group.pg = (object(), [0, 1], [0, 1])
+    replacement = make_mock_engine()
+
+    def start(cursors):
+        group.all_engines[1] = replacement
+        group.engine_init_records[1] = rollout._EngineInitRecord({"url": "http://r:1", "pid": 1, "node_id": "n"})
+        group.num_new_engines = 1
+        return [], cursors
+
+    monkeypatch.setattr(group, "start_engines", start)
+    server = make_rollout_server(engine_groups=[group])
+
+    server.recover()
+
+    assert group.engine_init_records[1].awaiting_weight_sync is fully_async
+    assert 0 not in group.engine_init_records or not group.engine_init_records[0].awaiting_weight_sync
+
+
+def test_rollout_observe_keeps_a_failed_probe_as_incomplete_evidence(patch_ray_get: Any, monkeypatch: Any) -> None:
+    from relax.utils.metrics import sglang_exporter
+
+    engine = _observed_engine()
+    engine.get_inference_observation.remote.return_value = None
+    engine.get_inference_observation.remote.side_effect = ray.exceptions.GetTimeoutError("probe timed out")
+    pool = _pool([_recorded_group(engine)])
+
+    model = _model(pool)
+
+    # Unknown, not dead: it serves nothing, but its endpoint stays known.
+    (replica,) = model.replicas
+    assert replica.state == LifecycleState.STARTING and replica.base_url == "http://w:1"
+    assert not model.admission
+    assert ("default/0/0", "probe_failed") in model.issues
+    discovery = pool.owner.snapshot(Role.ROLLOUT).to_dict()
+    assert discovery["observation"]["complete"] is False
+    engines, complete = sglang_exporter._discover_engines(discovery)
+    assert [found.url for found in engines] == ["http://w:1"] and complete is False

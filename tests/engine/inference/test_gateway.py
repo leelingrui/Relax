@@ -481,7 +481,7 @@ async def test_gateway_stream_disconnect_completes_admission(disconnect: str) ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rid", [None, "caller-rid"])
-async def test_gateway_chat_abort_uses_forwarded_request_id(rid: str | None) -> None:
+async def test_gateway_chat_abort_uses_the_execution_rid(rid: str | None) -> None:
     owner = _owner(_snapshot)
     gateway = InferenceGateway(Role.ROLLOUT, manager_handle=owner)
     gateway._executor.abort = AsyncMock()
@@ -497,9 +497,8 @@ async def test_gateway_chat_abort_uses_forwarded_request_id(rid: str | None) -> 
             _request({"model": "model-a", "messages": [], "rid": rid}), "v1/chat/completions"
         )
         assert response.status_code == 502
-        assert forwarded[0]
-        if rid:
-            assert forwarded == [rid]
+        # The caller's rid is only traced; the engine runs this execution's own.
+        assert forwarded[0].startswith("relax-inf-") and forwarded[0] != rid
         ((aborted,), _) = gateway._executor.abort.await_args
         assert (aborted.target, aborted.rid) == ("http://router", forwarded[0])
         assert not owner.inflight

@@ -26,7 +26,7 @@ from ray.serve.schema import LoggingConfig
 from relax.components.base import Base
 from relax.distributed.ray.inference_manager import ModelHandle
 from relax.distributed.ray.placement_group import create_genrm_role
-from relax.engine.inference.executor import InferenceRequestExecutor
+from relax.engine.inference.executor import InferenceRequestExecutor, assign_backend_rids
 from relax.engine.inference.routing import RoutingError
 from relax.engine.inference.types import Role
 from relax.utils.data.processing_utils import load_tokenizer
@@ -230,7 +230,7 @@ class GenRM(Base):
             raise _http_error(exc) from exc
         try:
             payload = await self.prepare_generate_payload(key, request.messages, request.sampling_params)
-            payload["rid"] = admitted.rid
+            assign_backend_rids(admitted, payload)
             output = await self._executor.post(admitted, "generate", payload)
         except RoutingError as exc:
             raise _http_error(exc) from exc

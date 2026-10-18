@@ -38,8 +38,9 @@ GPUs, until ``offload`` or ``shutdown`` has succeeded.
 import asyncio
 import functools
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from threading import Condition, Lock, RLock, Thread
@@ -118,6 +119,40 @@ class _RemoteCall:
         return self.handle.manager.call.remote(self.handle.role, self.handle.model_id, self.method, *args, **kwargs)
 
 
+@dataclass(frozen=True)
+class DeploymentManagerHandle:
+    """The Manager handle one deployment of a service role runs with.
+
+    It forwards every call to ``manager``; role starts also carry the
+    deployment's ``start_token``, so the Manager refuses a start from an
+    earlier deployment of the role; see :meth:`InferenceManager.open_starts`.
+    """
+
+    manager: Any
+    start_token: str
+
+    def __getattr__(self, method: str) -> Any:
+        if method.startswith("_"):
+            raise AttributeError(method)
+        call = getattr(self.manager, method)
+        if method in ("create_role", "create_rollout_role"):
+            return _TokenedCall(call, self.start_token)
+        return call
+
+
+@dataclass(frozen=True)
+class _TokenedCall:
+    call: Any
+    start_token: str
+
+    def remote(self, *args: Any, **kwargs: Any) -> Any:
+        return self.call.remote(*args, start_token=self.start_token, **kwargs)
+
+
+# Marks a role whose starts a rollback closed; no start token matches it.
+_STARTS_CLOSED = object()
+
+
 @dataclass
 class _Model:
     config: InferenceModelSpec
@@ -183,6 +218,14 @@ class InferenceManager:
         # Roles registered only with the models a failed ``create_role`` could
         # not stop; creating the role again stops them first.
         self._failed_starts: set[Role] = set()
+        # Role creations still running. Stopping a role waits for them: until
+        # they register, their engines are invisible yet may hold GPUs.
+        self._starting: dict[Role, int] = {}
+        self._start_finished = Condition(self._lock)
+        # The start token of each role's current deployment, or
+        # ``_STARTS_CLOSED`` after a rollback; see ``open_starts``. A role
+        # without an entry accepts every start.
+        self._start_tokens: dict[Role, Any] = {}
         # Running weight updates per role; see ``begin_weight_update``.
         self._weight_updates: dict[Role, set[str]] = {}
         # Models whose engines a pool reported settled, awaiting an
@@ -777,9 +820,10 @@ class InferenceManager:
             self._observe(Role(role), model_id)
             return healthy
 
-    def shutdown(self, role: Role | str, model_id: str | None = None) -> None:
+    def shutdown(self, role: Role | str, model_id: str | None = None, close_starts: bool = False) -> None:
         """Stop a whole role, or one of its models; a stopped model is left
-        alone.
+        alone. ``close_starts`` also refuses every later start of the role
+        until :meth:`open_starts`.
 
         Admitted requests get a bounded grace period, then the engines abort
         them. Stopping proceeds even if the abort fails: a killed engine fails
@@ -788,6 +832,10 @@ class InferenceManager:
         """
         role = Role(role)
         if model_id is None:
+            with self._lock:
+                if close_starts:
+                    self._start_tokens[role] = _STARTS_CLOSED
+                self._start_finished.wait_for(lambda: role not in self._starting)
             self._shutdown_role(role)
             return
         entry = self._model(role, model_id)
@@ -861,8 +909,12 @@ class InferenceManager:
     # Role creation and teardown; the engines live in this process.
     # ------------------------------------------------------------------
 
-    def create_rollout_role(self, args: Any, placement_group: Any) -> dict[str, Any]:
+    def create_rollout_role(self, args: Any, placement_group: Any, start_token: str | None = None) -> dict[str, Any]:
         """Create the rollout engines and return the primary Router address."""
+        with self._starting_role(Role.ROLLOUT, start_token):
+            return self._create_rollout_role(args, placement_group)
+
+    def _create_rollout_role(self, args: Any, placement_group: Any) -> dict[str, Any]:
         from relax.distributed.ray.rollout import RolloutEnginePool
 
         if Role.ROLLOUT in self._failed_starts:
@@ -911,7 +963,10 @@ class InferenceManager:
             self._refresh_stale()
 
     def create_role(
-        self, role: Role | str, models: Sequence[tuple[InferenceModelSpec, Any, dict[str, Any]]]
+        self,
+        role: Role | str,
+        models: Sequence[tuple[InferenceModelSpec, Any, dict[str, Any]]],
+        start_token: str | None = None,
     ) -> tuple[str, ...]:
         """Start a static role's models here and register them.
 
@@ -920,9 +975,15 @@ class InferenceManager:
         layout is checked against the task ledger before its first engine
         starts; a later failure closes whatever already started.
         """
+        role = Role(role)
+        with self._starting_role(role, start_token):
+            return self._create_role(role, models)
+
+    def _create_role(
+        self, role: Role, models: Sequence[tuple[InferenceModelSpec, Any, dict[str, Any]]]
+    ) -> tuple[str, ...]:
         from relax.distributed.ray.rollout import placement_preview, start_servers
 
-        role = Role(role)
         if role in self._failed_starts:
             # Stop what a failed start left behind; raises while it still holds GPUs.
             self._shutdown_role(role)
@@ -960,6 +1021,32 @@ class InferenceManager:
             self._keep_failed_start(role, leftovers)
             raise
         return self.register(role, pools)
+
+    def open_starts(self, role: Role | str, start_token: str) -> None:
+        """Accept starts of ``role`` from the deployment holding
+        ``start_token`` only.
+
+        A start sent by an earlier deployment, or after a ``close_starts``
+        shutdown, can reach the Manager late; it is refused either way.
+        """
+        with self._lock:
+            self._start_tokens[Role(role)] = start_token
+
+    @contextmanager
+    def _starting_role(self, role: Role, start_token: str | None) -> Iterator[None]:
+        """Mark a creation of ``role`` as running until it returns."""
+        with self._lock:
+            if role in self._start_tokens and self._start_tokens[role] != start_token:
+                raise RuntimeError(f"Start of inference role {role.value} is not from its current deployment")
+            self._starting[role] = self._starting.get(role, 0) + 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._starting[role] -= 1
+                if not self._starting[role]:
+                    del self._starting[role]
+                self._start_finished.notify_all()
 
     def _keep_failed_start(self, role: Role, leftovers: dict[str, Any]) -> None:
         """Keep what a failed start could not stop.
@@ -1016,7 +1103,10 @@ class InferenceManager:
 
     def shutdown_all(self) -> None:
         errors = []
-        for role in tuple(self._models):
+        with self._lock:
+            # A role still starting is stopped once it registers.
+            roles = tuple(dict.fromkeys((*self._models, *self._starting)))
+        for role in roles:
             try:
                 self.shutdown(role)
             except Exception as exc:
@@ -1258,7 +1348,7 @@ class _InferenceManagerActor:
             self._lifecycle, self._targets(role, model_id), self.manager.health_check, role, model_id
         )
 
-    async def shutdown(self, role: Role | str, model_id: str | None = None) -> None:
+    async def shutdown(self, role: Role | str, model_id: str | None = None, close_starts: bool = False) -> None:
         role = Role(role)
         targets = self._targets(role, model_id)
         try:
@@ -1266,7 +1356,7 @@ class _InferenceManagerActor:
         except Exception as exc:
             # Stopping the engines fails whatever they still run.
             logger.warning(f"Stopping {role.value} with requests still in flight: {exc}")
-        await self._gated(self._lifecycle, targets, self.manager.shutdown, role, model_id)
+        await self._gated(self._lifecycle, targets, self.manager.shutdown, role, model_id, close_starts)
 
     async def call(self, role: Role | str, model_id: str, method: str, /, *args: Any, **kwargs: Any) -> Any:
         if method in _LIFECYCLE_METHODS:
@@ -1282,6 +1372,7 @@ class _InferenceManagerActor:
     # Role creation, teardown and queries wait for no other call.
     shutdown_all = _blocking("shutdown_all", "_lifecycle")
     create_role = _blocking("create_role", "_lifecycle")
+    open_starts = _blocking("open_starts", "_lifecycle")
     refresh = _blocking("refresh", "_lifecycle")
     roles = _blocking("roles", "_lifecycle")
     registered_roles = _blocking("registered_roles", "_lifecycle")

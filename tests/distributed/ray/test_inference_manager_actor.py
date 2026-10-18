@@ -40,6 +40,7 @@ _REMOTE_API = (
     "enter_phase",
     "leave_phase",
     "create_role",
+    "open_starts",
     "refresh",
     "model_spec",
     "create_rollout_role",
@@ -344,3 +345,38 @@ def test_inference_manager_actor_rollout_recovery_waits_for_the_lease(monkeypatc
     manager._rollout_started = True
     assert _run(actor.rollout_operation("recover_rollout_engines", "policy")) == "engines"
     assert leased == [True] and manager.lifecycle._gpu_owner is None
+
+
+def test_deployment_manager_handle_tags_role_starts_with_its_token() -> None:
+    import pickle
+
+    from relax.distributed.ray.inference_manager import DeploymentManagerHandle
+
+    calls = []
+
+    class _Method:
+        def __init__(self, name):
+            self.name = name
+
+        def remote(self, *args, **kwargs):
+            calls.append((self.name, args, kwargs))
+
+    class _Manager:
+        def __getattr__(self, name):
+            if name.startswith("_"):
+                raise AttributeError(name)
+            return _Method(name)
+
+    handle = DeploymentManagerHandle(_Manager(), "deploy-1")
+    handle.create_role.remote("genrm", [])
+    handle.create_rollout_role.remote("args", "pg")
+    handle.snapshot.remote("rollout")
+
+    assert calls == [
+        ("create_role", ("genrm", []), {"start_token": "deploy-1"}),
+        ("create_rollout_role", ("args", "pg"), {"start_token": "deploy-1"}),
+        ("snapshot", ("rollout",), {}),
+    ]
+    assert pickle.loads(pickle.dumps(DeploymentManagerHandle("manager", "t"))) == DeploymentManagerHandle(
+        "manager", "t"
+    )

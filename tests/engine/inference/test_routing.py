@@ -72,6 +72,14 @@ def test_routing_invalid_explicit_model_never_falls_back(kwargs: dict, code: str
     assert error.value.status_code == 400
 
 
+def test_routing_single_model_role_serves_any_model_name() -> None:
+    """The Gateway and direct discovery clients share this rule."""
+    snapshot = replace(_snapshot(), models=(_model(),))
+    assert resolve_model(snapshot, model="Qwen3-8B").model_id == "student"
+    with pytest.raises(RoutingError, match="Unknown model"):
+        resolve_model(replace(snapshot, routing=RoutingSpec()), model="Qwen3-8B")
+
+
 def test_routing_unmapped_route_key_falls_back_to_default_model() -> None:
     assert resolve_model(_snapshot(), route_key="missing").model_id == "student"
 

@@ -516,15 +516,36 @@ def test_controller_aborted_rollout_shuts_down_rollout_engines(monkeypatch):
     instance._inference_manager_handle = SimpleNamespace(
         shutdown=SimpleNamespace(remote=lambda role: shutdowns.append(role) or "shutdown_ref")
     )
-    service = SimpleNamespace(_deployed=True, _stop_heartbeat_thread=lambda: None)
-    gets = []
-    monkeypatch.setattr(controller.ray, "get", lambda ref, timeout=None: gets.append(ref))
-    monkeypatch.setattr(controller.serve, "delete", lambda _role: None)
-    warnings = []
-    monkeypatch.setattr(controller.logger, "warning", warnings.append)
+    events = []
+    service = SimpleNamespace(
+        _deployed=True,
+        _stop_heartbeat_thread=lambda: None,
+        _delete_applications=lambda: events.append("delete_apps"),
+        _shutdown_inference_engines=lambda: events.append("engines") or True,
+        _is_shared_pgs=False,
+        pgs=("pg", [0], [0]),
+    )
+    monkeypatch.setattr(controller, "remove_placement_group", lambda pg: events.append(("release", pg)))
 
     instance._cleanup_aborted_service("rollout", service, deploy=True)
 
-    assert shutdowns == [controller.Role.ROLLOUT]
-    assert gets == ["shutdown_ref"]
-    assert warnings == []
+    # The real application names and engine stop are Service's; the PG goes last.
+    assert events == ["delete_apps", "engines", ("release", "pg")]
+    assert shutdowns == []
+
+
+def test_controller_aborted_service_keeps_the_pg_while_engines_may_hold_gpus(monkeypatch):
+    instance = controller.Controller.__new__(controller.Controller)
+    released = []
+    service = SimpleNamespace(
+        _stop_heartbeat_thread=lambda: None,
+        _delete_applications=lambda: None,
+        _shutdown_inference_engines=lambda: False,
+        _is_shared_pgs=False,
+        pgs=("pg", [0], [0]),
+    )
+    monkeypatch.setattr(controller, "remove_placement_group", released.append)
+
+    instance._cleanup_aborted_service("rollout", service, deploy=True)
+
+    assert released == []

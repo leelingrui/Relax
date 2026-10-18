@@ -28,7 +28,7 @@ from relax.algorithms import algorithm_needs_critic
 from relax.core.node_group_affinity import require_control_plane_resource, with_control_plane_affinity
 from relax.core.optional_roles import GENRM_ROLE, register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
-from relax.core.service import Service, create_placement_group
+from relax.core.service import Service, create_placement_group, serve_app_names
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.inference_manager import WEIGHT_UPDATE_BACKEND, create_inference_manager
@@ -608,12 +608,15 @@ class Controller:
                         else:
                             pending_future.cancel()
                             if phase == ServiceStartupPhase.DEPLOY:
-                                try:
-                                    serve.delete(pending_role)
-                                except Exception as exc:
-                                    logger.warning(
-                                        f"[{pending_role}] Failed to cancel deployment during phase abort: {exc}"
-                                    )
+                                for app_name in serve_app_names(str(pending_role)):
+                                    if app_name is None:
+                                        continue
+                                    try:
+                                        serve.delete(app_name)
+                                    except Exception as exc:
+                                        logger.warning(
+                                            f"[{pending_role}] Failed to cancel '{app_name}' during phase abort: {exc}"
+                                        )
                     self._abort_service_phase(phase, services, failed_services)
                     raise RuntimeError(f"Failed to {phase.value} service {role}: {error}")
                 services[role] = service
@@ -670,20 +673,11 @@ class Controller:
                 service._stop_heartbeat_thread()
             except Exception as e:
                 logger.warning(f"[{role}] Failed to stop heartbeat during phase abort: {e}")
-            if (
-                str(role) == "rollout"
-                and getattr(service, "_deployed", False)
-                and self._inference_manager_handle is not None
-            ):
-                # The inference manager owns the rollout engines and their monitors.
-                try:
-                    ray.get(self._inference_manager_handle.shutdown.remote(Role.ROLLOUT), timeout=60)
-                except Exception as e:
-                    logger.warning(f"[{role}] Failed to shut down rollout engines during phase abort: {e}")
-            try:
-                serve.delete(role)
-            except Exception as e:
-                logger.warning(f"[{role}] Failed to delete deployment during phase abort: {e}")
+            service._delete_applications()
+            # The inference manager owns the role's engines and their monitors;
+            # the placement group goes only once they are confirmed stopped.
+            if not service._shutdown_inference_engines():
+                return
         if getattr(service, "_is_shared_pgs", False):
             return
         pgs = getattr(service, "pgs", None)

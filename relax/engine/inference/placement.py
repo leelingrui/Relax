@@ -78,6 +78,9 @@ class PlacementBinding(NamedTuple):
     bundle_indices: tuple[int, ...]
     gpu_ids: tuple[int, ...]
     node_ids: tuple[str, ...]
+    # The device index an engine on that node addresses each GPU by, under the
+    # visible devices it inherits; ``None`` when the probe did not report it.
+    local_gpu_ids: tuple[int, ...] | None = None
 
     @classmethod
     def require(cls, value: Any) -> "PlacementBinding":
@@ -101,6 +104,7 @@ class PlacementGroupView:
     identity: object = field(default_factory=object, repr=False, compare=False)
     node_ids: tuple[str, ...] | None = None
     bundle_count: int | None = None
+    local_gpu_ids: tuple[int, ...] | None = None
 
     @classmethod
     def from_binding(cls, binding: PlacementBinding, owner: PlacementOwner) -> "PlacementGroupView":
@@ -112,6 +116,7 @@ class PlacementGroupView:
             identity=binding.pg,
             node_ids=tuple(binding.node_ids),
             bundle_count=bundle_count if isinstance(bundle_count, int) else None,
+            local_gpu_ids=None if binding.local_gpu_ids is None else tuple(binding.local_gpu_ids),
         )
 
     @property
@@ -312,6 +317,11 @@ class PlacementPlanner:
             raise ValueError(
                 f"Placement group view is inconsistent: {len(bundles)} bundles, {len(placement_group.gpu_ids)} GPU ids"
             )
+        local = placement_group.local_gpu_ids
+        if local is not None and len(local) != len(bundles):
+            raise ValueError(
+                f"Placement group view is inconsistent: {len(bundles)} bundles, {len(local)} local device indices"
+            )
         if len(set(bundles)) != len(bundles):
             raise ValueError(f"Placement group view repeats a bundle index: {bundles}")
         count = placement_group.bundle_count
@@ -338,14 +348,18 @@ class PlacementPlanner:
     ) -> None:
         """Check resolved slots against where the bundles physically are.
 
-        One slot is one engine actor on one node, and the engine drives GPUs
-        ``base_gpu_id + k``, so a slot must sit on one node over consecutive
-        GPU ids. A multi-node engine must put each of its slots on a distinct
-        node, or it would run fewer nodes than its TP/PP layout assumes.
+        One slot is one engine actor on one node, and the engine drives the
+        local devices ``base + k`` under the visible devices it inherits, so a
+        slot must sit on one node over consecutive local device indices: then
+        each device it drives is a GPU the slot reserved. Without those indices
+        the physical IDs stand in for them. A multi-node engine must put each
+        of its slots on a distinct node, or it would run fewer nodes than its
+        TP/PP layout assumes.
         """
         node_ids = placement_group.node_ids
         assert node_ids is not None
-        gpu_ids = placement_group.gpu_ids
+        local = placement_group.local_gpu_ids
+        gpu_ids = placement_group.gpu_ids if local is None else local
         for start in referenced:
             slot = range(start, start + slot_size)
             nodes = {node_ids[index] for index in slot}
@@ -357,9 +371,10 @@ class PlacementPlanner:
             base = int(gpu_ids[start])
             actual = [int(gpu_ids[index]) for index in slot]
             if actual != list(range(base, base + slot_size)):
+                physical = [int(placement_group.gpu_ids[index]) for index in slot]
                 raise ValueError(
                     f"An engine slot of {request.group_id} needs consecutive GPUs from {base}, "
-                    f"got {actual} on node {node_ids[start]}"
+                    f"got {actual} (physical {physical}) on node {node_ids[start]}"
                 )
         nodes_per_engine = max(1, request.num_gpus_per_engine // request.num_gpus_per_node)
         for first in range(0, len(referenced), nodes_per_engine):

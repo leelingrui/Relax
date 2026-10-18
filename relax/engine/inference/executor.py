@@ -18,7 +18,8 @@ no idempotent request protocol, so it is aborted and the failure reported.
 import asyncio
 import inspect
 import itertools
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,10 +45,11 @@ _NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 class AdmittedRequest:
     """One request holding a Manager permit.
 
-    ``dispatched`` means an engine may have seen the request; ``finished``
-    means the upstream reported its outcome. A dispatched request that never
-    finished is aborted on release, by ``engine_rids`` when set (the IDs the
-    engine actually runs, e.g. ``rid_0..rid_k`` for a batch), else by ``rid``.
+    ``rid`` is the backend ID namespace of this one execution; see
+    :func:`assign_backend_rids`. ``dispatched`` means an engine may have seen
+    the request; ``finished`` means the upstream reported its outcome. A
+    dispatched request that never finished is aborted on release, by
+    ``engine_rids`` when set (its logical IDs), else by ``rid``.
     """
 
     model_id: str
@@ -56,9 +58,57 @@ class AdmittedRequest:
     permit: str
     rid: str
     engine_rids: tuple[str, ...] | None = None
+    # The caller's ID for logs; never sent to an engine.
+    trace_id: str | None = None
     dispatched: bool = False
     finished: bool = False
     released: bool = False
+
+
+# SGLang's scheduler aborts every request whose rid starts with the aborted
+# one, so each execution owns a namespace no other rid can share or prefix: a
+# plain random rid cannot start with this marker.
+_BACKEND_RID_PREFIX = "relax-inf-"
+
+
+def new_backend_rid() -> str:
+    return f"{_BACKEND_RID_PREFIX}{uuid.uuid4().hex}"
+
+
+def _batch_size(payload: Mapping[str, Any]) -> int | None:
+    """Prompts of a batched native or completions payload, else ``None``.
+
+    Follows SGLang's ``GenerateReqInput``: the first input present decides, in
+    the order text (``prompt`` for completions), ``input_ids``,
+    ``input_embeds``.
+    """
+    for key in ("text", "prompt"):
+        value = payload.get(key)
+        if value is not None:
+            return len(value) if isinstance(value, list) and value and not isinstance(value[0], int) else None
+    input_ids = payload.get("input_ids")
+    if input_ids is not None:
+        return len(input_ids) if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list) else None
+    embeds = payload.get("input_embeds")
+    # One prompt is a list of vectors; a batch nests one more level. SGLang's
+    # HTTP layer coerces integer entries to floats first, so only depth counts.
+    if isinstance(embeds, list) and embeds and isinstance(embeds[0], list) and embeds[0]:
+        return len(embeds) if isinstance(embeds[0][0], list) else None
+    return None
+
+
+def assign_backend_rids(request: AdmittedRequest, payload: dict[str, Any]) -> None:
+    """Replace ``payload["rid"]`` with this execution's logical IDs.
+
+    A batch gets an explicit list, which SGLang keeps as is instead of
+    normalizing a string rid; a single prompt keeps the bare namespace. Abort
+    names these logical IDs, which also covers ``n > 1``: the TokenizerManager
+    aborts a logical ID's parallel-sampling children.
+    """
+    size = _batch_size(payload)
+    rids = (request.rid,) if size is None else tuple(f"{request.rid}_{index}" for index in range(size))
+    payload["rid"] = rids[0] if size is None else list(rids)
+    request.engine_rids = rids
 
 
 class InferenceRequestExecutor:
@@ -88,16 +138,6 @@ class InferenceRequestExecutor:
         """Return ``(target, model_id, via_router)``, or raise
         :class:`RoutingError`."""
         snapshot = await self.snapshot()
-        # OpenAI clients send the served model's real name (e.g. "Qwen3-8B"), which the
-        # router used to accept. A single-model role keeps serving it through its
-        # default model; only a multi-model role must be named exactly.
-        if (
-            model is not None
-            and len(snapshot.models) == 1
-            and snapshot.routing.default_model is not None
-            and model != snapshot.models[0].model_id
-        ):
-            model = None
         selected = resolve_model(snapshot, model=model, route_key=route_key)
         target = select_target(selected, cursor=next(self._cursor)).base_url.rstrip("/")
         return target, selected.model_id, target == (selected.router_url or "").rstrip("/")
@@ -109,14 +149,54 @@ class InferenceRequestExecutor:
         refuses the admission (503, e.g. the model is draining).
         """
         target, model_id, via_router = await self.resolve(model=model, route_key=route_key)
+        call = asyncio.ensure_future(self.manager_call("admit_request", self.role, model_id, trace_id))
         try:
-            permit = await self.manager_call("admit_request", self.role, model_id, trace_id)
+            permit = await asyncio.shield(call)
+        except asyncio.CancelledError:
+            # The Manager may already hold the permit while its reply is in
+            # flight; no caller cleanup sees it yet, so return it here.
+            await self._return_unclaimed_permit(call, trace_id)
+            raise
         except Exception as exc:
             logger.warning("Inference request %s admission failed: %s", trace_id, exc)
             raise RoutingError(
                 "unavailable", "Inference request is not admitted", status_code=503, model_id=model_id
             ) from exc
-        return AdmittedRequest(model_id=model_id, target=target, via_router=via_router, permit=permit, rid=trace_id)
+        return AdmittedRequest(
+            model_id=model_id,
+            target=target,
+            via_router=via_router,
+            permit=permit,
+            rid=new_backend_rid(),
+            trace_id=trace_id,
+        )
+
+    async def _return_unclaimed_permit(self, call: asyncio.Future, trace_id: str) -> None:
+        """Wait for an admission its caller abandoned, then return its permit.
+
+        Further cancellations are absorbed: the caller re-raises its own once
+        the permit is back, so a drain never waits on a leaked admission.
+        """
+        while True:
+            try:
+                permit = await asyncio.shield(call)
+                break
+            except asyncio.CancelledError:
+                if call.cancelled():
+                    return  # Cancelled before the Manager was called.
+            except Exception:
+                return  # Refused: no permit was recorded.
+        complete = asyncio.ensure_future(self.manager_call("complete_request", permit))
+        while True:
+            try:
+                await asyncio.shield(complete)
+                return
+            except asyncio.CancelledError:
+                if complete.cancelled():
+                    return
+            except Exception as exc:
+                logger.warning("Failed to return abandoned permit %s of request %s: %s", permit, trace_id, exc)
+                return
 
     async def send(self, request: AdmittedRequest, build: Callable[[str], httpx.Request]) -> httpx.Response:
         """Send ``build(target)`` and return the unread, streamed response.
@@ -234,4 +314,4 @@ class InferenceRequestExecutor:
         return Envs.GENRM_ENGINE_RETRY_ATTEMPTS if self.role == Role.GENRM else 1
 
 
-__all__ = ["AdmittedRequest", "InferenceRequestExecutor"]
+__all__ = ["AdmittedRequest", "InferenceRequestExecutor", "assign_backend_rids", "new_backend_rid"]
