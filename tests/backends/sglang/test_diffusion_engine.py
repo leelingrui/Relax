@@ -426,8 +426,14 @@ def test_inference_observation_reports_a_direct_routed_replica():
     assert SGLangNativeGenerationEngine.route_mode == de.RouteMode.DIRECT
 
 
-def test_inference_observation_never_probes_released_memory():
-    from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+def test_inference_observation_never_probes_released_memory(monkeypatch):
+    # The engine reads the weights tag from SGLang; CPU CI runs without it.
+    weights_tag = "weights"
+    for name in ("sglang", "sglang.srt"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    constants = types.ModuleType("sglang.srt.constants")
+    constants.GPU_MEMORY_TYPE_WEIGHTS = weights_tag
+    monkeypatch.setitem(sys.modules, "sglang.srt.constants", constants)
 
     eng = SGLangNativeGenerationEngine(args=None, rank=0)
     eng._url = "http://127.0.0.1:21000"
@@ -437,7 +443,7 @@ def test_inference_observation_never_probes_released_memory():
     eng.release_memory_occupation()
     assert eng.get_inference_observation()["healthy"] is False
     # A weights-only resume leaves the rest of the pipeline released.
-    eng.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+    eng.resume_memory_occupation(tags=[weights_tag])
     assert eng.get_inference_observation()["healthy"] is False
 
     eng.health_generate = lambda timeout=5.0: True
