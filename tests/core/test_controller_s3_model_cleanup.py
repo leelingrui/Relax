@@ -595,3 +595,29 @@ def test_controller_fails_startup_when_rollout_stays_unready(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Rollout is not ready"):
         asyncio.run(instance._await_rollout_ready_after_initial_sync())
+
+
+def test_controller_bounds_the_ready_wait_by_a_hanging_refresh(monkeypatch):
+    import asyncio
+    import time
+
+    instance = controller.Controller.__new__(controller.Controller)
+    handle, _ = _rollout_snapshots([controller.LifecycleState.STARTING, controller.LifecycleState.READY])
+
+    async def hanging_refresh(role, model_id):
+        # One refresh probes every replica in turn; unresponsive engines can
+        # keep it busy far beyond the startup limit.
+        await asyncio.sleep(60)
+
+    handle.refresh = SimpleNamespace(remote=hanging_refresh)
+    instance._inference_manager_handle = handle
+    monkeypatch.setattr(controller, "INITIAL_ROLLOUT_READY_POLL_S", 0.0)
+    monkeypatch.setattr(controller, "INITIAL_ROLLOUT_READY_TIMEOUT_S", 0.2)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="Rollout is not ready") as error:
+        asyncio.run(instance._await_rollout_ready_after_initial_sync())
+
+    # The limit holds even mid-refresh, and the late READY is never accepted.
+    assert time.monotonic() - started < 5
+    assert "'state': 'starting'" in str(error.value)

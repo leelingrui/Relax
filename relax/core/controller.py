@@ -1163,20 +1163,34 @@ class Controller:
         weight sync.
 
         One observation can miss a replica whose probe was briefly slow, which
-        would fail the whole startup, so unready models are observed again
-        until ``INITIAL_ROLLOUT_READY_TIMEOUT_S`` passes.
+        would fail the whole startup, so unready models are observed again.
+        ``INITIAL_ROLLOUT_READY_TIMEOUT_S`` bounds the whole wait, including
+        each snapshot and refresh: one refresh probes every replica in turn and
+        can itself outlast the limit.
         """
         manager = self._inference_manager_handle
-        deadline = time.monotonic() + INITIAL_ROLLOUT_READY_TIMEOUT_S
-        while True:
-            snapshot = await manager.snapshot.remote(Role.ROLLOUT)
-            unready = [
-                model for model in snapshot.models if model.state != LifecycleState.READY or not model.admission
-            ]
-            if not unready:
-                return
-            if time.monotonic() >= deadline:
-                details = [
+        unready: list[Any] | None = None
+
+        async def poll() -> None:
+            nonlocal unready
+            while True:
+                snapshot = await manager.snapshot.remote(Role.ROLLOUT)
+                unready = [
+                    model for model in snapshot.models if model.state != LifecycleState.READY or not model.admission
+                ]
+                if not unready:
+                    return
+                await asyncio.sleep(INITIAL_ROLLOUT_READY_POLL_S)
+                await asyncio.gather(*(manager.refresh.remote(Role.ROLLOUT, model.model_id) for model in unready))
+
+        try:
+            await asyncio.wait_for(poll(), INITIAL_ROLLOUT_READY_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            # The last snapshot that arrived in time explains the failure.
+            details = (
+                "no rollout snapshot arrived in time"
+                if unready is None
+                else [
                     {
                         "model": model.model_id,
                         "state": model.state.value,
@@ -1189,11 +1203,10 @@ class Controller:
                     }
                     for model in unready
                 ]
-                raise RuntimeError(
-                    f"Rollout is not ready {INITIAL_ROLLOUT_READY_TIMEOUT_S:.0f}s after initial weight sync: {details}"
-                )
-            await asyncio.sleep(INITIAL_ROLLOUT_READY_POLL_S)
-            await asyncio.gather(*(manager.refresh.remote(Role.ROLLOUT, model.model_id) for model in unready))
+            )
+            raise RuntimeError(
+                f"Rollout is not ready {INITIAL_ROLLOUT_READY_TIMEOUT_S:.0f}s after initial weight sync: {details}"
+            ) from None
 
     def shutdown(self) -> None:
         """Gracefully shut down all services, cleaning up SGLang engine
