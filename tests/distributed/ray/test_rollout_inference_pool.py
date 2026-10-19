@@ -22,7 +22,7 @@ if HAS_DEPS:
     from relax.backends.sglang.sglang_engine import EngineMemoryStateUnknown
     from relax.distributed.ray.inference_manager import WEIGHT_UPDATE_BACKEND
     from relax.engine.inference.config import InferenceModelSpec
-    from relax.engine.inference.types import LifecycleState, Role, WeightSource
+    from relax.engine.inference.types import LifecycleState, Role, RouteMode, WeightSource
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
@@ -87,6 +87,24 @@ def test_rollout_observe_pd_exposes_only_router_service(patch_ray_get: Any, deco
     assert model.replicas[0].base_url == model.router_url
     assert sorted(kind for kind, _ in model.pd_workers) == ["decode", "prefill"]
     assert model.admission is ready
+
+
+def test_rollout_observe_direct_model_serves_without_a_router(patch_ray_get: Any) -> None:
+    # A direct-routed engine (native diffusion) never joins a Router.
+    engine = _observed_engine("3", router_registered=False)
+    server = make_rollout_server(engine_groups=[make_engine_group(engines=[engine])])
+    server.model_spec = InferenceModelSpec("default", "ckpt", route_mode=RouteMode.DIRECT)
+    pool = create_test_manager(servers={"default": server})
+    pool.rollout_engine_lock = MagicMock()
+
+    model = _model(pool)
+
+    assert engine.get_inference_observation.remote.call_args.kwargs == {"ensure_router": False}
+    assert model.state == LifecycleState.READY and model.admission
+    assert model.router_url is None
+    (replica,) = model.replicas
+    assert replica.state == LifecycleState.READY and replica.direct_eligible
+    assert model.required_weight_version == "3"
 
 
 def test_static_server_offload_is_idempotent_and_onload_reopens_every_engine(patch_ray_get: Any) -> None:
@@ -511,15 +529,26 @@ def test_weight_sync_confirmation_never_releases_a_later_generation(patch_ray_ge
     assert group.engine_init_records[0].awaiting_weight_sync
 
 
-@pytest.mark.parametrize("fully_async", [False, True])
+@pytest.mark.parametrize(
+    ("overrides", "weight_source", "awaits"),
+    [
+        ({"fully_async": False}, "dcs", False),
+        ({"fully_async": True}, "dcs", True),
+        # Nothing confirms these syncs, so a marked replacement would never serve.
+        ({"fully_async": True, "hybrid": True}, "dcs", False),
+        ({"fully_async": True, "lora_rank": 8, "lora_adapter_mode": True}, "dcs", False),
+        ({"fully_async": True}, "static", False),
+    ],
+    ids=["colocate", "fully-async", "hybrid", "lora-adapter", "static-weights"],
+)
 def test_recovery_marks_dcs_replacements_until_their_sync_is_confirmed(
-    patch_ray_get: Any, monkeypatch: Any, fully_async: bool
+    patch_ray_get: Any, monkeypatch: Any, overrides: dict[str, Any], weight_source: str, awaits: bool
 ) -> None:
     from conftest import make_mock_args
 
     from relax.distributed.ray import rollout
 
-    args = make_mock_args(num_gpus_per_node=1, fully_async=fully_async, offload_rollout=False)
+    args = make_mock_args(num_gpus_per_node=1, offload_rollout=False, **overrides)
     survivor = make_mock_engine()
     group = make_engine_group(args=args, engines=[survivor, None])
     group.pg = (object(), [0, 1], [0, 1])
@@ -533,10 +562,11 @@ def test_recovery_marks_dcs_replacements_until_their_sync_is_confirmed(
 
     monkeypatch.setattr(group, "start_engines", start)
     server = make_rollout_server(engine_groups=[group])
+    server.model_spec = InferenceModelSpec("default", "ckpt", weight_source=weight_source)
 
     server.recover()
 
-    assert group.engine_init_records[1].awaiting_weight_sync is fully_async
+    assert group.engine_init_records[1].awaiting_weight_sync is awaits
     assert 0 not in group.engine_init_records or not group.engine_init_records[0].awaiting_weight_sync
 
 

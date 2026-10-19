@@ -1560,12 +1560,22 @@ class SGLangEngine(RayActor):
         if self.unregister_from_router(wait_for_removal=True):
             return
         worker_url = f"http://{self.server_host}:{self.server_port}"
+        router = f"{getattr(self, 'router_ip', None)}:{getattr(self, 'router_port', None)}"
         try:
             listed = self._router_lists_worker(worker_url)
         except Exception as exc:
-            raise RuntimeError(f"Cannot offload {self.role.value}: its Router membership is unknown: {exc}") from exc
+            # Releasing memory a Router may still route to would crash the
+            # scheduler, so the engine keeps it: the offload fails closed.
+            raise RuntimeError(
+                f"Cannot offload {self.role.value} engine {worker_url}: its Router {router} is unreachable, so its "
+                f"removal cannot be confirmed and the engine keeps its GPU memory. Restore the Router or restart "
+                f"the task. ({type(exc).__name__}: {exc})"
+            ) from exc
         if listed:
-            raise RuntimeError(f"Cannot offload {self.role.value} while its Router worker is still registered")
+            raise RuntimeError(
+                f"Cannot offload {self.role.value} engine {worker_url} while Router {router} still lists it; "
+                "the engine keeps its GPU memory"
+            )
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
@@ -1694,20 +1704,21 @@ class SGLangEngine(RayActor):
         inherited_visible = [item.strip() for item in env.get(visible_env, "").split(",") if item.strip()]
         physical_gpu_ids = [self.base_gpu_id + local_rank for local_rank in range(tp_size)]
         if inherited_visible:
-            physical_tokens = [str(gpu_id) for gpu_id in physical_gpu_ids]
-            if all(token in inherited_visible for token in physical_tokens):
-                selected_visible = physical_tokens
-                parent_device_ids = [inherited_visible.index(token) for token in physical_tokens]
-            elif all(0 <= gpu_id < len(inherited_visible) for gpu_id in physical_gpu_ids):
-                selected_visible = [inherited_visible[gpu_id] for gpu_id in physical_gpu_ids]
-                parent_device_ids = physical_gpu_ids
-            else:
+            # Map the base the way the engine was launched (``_to_local_gpu_id``):
+            # it drives local devices ``base + k``, whose physical IDs need not
+            # be consecutive (e.g. GPUs 4 and 7 under visible devices "4,7").
+            base_token = str(self.base_gpu_id)
+            local_base = inherited_visible.index(base_token) if base_token in inherited_visible else self.base_gpu_id
+            parent_device_ids = list(range(local_base, local_base + tp_size))
+            if not all(0 <= device_id < len(inherited_visible) for device_id in parent_device_ids):
                 return {
                     "success": False,
                     "category": PrecheckProbeCategory.GPU_MAPPING_MISMATCH.value,
-                    "message": f"cannot map {physical_gpu_ids=} under {visible_env}={inherited_visible}",
+                    "message": f"cannot map base {self.base_gpu_id} x{tp_size} under {visible_env}={inherited_visible}",
                     "results": [],
                 }
+            selected_visible = [inherited_visible[device_id] for device_id in parent_device_ids]
+            physical_gpu_ids = [int(token) if token.isdigit() else token for token in selected_visible]
         else:
             selected_visible = [str(gpu_id) for gpu_id in physical_gpu_ids]
             parent_device_ids = physical_gpu_ids

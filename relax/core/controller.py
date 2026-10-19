@@ -79,6 +79,10 @@ ACTOR_ROLLOUT_PG_ROLES = ["actor", "rollout", GENRM_ROLE]
 # Bounds the inference manager's engine and Router cleanup so it finishes
 # before the driver's 60s signal-exit watchdog.
 INFERENCE_SHUTDOWN_TIMEOUT_S = 35.0
+# How long the initial fully-async weight sync may take to show every rollout
+# model READY, re-observing unready models every poll.
+INITIAL_ROLLOUT_READY_TIMEOUT_S = 120.0
+INITIAL_ROLLOUT_READY_POLL_S = 2.0
 # ``auto`` may resolve to a node-local full checkpoint on a single-node engine,
 # while ``runai_streamer`` keeps the model source on raw S3.  Be conservative:
 # cleanup is enabled only when the configured plan cannot retain SHM weights.
@@ -1086,22 +1090,7 @@ class Controller:
                         await self._inference_manager_handle.end_weight_update.remote(
                             Role.ROLLOUT, WEIGHT_UPDATE_BACKEND
                         )
-                        snapshot = await self._inference_manager_handle.snapshot.remote(Role.ROLLOUT)
-                        unready = [
-                            {
-                                "model": model.model_id,
-                                "state": model.state.value,
-                                "admission": model.admission,
-                                "versions": [
-                                    (replica.engine_id, replica.weight_version, replica.state.value)
-                                    for replica in model.replicas
-                                ],
-                            }
-                            for model in snapshot.models
-                            if model.state != LifecycleState.READY or not model.admission
-                        ]
-                        if unready:
-                            raise RuntimeError(f"Rollout is not ready after initial weight sync: {unready}")
+                        await self._await_rollout_ready_after_initial_sync()
                 if ROLES.actor in self.serve_dict:
                     step = await self.serve_dict[ROLES.actor].get_step()
                     for service in self.serve_dict.values():
@@ -1168,6 +1157,43 @@ class Controller:
                 # Report error to metrics service for Apprise notification
                 self._report_error_to_metrics_service(e)
                 raise
+
+    async def _await_rollout_ready_after_initial_sync(self) -> None:
+        """Wait, bounded, until every rollout model is READY after the initial
+        weight sync.
+
+        One observation can miss a replica whose probe was briefly slow, which
+        would fail the whole startup, so unready models are observed again
+        until ``INITIAL_ROLLOUT_READY_TIMEOUT_S`` passes.
+        """
+        manager = self._inference_manager_handle
+        deadline = time.monotonic() + INITIAL_ROLLOUT_READY_TIMEOUT_S
+        while True:
+            snapshot = await manager.snapshot.remote(Role.ROLLOUT)
+            unready = [
+                model for model in snapshot.models if model.state != LifecycleState.READY or not model.admission
+            ]
+            if not unready:
+                return
+            if time.monotonic() >= deadline:
+                details = [
+                    {
+                        "model": model.model_id,
+                        "state": model.state.value,
+                        "admission": model.admission,
+                        "versions": [
+                            (replica.engine_id, replica.weight_version, replica.state.value)
+                            for replica in model.replicas
+                        ],
+                        "issues": list(model.issues),
+                    }
+                    for model in unready
+                ]
+                raise RuntimeError(
+                    f"Rollout is not ready {INITIAL_ROLLOUT_READY_TIMEOUT_S:.0f}s after initial weight sync: {details}"
+                )
+            await asyncio.sleep(INITIAL_ROLLOUT_READY_POLL_S)
+            await asyncio.gather(*(manager.refresh.remote(Role.ROLLOUT, model.model_id) for model in unready))
 
     def shutdown(self) -> None:
         """Gracefully shut down all services, cleaning up SGLang engine

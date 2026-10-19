@@ -193,3 +193,28 @@ def test_genrm_resource_is_required_when_enabled(_arguments_module):
     args = _args(genrm_model_path="/judge", resource={})
     with pytest.raises(ValueError, match="no 'genrm' entry"):
         _arguments_module._validate_genrm_resource_config(args, _arguments_module._resolve_genrm_instances(args))
+
+
+@pytest.mark.parametrize(
+    ("rollout_gpus", "defer", "shared"),
+    [(4, False, False), (8, True, True)],
+    ids=["split", "shared-defer-swap"],
+)
+def test_genrm_colocate_layout_accepts_split_and_defer_swap(_arguments_module, rollout_gpus, defer, shared):
+    args = SimpleNamespace(
+        rollout_num_gpus=rollout_gpus,
+        _genrm_instances_resolved={"judge": {"num_gpus": 8 - rollout_gpus if not shared else 8}},
+        defer_reward_to_post_process=defer,
+    )
+    _arguments_module._resolve_genrm_colocate_layout(args, actor_total_gpus=8)
+    assert args._genrm_colocate_with_rollout is shared
+
+
+def test_genrm_colocate_layout_refuses_shared_bundles_without_defer(_arguments_module):
+    # Shared bundles without --defer-reward-to-post-process would keep both
+    # resident, which the inference planner does not support.
+    args = SimpleNamespace(
+        rollout_num_gpus=8, _genrm_instances_resolved={"judge": {"num_gpus": 8}}, defer_reward_to_post_process=False
+    )
+    with pytest.raises(ValueError, match="requires --defer-reward-to-post-process"):
+        _arguments_module._resolve_genrm_colocate_layout(args, actor_total_gpus=8)

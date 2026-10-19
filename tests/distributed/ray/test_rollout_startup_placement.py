@@ -843,3 +843,18 @@ def test_build_placement_binding_orders_by_address_but_names_nodes_by_ray_id():
     assert binding.gpu_ids == (0, 1, 0, 1)
     assert binding.node_ids == ("node-a", "node-a", "node-b", "node-b")
     assert binding.pg is pg
+
+
+@pytest.mark.parametrize(
+    ("class_path", "route_mode"),
+    [
+        (None, "sglang_router"),
+        ("relax.backends.sglang.diffusion_engine.SGLangNativeGenerationEngine", "direct"),
+    ],
+)
+def test_rollout_models_take_the_route_mode_of_their_engine_class(class_path, route_mode):
+    args = _args()
+    args.rollout_engine_class_path = class_path
+
+    # A native diffusion engine never joins a Router, so its models are direct-routed.
+    assert [model.route_mode.value for model in module.rollout_role_models(args)] == [route_mode]

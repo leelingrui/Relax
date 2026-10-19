@@ -17,6 +17,7 @@ from starlette.types import Receive, Scope, Send
 from relax.engine.inference.executor import AdmittedRequest, InferenceRequestExecutor, assign_backend_rids
 from relax.engine.inference.routing import RoutingError
 from relax.engine.inference.types import Role, RoleSnapshot
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
@@ -321,8 +322,10 @@ gateway_app = FastAPI()
 
 # Routes live in the deployment class: ``serve.ingress`` serves a copy of
 # ``gateway_app`` and binds each replica instance to its routes as ``self``, so
-# nothing is looked up through the module-level app's state.
-@serve.deployment(ray_actor_options={"num_gpus": 0}, max_ongoing_requests=128)
+# nothing is looked up through the module-level app's state. ``deploy_gateway``
+# sizes each role's concurrency; the class keeps a usable default for a direct
+# bind instead of Ray Serve's default of 5.
+@serve.deployment(ray_actor_options={"num_gpus": 0}, max_ongoing_requests=256)
 @serve.ingress(gateway_app)
 class InferenceGatewayDeployment(InferenceGateway):
     """Ray Serve deployment form of :class:`InferenceGateway`."""
@@ -360,6 +363,18 @@ def gateway_deployment_name(role: str | Role) -> str:
     return f"{Role(role).value}_gateway"
 
 
+def gateway_max_ongoing_requests(role: str | Role) -> int:
+    """The concurrency a role's Gateway admits, the limit its callers already
+    configure: GenRM and Rollout keep their former Serve ingress limits, and
+    the Teacher matches the OPD client's connection limit."""
+    limits = {
+        Role.ROLLOUT: Envs.ROLLOUT_SERVE_MAX_ONGOING_REQUESTS,
+        Role.GENRM: Envs.GENRM_SERVE_MAX_ONGOING_REQUESTS,
+        Role.TEACHER: Envs.TEACHER_GATEWAY_MAX_ONGOING_REQUESTS,
+    }
+    return limits[Role(role)]
+
+
 def deploy_gateway(
     role: str | Role,
     *,
@@ -375,7 +390,7 @@ def deploy_gateway(
     from relax.utils.utils import get_serve_url
 
     role = Role(role)
-    gateway = InferenceGatewayDeployment.bind(
+    gateway = InferenceGatewayDeployment.options(max_ongoing_requests=gateway_max_ongoing_requests(role)).bind(
         role.value,
         manager_handle=manager_handle,
         upstream_url=upstream_url,
@@ -396,4 +411,5 @@ __all__ = [
     "deploy_gateway",
     "gateway_app",
     "gateway_deployment_name",
+    "gateway_max_ongoing_requests",
 ]

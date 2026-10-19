@@ -278,6 +278,7 @@ def create_test_manager(args=None, servers=None):
     manager._health_monitors = []
     manager._stranded_replicas = []
     manager._stranded_lock = threading.Lock()
+    manager._stranded_retry_running = threading.Lock()
     manager._stranded_retry_stop = threading.Event()
     manager._stranded_retry_thread = None
     manager._max_terminal_requests = 100

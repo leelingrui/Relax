@@ -108,9 +108,34 @@ def test_inference_gateway_deploy_uses_one_cpu_ingress_per_role(monkeypatch):
     owner = object()
 
     assert inference_gateway.deploy_gateway(Role.TEACHER, manager_handle=owner) == "http://serve/teacher"
-    deployment.bind.assert_called_once_with(
-        "teacher", manager_handle=owner, upstream_url=None, genrm_backend_handle=None
-    )
-    run.assert_called_once_with(deployment.bind.return_value, name="teacher_gateway", route_prefix="/teacher")
+    deployment.options.assert_called_once_with(max_ongoing_requests=256)
+    bind = deployment.options.return_value.bind
+    bind.assert_called_once_with("teacher", manager_handle=owner, upstream_url=None, genrm_backend_handle=None)
+    run.assert_called_once_with(bind.return_value, name="teacher_gateway", route_prefix="/teacher")
     inference_gateway.delete_gateway("teacher")
     delete.assert_called_once_with("teacher_gateway")
+
+
+def test_inference_gateway_keeps_each_role_s_configured_concurrency(monkeypatch):
+    from relax.components import inference_gateway
+    from relax.engine.inference.types import Role
+
+    monkeypatch.setenv("GENRM_SERVE_MAX_ONGOING_REQUESTS", "64")
+    monkeypatch.setenv("ROLLOUT_SERVE_MAX_ONGOING_REQUESTS", "512")
+    monkeypatch.setenv("TEACHER_GATEWAY_MAX_ONGOING_REQUESTS", "1024")
+
+    # The Gateway is the ingress callers reach, so it must honor their limits
+    # instead of capping every role at one fixed value.
+    assert inference_gateway.gateway_max_ongoing_requests(Role.GENRM) == 64
+    assert inference_gateway.gateway_max_ongoing_requests(Role.ROLLOUT) == 512
+    assert inference_gateway.gateway_max_ongoing_requests("teacher") == 1024
+
+
+def test_inference_gateway_class_keeps_a_usable_default_concurrency():
+    from ray.serve._private.constants import DEFAULT_MAX_ONGOING_REQUESTS
+
+    from relax.components.inference_gateway import InferenceGatewayDeployment
+
+    # A direct bind that skips deploy_gateway must not fall back to Serve's tiny default.
+    limit = InferenceGatewayDeployment._deployment_config.max_ongoing_requests
+    assert limit == 256 and limit > DEFAULT_MAX_ONGOING_REQUESTS

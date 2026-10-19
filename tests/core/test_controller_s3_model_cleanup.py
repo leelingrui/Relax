@@ -549,3 +549,49 @@ def test_controller_aborted_service_keeps_the_pg_while_engines_may_hold_gpus(mon
     instance._cleanup_aborted_service("rollout", service, deploy=True)
 
     assert released == []
+
+
+def _rollout_snapshots(states):
+    """A Manager stub whose rollout snapshot walks through ``states``."""
+    seen = {"snapshots": 0, "refreshed": []}
+
+    async def snapshot(_role):
+        state = states[min(seen["snapshots"], len(states) - 1)]
+        seen["snapshots"] += 1
+        model = SimpleNamespace(
+            model_id="default", state=state, admission=state == controller.LifecycleState.READY, replicas=(), issues=()
+        )
+        return SimpleNamespace(models=[model])
+
+    async def refresh(role, model_id):
+        seen["refreshed"].append((role, model_id))
+
+    handle = SimpleNamespace(snapshot=SimpleNamespace(remote=snapshot), refresh=SimpleNamespace(remote=refresh))
+    return handle, seen
+
+
+def test_controller_re_observes_rollout_until_ready_after_initial_sync(monkeypatch):
+    import asyncio
+
+    instance = controller.Controller.__new__(controller.Controller)
+    starting, ready = controller.LifecycleState.STARTING, controller.LifecycleState.READY
+    instance._inference_manager_handle, seen = _rollout_snapshots([starting, starting, ready])
+    monkeypatch.setattr(controller, "INITIAL_ROLLOUT_READY_POLL_S", 0.0)
+
+    # One slow probe must not fail the startup: unready models are observed again.
+    asyncio.run(instance._await_rollout_ready_after_initial_sync())
+
+    assert seen["snapshots"] == 3
+    assert seen["refreshed"] == [(controller.Role.ROLLOUT, "default")] * 2
+
+
+def test_controller_fails_startup_when_rollout_stays_unready(monkeypatch):
+    import asyncio
+
+    instance = controller.Controller.__new__(controller.Controller)
+    instance._inference_manager_handle, _ = _rollout_snapshots([controller.LifecycleState.STARTING])
+    monkeypatch.setattr(controller, "INITIAL_ROLLOUT_READY_POLL_S", 0.0)
+    monkeypatch.setattr(controller, "INITIAL_ROLLOUT_READY_TIMEOUT_S", 0.0)
+
+    with pytest.raises(RuntimeError, match="Rollout is not ready"):
+        asyncio.run(instance._await_rollout_ready_after_initial_sync())

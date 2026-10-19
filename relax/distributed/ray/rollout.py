@@ -59,6 +59,7 @@ from relax.engine.inference.types import (
     ModelSnapshot,
     ReplicaSnapshot,
     Role,
+    RouteMode,
     TopologyEvents,
     WeightSource,
 )
@@ -73,6 +74,7 @@ from relax.utils.http_utils import (
     init_http_client,
 )
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_peft_utils import is_lora_adapter_mode, is_lora_enabled
 from relax.utils.metrics.metric_utils import compute_pass_rate, compute_rollout_step, dict_add_prefix
 from relax.utils.metrics.rollout_metrics import (
     compute_metrics_from_samples,
@@ -666,6 +668,20 @@ class RolloutServer:
             raise ValueError(f"Heterogeneous nodes_per_engine across groups: {values}")
         return values.pop()
 
+    def _replacements_await_dcs_confirmation(self, args: Any) -> bool:
+        """Whether a replacement must wait for ``confirm_weight_sync``.
+
+        Only a fully-async DCS sync of policy weights reports its recipients.
+        Hybrid syncs through the colocated path, a LoRA adapter sync confirms
+        nothing and static weights are never synced, so a replacement there
+        would never be published.
+        """
+        if self.static or not getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+            return False
+        if self.model_spec is not None and not self.model_spec.needs_dcs:
+            return False
+        return not (is_lora_enabled(args) and is_lora_adapter_mode(args))
+
     def recover(self):
         """Recover dead engines across all active groups, overlapping init."""
         groups = list(self.engine_groups)
@@ -771,7 +787,7 @@ class RolloutServer:
                 continue
             handles, port_cursors = g.start_engines(port_cursors)
             all_handles.extend(handles)
-            if getattr(g.args, "fully_async", False) and not self.static:
+            if self._replacements_await_dcs_confirmation(g.args):
                 for slot in dead_per_group[g_idx]:
                     if (record := g.engine_init_records.get(slot)) is not None:
                         record.awaiting_weight_sync = True
@@ -984,6 +1000,8 @@ class RolloutServer:
         """
         serving = self.onloaded and serving
         policy = self.model_spec is None or self.model_spec.needs_weight_update
+        # A direct-routed model serves from its replicas, not through a Router.
+        direct = self.model_spec is not None and not self.model_spec.needs_router
         actor_states = _cached_engine_actor_states()
         replicas = []
         issues: list[tuple[str, str]] = []
@@ -1028,7 +1046,8 @@ class RolloutServer:
                 if alive and not skip_probe:
                     try:
                         result = ray.get(
-                            head.get_inference_observation.remote(ensure_router=serving and confirmed), timeout=45
+                            head.get_inference_observation.remote(ensure_router=serving and confirmed and not direct),
+                            timeout=45,
                         )
                         observation = result if isinstance(result, dict) else {}
                     except Exception as e:
@@ -1059,7 +1078,7 @@ class RolloutServer:
                     alive
                     and confirmed
                     and observation.get("healthy")
-                    and observation.get("router_registered")
+                    and (direct or observation.get("router_registered"))
                     and (not policy or version not in (None, "", "default"))
                     and group.lifecycle_status == EngineGroupLifecycle.ACTIVE
                 )
@@ -1073,7 +1092,11 @@ class RolloutServer:
                     version,
                 )
                 pd_workers.get(group.worker_type, replicas).append(replica)
-        router_url = f"http://{self.router_ip}:{self.router_port}" if self.router_ip and self.router_port else None
+        router_url = (
+            f"http://{self.router_ip}:{self.router_port}"
+            if self.router_ip and self.router_port and not direct
+            else None
+        )
         if any(pd_workers.values()):
             workers = [worker for values in pd_workers.values() for worker in values]
             versions = {worker.weight_version for worker in workers if worker.state == LifecycleState.READY}
@@ -1091,7 +1114,7 @@ class RolloutServer:
         ready = bool(
             serving
             and router_members_ready
-            and router_url
+            and (direct or router_url)
             and (len(versions) == 1 if policy else any(r.state == LifecycleState.READY for r in replicas))
         )
         return ModelSnapshot(
@@ -1153,6 +1176,9 @@ class RolloutEnginePool:
         # Guards the list against the background retry thread, which runs
         # only while some replica is stranded.
         self._stranded_lock = threading.Lock()
+        # Held by the one retry that has taken the list: a replica it is still
+        # stopping is in no list, so the final retry must wait for it.
+        self._stranded_retry_running = threading.Lock()
         self._stranded_retry_stop = threading.Event()
         self._stranded_retry_thread: threading.Thread | None = None
         # Created before the engines start: once they run, nothing here may
@@ -3315,8 +3341,20 @@ class RolloutEnginePool:
         a replica that still does not stop has its placement group removed as a
         last resort, and is given back too.
 
-        Returns how many were still not confirmed stopped.
+        Returns how many were still not confirmed stopped. A retry that finds
+        another one running leaves the replicas to it, except the final one,
+        which waits for it and then sees every replica that is still stranded.
         """
+        if final:
+            await asyncio.to_thread(self._stranded_retry_running.acquire)
+        elif not self._stranded_retry_running.acquire(blocking=False):
+            return 0
+        try:
+            return await self._retry_stranded_replicas(final)
+        finally:
+            self._stranded_retry_running.release()
+
+    async def _retry_stranded_replicas(self, final: bool) -> int:
         # Take the list, so a concurrent retry never stops the same replica.
         with self._stranded_lock:
             stranded, self._stranded_replicas = self._stranded_replicas, []
@@ -5082,10 +5120,13 @@ def _wait_engine_init_with_progress(
 def rollout_role_models(args) -> list[InferenceModelSpec]:
     """The rollout models declared by the SGLang config, resolved."""
     config = _resolve_sglang_config(args)
+    # An engine class that never joins a Router (native diffusion) is direct-routed.
+    route_mode = getattr(_resolve_rollout_engine_class(args), "route_mode", RouteMode.SGLANG_ROUTER)
     # Rollout is the only elastic role, unless its Router is a fixed pool.
     return [
         dataclasses.replace(
             model.resolved(args),
+            route_mode=route_mode,
             elastic_enabled=not getattr(args, "use_slime_router", False),
             fault_tolerance_enabled=bool(getattr(args, "use_fault_tolerance", False)),
             # Debug-rollout-only never syncs weights: the checkpoint the engines

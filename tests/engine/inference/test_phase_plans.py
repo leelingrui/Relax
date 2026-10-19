@@ -14,7 +14,7 @@ from relax.engine.inference.phase_plans import (
     deferred_genrm_enabled,
     deferred_opd_enabled,
     placement_phase,
-    reject_shared_co_resident,
+    require_deferred_shared_genrm,
 )
 from relax.engine.inference.placement import (
     PlacementGroupView,
@@ -97,20 +97,20 @@ def test_phase_plans_split_genrm_scores_inline_even_when_deferred():
     assert placement_phase(split, PHASE_GENRM) == PHASE_GENERATE
 
 
-def test_shared_co_resident_genrm_is_rejected_before_startup():
+def test_shared_genrm_without_defer_is_rejected_before_startup():
     shared = build_args(_genrm_instances_resolved={"a": {}}, _genrm_colocate_with_rollout=True)
-    with pytest.raises(ValueError, match="shared co-resident"):
-        reject_shared_co_resident(shared)
+    with pytest.raises(ValueError, match="requires --defer-reward-to-post-process"):
+        require_deferred_shared_genrm(shared)
     # Deferring makes the same bundles legal: the roles take turns.
-    reject_shared_co_resident(
+    require_deferred_shared_genrm(
         build_args(
             _genrm_instances_resolved={"a": {}}, _genrm_colocate_with_rollout=True, defer_reward_to_post_process=True
         )
     )
-    reject_shared_co_resident(build_args(_genrm_instances_resolved={"a": {}}))
+    require_deferred_shared_genrm(build_args(_genrm_instances_resolved={"a": {}}))
 
 
-def test_shared_co_resident_genrm_overlap_is_rejected_by_the_planner():
+def test_shared_genrm_overlap_without_defer_is_rejected_by_the_planner():
     args = build_args(_genrm_instances_resolved={"a": {}})
     planner = PlacementPlanner()
     view = PlacementGroupView(tuple(range(4)), tuple(range(4)), PlacementOwner.CONTROLLER, identity="pg")

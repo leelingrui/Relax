@@ -53,7 +53,7 @@ from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.engine.inference.config import DeploymentSpec, InferenceModelSpec, InferenceRoleSpec
 from relax.engine.inference.discovery import new_manager_epoch
 from relax.engine.inference.lifecycle import SWITCH_DRAIN_TIMEOUT_S, LifecycleCoordinator, LoopAwareCondition
-from relax.engine.inference.phase_plans import PHASE_GENERATE, reject_shared_co_resident
+from relax.engine.inference.phase_plans import PHASE_GENERATE, require_deferred_shared_genrm
 from relax.engine.inference.placement import (
     ModelPlacement,
     PlacementGroupView,
@@ -1528,7 +1528,7 @@ def create_inference_manager(args: Any, runtime_env: dict[str, Any] | None = Non
     from relax.core.node_group_affinity import require_control_plane_resource_on_node
     from relax.distributed.ray.placement_group import _get_head_node_id
 
-    reject_shared_co_resident(args)
+    require_deferred_shared_genrm(args)
     validate_task_layout(args)
     head_node_id = _get_head_node_id()
     require_control_plane_resource_on_node(args, head_node_id)

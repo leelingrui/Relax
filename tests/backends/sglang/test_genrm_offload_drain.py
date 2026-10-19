@@ -180,7 +180,7 @@ def test_release_refuses_to_offload_while_router_worker_is_registered(patched, r
     engine.unregister_from_router = lambda **kwargs: False
     engine._router_lists_worker = lambda url: True
 
-    with pytest.raises(RuntimeError, match="Router worker is still registered"):
+    with pytest.raises(RuntimeError, match="still lists it"):
         engine.release_memory_occupation()
 
     assert "release_memory_occupation" not in fake_requests.calls
@@ -209,7 +209,7 @@ def test_release_refuses_when_router_membership_is_unknown(patched):
         raise m.requests.exceptions.ConnectionError("router down")
 
     engine._router_lists_worker = unreachable
-    with pytest.raises(RuntimeError, match="membership is unknown"):
+    with pytest.raises(RuntimeError, match=r"Router .* is unreachable.*keeps its GPU memory"):
         engine.release_memory_occupation()
     assert "release_memory_occupation" not in fake_requests.calls
 

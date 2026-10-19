@@ -52,14 +52,15 @@ def placement_phase(args: Any, phase_id: str) -> str:
     return phase_id if deferred[phase_id](args) else PHASE_GENERATE
 
 
-def reject_shared_co_resident(args: Any) -> None:
-    """Refuse a GenRM that shares the rollout bundles without deferring.
+def require_deferred_shared_genrm(args: Any) -> None:
+    """Require a GenRM on the rollout bundles to defer its scoring.
 
-    The planner rejects the same layout once both roles are placed; this check
-    runs before the first engine of the task starts.
+    Such a GenRM only takes turns with generation; the planner rejects the
+    same-phase overlap once both roles are placed, and this check runs before
+    the first engine of the task starts.
     """
     if getattr(args, "_genrm_colocate_with_rollout", False) and not deferred_genrm_enabled(args):
         raise ValueError(
-            "GenRM shares the rollout GPUs while both stay resident (shared co-resident), which is not supported. "
-            "Split the GPUs (--rollout-num-gpus + GenRM GPUs == actor GPUs) or add --defer-reward-to-post-process."
+            "A GenRM on the rollout GPUs takes turns with generation and requires --defer-reward-to-post-process. "
+            "Add it, or split the GPUs (--rollout-num-gpus + GenRM GPUs == actor GPUs)."
         )

@@ -185,7 +185,7 @@ def test_placement_planner_rejects_an_inconsistent_group_view():
 # ---------------------------------------------------------------------------
 # Same-phase exclusion and cross-phase sharing.
 # ---------------------------------------------------------------------------
-def test_placement_planner_rejects_co_resident_slices_in_one_phase():
+def test_placement_planner_rejects_overlapping_slices_in_one_phase():
     planner = PlacementPlanner()
     view = _view()
 

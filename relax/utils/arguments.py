@@ -13,6 +13,7 @@ from sglang_router.launch_router import RouterArgs
 from relax.algorithms import get_algorithm, list_algorithm_names
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
+from relax.engine.inference.phase_plans import require_deferred_shared_genrm
 from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
 from relax.engine.sft.runtime import is_dpo_mode, is_offline_mode, is_sft_mode
 from relax.utils import device as device_utils
@@ -3159,6 +3160,36 @@ def _resolve_genrm_instances(args) -> dict:
     }
 
 
+def _resolve_genrm_colocate_layout(args, actor_total_gpus: int) -> None:
+    """Set ``args._genrm_colocate_with_rollout`` for a colocated GenRM, or
+    refuse its GPU layout.
+
+    Split bundles serve GenRM beside generation; shared bundles only take turns
+    with it (defer-swap), so sharing them without deferring is refused.
+    """
+    rollout_g = args.rollout_num_gpus
+    genrm_g = sum(spec["num_gpus"] for spec in args._genrm_instances_resolved.values())
+    if rollout_g + genrm_g == actor_total_gpus:
+        args._genrm_colocate_with_rollout = False
+        logger.info(
+            f"GenRM colocate (split bundles): rollout={rollout_g}, genrm={genrm_g}, actor total={actor_total_gpus}."
+        )
+    elif rollout_g == actor_total_gpus and genrm_g == actor_total_gpus:
+        args._genrm_colocate_with_rollout = True
+        require_deferred_shared_genrm(args)
+        logger.info(
+            f"GenRM colocate (shared bundles with rollout, defer-swap): rollout=genrm={actor_total_gpus} GPUs."
+        )
+    else:
+        raise ValueError(
+            "In colocated mode with genRM enabled, GPU allocation must satisfy one of:\n"
+            f"  (1) split: --rollout-num-gpus + --genrm-num-gpus == actor total ({actor_total_gpus}), or\n"
+            f"  (2) shared (with --defer-reward-to-post-process): "
+            f"--rollout-num-gpus == --genrm-num-gpus == actor total ({actor_total_gpus}).\n"
+            f"Got rollout={rollout_g}, genrm={genrm_g}, actor total={actor_total_gpus}."
+        )
+
+
 def _validate_genrm_resource_config(args, instance_specs: dict) -> None:
     """Require the GenRM placement-group budget to match all instances."""
     if not instance_specs:
@@ -4436,28 +4467,7 @@ def slime_validate_args(args):
         if args.use_critic:
             actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
 
-        rollout_g = args.rollout_num_gpus
-        genrm_g = sum(spec["num_gpus"] for spec in args._genrm_instances_resolved.values())
-        if rollout_g + genrm_g == actor_total_gpus:
-            args._genrm_colocate_with_rollout = False
-            logger.info(
-                f"GenRM colocate (split bundles): rollout={rollout_g}, genrm={genrm_g}, "
-                f"actor total={actor_total_gpus}."
-            )
-        elif rollout_g == actor_total_gpus and genrm_g == actor_total_gpus:
-            args._genrm_colocate_with_rollout = True
-            logger.info(
-                f"GenRM colocate (shared bundles with rollout): rollout=genrm={actor_total_gpus} GPUs. "
-                f"Set per-engine SGLang mem_fraction_static via --sglang-config (rollout) and "
-                f"--genrm-engine-config '{{\"mem_fraction_static\": <float>}}' (genrm)."
-            )
-        else:
-            raise ValueError(
-                "In colocated mode with genRM enabled, GPU allocation must satisfy one of:\n"
-                f"  (1) split: --rollout-num-gpus + --genrm-num-gpus == actor total ({actor_total_gpus}), or\n"
-                f"  (2) shared: --rollout-num-gpus == --genrm-num-gpus == actor total ({actor_total_gpus}).\n"
-                f"Got rollout={rollout_g}, genrm={genrm_g}, actor total={actor_total_gpus}."
-            )
+        _resolve_genrm_colocate_layout(args, actor_total_gpus)
 
     if args.offload_train is None:
         args.offload_train = False

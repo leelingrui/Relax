@@ -595,6 +595,40 @@ async def test_stranded_replica_is_given_back_once_a_retry_stops_it():
 
 
 @pytest.mark.asyncio
+async def test_final_stranded_retry_waits_for_a_retry_already_running():
+    manager = create_test_manager()
+    pg = object()
+    group = await _strand_one_replica(manager, pg)
+    started, unblock = asyncio.Event(), asyncio.Event()
+
+    async def slow_rollback(_group):
+        started.set()
+        await unblock.wait()
+        return False
+
+    manager._rollback_engines = slow_rollback
+    with patch("relax.distributed.ray.rollout.ray.util.remove_placement_group") as remove_pg:
+        background = asyncio.create_task(manager.retry_stranded_replicas())
+        await started.wait()
+        # The running retry holds the replica outside the list; a second
+        # ordinary retry leaves it alone instead of seeing an empty list.
+        assert await manager.retry_stranded_replicas() == 0
+        final = asyncio.create_task(manager.retry_stranded_replicas(final=True))
+        await asyncio.sleep(0.05)
+        assert not final.done()
+
+        manager._rollback_engines = AsyncMock(return_value=False)
+        unblock.set()
+        assert await background == 1
+        # The final retry sees the replica the background retry put back.
+        assert await final == 1
+
+    manager._rollback_engines.assert_awaited_once_with(group)
+    assert manager._planner.allocations() == () and manager._stranded_replicas == []
+    remove_pg.assert_called_once_with(pg)
+
+
+@pytest.mark.asyncio
 async def test_stranded_replica_falls_back_to_placement_group_removal_only_at_shutdown():
     manager = create_test_manager()
     pg = object()
