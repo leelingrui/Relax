@@ -589,3 +589,74 @@ def test_rollout_observe_keeps_a_failed_probe_as_incomplete_evidence(patch_ray_g
     assert discovery["observation"]["complete"] is False
     engines, complete = sglang_exporter._discover_engines(discovery)
     assert [found.url for found in engines] == ["http://w:1"] and complete is False
+
+
+def _multinode_static_server(*engines: Any) -> tuple[Any, Any]:
+    """A static pool whose engines span two 8-GPU nodes each (TP=16): slots
+    alternate head, follower."""
+    from conftest import make_mock_args
+
+    args = make_mock_args(num_gpus_per_node=8)
+    group = make_engine_group(args=args, engines=list(engines), num_gpus_per_engine=16)
+    server = make_rollout_server(engine_groups=[group])
+    server.static = True
+    server.onloaded = True
+    server.model_spec = InferenceModelSpec("teacher", "ckpt", weight_source=WeightSource.STATIC)
+    return server, group
+
+
+def test_multinode_static_pool_serves_and_releases_through_heads_only(patch_ray_get: Any, monkeypatch: Any) -> None:
+    _raising_get(monkeypatch)
+    heads = [make_mock_engine(url=f"http://head-{i}:1") for i in range(2)]
+    followers = [make_mock_engine(url=None) for _ in range(2)]
+    for engine in (*heads, *followers):
+        engine.release_memory_occupation.remote.return_value = AwaitableValue(None)
+    server, group = _multinode_static_server(heads[0], followers[0], heads[1], followers[1])
+
+    # A follower serves no HTTP and holds no memory of its own to release.
+    assert server.get_urls() == ["http://head-0:1", "http://head-1:1"]
+    server.offload()
+    for head in heads:
+        head.release_memory_occupation.remote.assert_called_once_with()
+    for follower in followers:
+        follower.release_memory_occupation.remote.assert_not_called()
+    assert group.all_engines == [heads[0], followers[0], heads[1], followers[1]]
+
+
+def test_multinode_static_pool_retires_a_dead_replica_as_a_whole(patch_ray_get: Any, monkeypatch: Any) -> None:
+    _raising_get(monkeypatch)
+    dead_head, follower, head, other_follower = (make_mock_engine() for _ in range(4))
+    dead_head.release_memory_occupation.remote.return_value = AwaitableValue(ray.exceptions.RayActorError("node lost"))
+    head.release_memory_occupation.remote.return_value = AwaitableValue(None)
+    server, group = _multinode_static_server(dead_head, follower, head, other_follower)
+
+    server.offload()
+
+    # The follower of the dead replica goes with it; the other replica stays.
+    assert group.all_engines == [None, None, head, other_follower]
+    follower.shutdown.remote.assert_called_once_with()
+    other_follower.shutdown.remote.assert_not_called()
+    assert not server.onloaded
+
+
+def test_multinode_teacher_model_names_one_replica_per_node_pair() -> None:
+    from types import SimpleNamespace
+
+    from relax.engine.inference.config import EngineGroupSpec
+
+    args = SimpleNamespace(
+        num_gpus_per_node=8, rollout_num_gpus_per_engine=16, sglang_hf_checkpoint=None, hf_checkpoint="ckpt"
+    )
+    spec = InferenceModelSpec(
+        "teacher", "ckpt", engine_groups=[EngineGroupSpec("regular", 32, 16)], weight_source=WeightSource.STATIC
+    )
+
+    replicas = spec.resolved(args).engine_groups[0].topology.replicas
+
+    assert [(replica.replica_id, replica.node_ranks) for replica in replicas] == [
+        ("teacher/replica-0", (0, 1)),
+        ("teacher/replica-2", (2, 3)),
+    ]
+    partial = InferenceModelSpec("teacher", "ckpt", engine_groups=[EngineGroupSpec("regular", 24, 12)])
+    with pytest.raises(ValueError, match="complete nodes"):
+        partial.resolved(args)
