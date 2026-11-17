@@ -90,8 +90,20 @@ class Service:
         if self._deployed:
             raise RuntimeError(f"[{self.role}] Service has already been deployed")
         try:
+            token = getattr(self, "_inference_deployment_token", None)
+            if token is not None and token != getattr(self.config, "_inference_startup_token", None):
+                raise RuntimeError("Inference deployment startup token has been superseded")
+            if getattr(self.config, "_inference_startup_retired", False):
+                raise RuntimeError("Inference deployment startup has been retired")
             self._deploy(self.pgs)
         except Exception:
+            if str(self.role) in {"rollout", "genrm", "teacher"} and (
+                getattr(self, "_inference_task_owner", None) is not None
+                or getattr(self.config, "_rollout_engine_manager", None) is not None
+            ):
+                # The task still owns engines in this PG. Controller retains
+                # this wrapper and deletes its gateway/PG after confirmed cleanup.
+                raise
             # A failed Serve deployment can leave the PG allocated even though
             # this wrapper never becomes visible to the Controller.
             try:
@@ -140,7 +152,32 @@ class Service:
                 **ray_actor_options.get("resources", {}),
                 resource: 0.001,
             }
-        if self.data_source is not None:
+        if (
+            self.role in ("rollout", "genrm", "teacher")
+            and getattr(self.config, "_rollout_engine_manager", None) is not None
+        ):
+            from relax.components.inference_gateway import InferenceGatewayService
+            from relax.utils.env import Envs
+
+            limits = {
+                "rollout": Envs.ROLLOUT_SERVE_MAX_ONGOING_REQUESTS,
+                "genrm": Envs.GENRM_SERVE_MAX_ONGOING_REQUESTS,
+                "teacher": Envs.TEACHER_GATEWAY_MAX_ONGOING_REQUESTS,
+            }
+            self.service = InferenceGatewayService.options(
+                ray_actor_options=ray_actor_options,
+                max_constructor_retry_count=1,
+                max_ongoing_requests=limits[self.role],
+            ).bind(
+                self.healthy,
+                pgs,
+                self.num_gpus,
+                self.config,
+                self.role,
+                runtime_env=self.runtime_env,
+                data_source=self.data_source,
+            )
+        elif self.data_source is not None:
             self.service = self.cls.options(ray_actor_options=ray_actor_options, max_constructor_retry_count=1).bind(
                 self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env
             )

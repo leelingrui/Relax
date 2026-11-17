@@ -1,9 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import json
-import sys
 from argparse import Namespace
-from types import ModuleType
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -128,20 +127,42 @@ def test_rollout_data_source_requests_stable_cpu(monkeypatch, tmp_path):
     assert captured["config"] is args
 
 
-@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
-def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkeypatch, tmp_path, loss_type):
-    captured = {}
-    node_id = "a" * 56
-    rollout_module = ModuleType("relax.distributed.ray.rollout")
+def _install_managed_rollout_stubs(monkeypatch, captured):
+    from relax.distributed.ray import inference_manager, rollout_worker
 
-    class FakeRolloutManager(_FakeActorClass):
+    manager = SimpleNamespace(
+        start=SimpleNamespace(remote=lambda *a, **k: {"router_ip": "localhost", "router_port": 8000})
+    )
+    worker = SimpleNamespace(
+        get_num_rollout_per_epoch=SimpleNamespace(remote=lambda: 7),
+        configure=SimpleNamespace(remote=lambda *a: None),
+    )
+
+    class ManagerActor(_FakeActorClass):
         @classmethod
         def options(cls, **options):
             captured["options"] = options
             return cls
 
-    rollout_module.RolloutManager = FakeRolloutManager
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", rollout_module)
+        @classmethod
+        def remote(cls, **kwargs):
+            return manager
+
+    class WorkerActor(_FakeActorClass):
+        @classmethod
+        def remote(cls, *args):
+            return worker
+
+    monkeypatch.setattr(inference_manager, "InferenceManager", ManagerActor)
+    monkeypatch.setattr(rollout_worker, "RolloutWorker", WorkerActor)
+    monkeypatch.setattr(inference_manager.ray, "get", lambda ref: ref)
+
+
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
+def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkeypatch, tmp_path, loss_type):
+    captured = {}
+    _install_managed_rollout_stubs(monkeypatch, captured)
+    node_id = "a" * 56
     monkeypatch.setattr(placement_group_module, "_get_head_node_id", lambda: node_id)
     monkeypatch.setattr(
         placement_group_module.ray,
@@ -151,19 +172,19 @@ def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkey
     args = _elastic_args(
         tmp_path,
         loss_type=loss_type,
-        num_rollout_per_epoch=1,
+        num_epoch=None,
+        num_rollout=1,
         check_weight_update_equal=False,
         offload_rollout=False,
     )
-
     placement_group_module.create_rollout_manager(args, "pg", runtime_env={"env_vars": {"A": "B"}})
-
     assert captured["options"]["resources"] == {"stable_cpu": 1}
     assert captured["options"]["num_cpus"] == 1
     assert captured["options"]["runtime_env"] == {"env_vars": {"A": "B"}}
     assert captured["options"]["scheduling_strategy"].node_id == node_id
 
 
+<<<<<<< HEAD
 def test_genrm_manager_requests_stable_cpu(monkeypatch, tmp_path):
     captured = {}
     genrm_module = ModuleType("relax.distributed.ray.genrm")
@@ -187,6 +208,12 @@ def test_genrm_manager_requests_stable_cpu(monkeypatch, tmp_path):
         "runtime_env": {"env_vars": {"A": "B"}},
         "resources": {"stable_cpu": 1},
     }
+=======
+def test_genrm_service_reuses_task_owned_route_without_actor_allocation(tmp_path):
+    owner = object()
+    args = _elastic_args(tmp_path, _genrm_managers={"quality": owner})
+    assert placement_group_module.create_genrm_manager(args, "pg") is owner
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
 
 
 @pytest.mark.parametrize(
@@ -198,11 +225,8 @@ def test_rollout_manager_records_startup_after_resolving_epoch_cap(
     from relax.utils.agentic_obs import startup
 
     monkeypatch.setattr(startup, "submit_background", lambda function, *args, **kwargs: function(*args))
-    rollout_module = ModuleType("relax.distributed.ray.rollout")
-    rollout_module.RolloutManager = type("FakeRolloutManager", (_FakeActorClass,), {})
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", rollout_module)
+    _install_managed_rollout_stubs(monkeypatch, {})
     monkeypatch.setattr(placement_group_module, "_get_head_node_id", lambda: "a" * 56)
-    monkeypatch.setattr(placement_group_module.ray, "get", lambda ref: 7)
     args = Namespace(
         num_epoch=num_epoch,
         num_rollout=num_rollout,
@@ -230,6 +254,7 @@ def test_rollout_manager_records_startup_after_resolving_epoch_cap(
     assert plan["global_batch_size"] == 32
 
 
+<<<<<<< HEAD
 def test_multi_genrm_managers_have_route_specific_names(monkeypatch, tmp_path):
     captured_options = []
     captured_ctor_kwargs = []
@@ -269,6 +294,12 @@ def test_multi_genrm_managers_have_route_specific_names(monkeypatch, tmp_path):
         "relax_genrm_manager_safety",
     ]
     assert [kwargs["port_window_index"] for kwargs in captured_ctor_kwargs] == [0, 1]
+=======
+def test_multi_genrm_service_preserves_task_role_routes(tmp_path):
+    routes = {"quality": object(), "safety": object()}
+    args = _elastic_args(tmp_path, _genrm_managers=routes)
+    assert placement_group_module.create_genrm_managers(args, "pg") is routes
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
 
 
 def test_dcs_proxy_requests_stable_cpu(monkeypatch, tmp_path):

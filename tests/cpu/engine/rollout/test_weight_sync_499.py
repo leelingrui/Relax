@@ -232,6 +232,7 @@ async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, e
 
 class _RolloutState:
     def __init__(self, last_step_current_deficit=1):
+        self.opd_manager = None
         self.last_step_current_deficit = last_step_current_deficit
         self.remaining_batch_size = 0
         self.prefetched_samples_ref = None

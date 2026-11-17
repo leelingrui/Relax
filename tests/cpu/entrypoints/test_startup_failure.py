@@ -562,11 +562,16 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
         node
         for node in cls.body
         if isinstance(node, ast.FunctionDef)
+<<<<<<< HEAD
         and node.name in {"shutdown", "_dispose_rollout_manager", "_dispose_managed_genrm"}
+=======
+        and node.name
+        in {"shutdown", "_dispose_rollout_manager", "_dispose_managed_genrm", "_dispose_shared_inference_task"}
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     ]
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
-        sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_routers)
+        sys.modules, "relax.distributed.ray.policy_engine_pool", SimpleNamespace(stop_launched_routers=stop_routers)
     )
     stop_teacher = Mock()
     ns = {
@@ -584,6 +589,9 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
         _shutdown_agentic_rollout_services=Mock(),
         _close_data_system=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
+    )
+    partial_controller._dispose_shared_inference_task = ns["_dispose_shared_inference_task"].__get__(
+        partial_controller
     )
     partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
     partial_controller._dispose_managed_genrm = ns["_dispose_managed_genrm"].__get__(partial_controller)
@@ -633,11 +641,16 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
         node
         for node in cls.body
         if isinstance(node, ast.FunctionDef)
+<<<<<<< HEAD
         and node.name in {"shutdown", "_dispose_rollout_manager", "_dispose_managed_genrm"}
+=======
+        and node.name
+        in {"shutdown", "_dispose_rollout_manager", "_dispose_managed_genrm", "_dispose_shared_inference_task"}
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     ]
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
-        sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_routers)
+        sys.modules, "relax.distributed.ray.policy_engine_pool", SimpleNamespace(stop_launched_routers=stop_routers)
     )
     dispose_ref = object()
     dispose_remote = Mock(return_value=dispose_ref)
@@ -660,6 +673,7 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
         _close_data_system=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
     )
+    controller._dispose_shared_inference_task = ns["_dispose_shared_inference_task"].__get__(controller)
     controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(controller)
     controller._dispose_managed_genrm = ns["_dispose_managed_genrm"].__get__(controller)
 

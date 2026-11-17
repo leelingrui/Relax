@@ -424,7 +424,21 @@ class MegatronTrainRayActor(TrainRayActor):
         # Only rollout requests consume this live handle. Megatron saves its
         # args in common.pt; serializing a job-scoped Ray owner breaks resume.
         args = copy.copy(args)
+<<<<<<< HEAD
         vars(args).pop("_teacher_inference_manager_handle", None)
+=======
+        for runtime_owner in (
+            "_teacher_inference_manager_handle",
+            "_inference_phase_coordinator",
+            "_rollout_engine_manager",
+            "_genrm_managers",
+            "_teacher_inference_managers",
+            "_shared_startup_pending_owners",
+            "_inference_manager_handle",
+            "_inference_startup_token",
+        ):
+            vars(args).pop(runtime_owner, None)
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
         monkey_patch_torch_dist(args)
         from relax.utils.checkpoint_write_patch import patch_checkpoint_write
 
@@ -3382,10 +3396,16 @@ class MegatronTrainRayActor(TrainRayActor):
             synced_actor_ids = run(
                 self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only)
             )
-            if not actor_fwd_only and dist.get_rank(group=get_gloo_group()) == 0 and synced_actor_ids:
+            if not actor_fwd_only and dist.get_rank(group=get_gloo_group()) == 0:
                 try:
                     ray.get(
-                        self.rollout_manager.register_recovered_engines.remote(synced_actor_ids),
+                        self.rollout_manager.register_recovered_engines.remote(
+                            synced_actor_ids,
+                            weight_version=str(self.checkpoint_engine_client.backend.weight_version),
+                            base_weights_confirmed=not getattr(
+                                self.checkpoint_engine_client.backend, "_lora_skip_rollout_base", False
+                            ),
+                        ),
                         timeout=self.args.rollout_http_timeout,
                     )
                 except Exception:
@@ -3405,6 +3425,16 @@ class MegatronTrainRayActor(TrainRayActor):
                 run_on_training_rank_zero(release_managed_locks, phase="LoRA weight-sync cleanup")
             elif lock_acquired and weight_sync_lock is not None and dist.get_rank() == 0:
                 ray.get(weight_sync_lock.release.remote())
+
+        # Remote replicas copy from a confirmed seed. This must happen after
+        # releasing the DCS lock, since their native sync acquires the same lock.
+        if not actor_fwd_only and dist.get_rank(group=get_gloo_group()) == 0:
+            result = ray.get(
+                self.rollout_manager.sync_weights_for_scaled_out_engines.remote(),
+                timeout=self.args.rollout_http_timeout,
+            )
+            if not result.get("success"):
+                raise RuntimeError(f"Scaled-out replica weight sync failed: {result}")
 
     @timer
     def recv_weight_fully_async(self, rollout_id) -> None:

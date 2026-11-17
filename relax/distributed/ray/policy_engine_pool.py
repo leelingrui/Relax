@@ -5,7 +5,6 @@
 import asyncio
 import dataclasses
 import enum
-import logging
 import multiprocessing
 import os
 import random
@@ -31,7 +30,10 @@ from relax.distributed.ray.rollout_scale_types import (
     ScaleOutStatus,
 )
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
+<<<<<<< HEAD:relax/distributed/ray/rollout.py
 from relax.engine.rollout.base_types import call_rollout_fn
+=======
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes):relax/distributed/ray/policy_engine_pool.py
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
 from relax.utils.env import Envs
@@ -39,14 +41,10 @@ from relax.utils.health_monitor import RolloutHealthMonitor
 from relax.utils.http_utils import (
     _wrap_ipv6,
     find_available_port,
-    get,
     get_host_info,
     init_http_client,
-    post,
-    router_worker_base_urls,
 )
 from relax.utils.logging_utils import get_logger
-from relax.utils.metrics.metric_checker import MetricChecker
 from relax.utils.metrics.metric_utils import compute_pass_rate, compute_rollout_step, dict_add_prefix
 from relax.utils.metrics.rollout_metrics import (
     compute_metrics_from_samples,
@@ -54,16 +52,12 @@ from relax.utils.metrics.rollout_metrics import (
     compute_perf_metrics_from_samples,
 )
 from relax.utils.misc import load_function
-from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.s3_model_loader import (
     build_runai_streamer_env_for_load,
-    prepare_model_maybe_update_args,
 )
 from relax.utils.scale_utils import PrecheckProbeCategory, ScaleOutFailure, ScaleOutFailureCategory
-from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
-    save_debug_rollout_data,
     save_eval_summary_jsonl,
     save_rollout_result_jsonl,
 )
@@ -71,9 +65,6 @@ from relax.utils.utils import get_ray_accelerator_kwargs
 
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 
-
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = get_logger(__name__)
 
@@ -881,6 +872,7 @@ class RolloutServer:
         return ray.get(handles) if handles else []
 
 
+<<<<<<< HEAD:relax/distributed/ray/rollout.py
 # In-process singleton set inside RolloutManager.__init__. Only meaningful
 # from code running inside the RolloutManager actor's own process (e.g., a
 # custom_reward_post_process function loaded there). Cross-process access
@@ -921,6 +913,10 @@ class RolloutManager(ReloadableMixin):
     - reload_module(module_name): Reload the specified module
     - get_loaded_modules(): Retrieve information about loaded modules
     """
+=======
+class PolicyEnginePool:
+    """Engine-only policy pool hosted inside the task InferenceManager."""
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes):relax/distributed/ray/policy_engine_pool.py
 
     # Scale-out weight-sync tunables; see relax.utils.env.Envs for semantics/defaults.
     _WEIGHT_SYNC_PORT_BASE = Envs.RELAX_WEIGHT_SYNC_PORT_BASE
@@ -930,10 +926,12 @@ class RolloutManager(ReloadableMixin):
     _SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS
     _WEIGHT_SYNC_MAX_INIT_ATTEMPTS = Envs.RELAX_WEIGHT_SYNC_MAX_INIT_ATTEMPTS
 
-    def __init__(self, args, pg, data_source=None, *, inference_only: bool = False):
+    def __init__(self, args, pg):
         self.pg = pg
         self.args = args
+        self.route_mode = getattr(_resolve_rollout_engine_class(args), "route_mode", "router")
         self._engine_actor_states = _get_engine_actor_states()
+        self._seed_sync_receipts: dict[str, tuple[tuple[str, ...], str]] = {}
         self._dynamic_global_batch_size = None
         # Disposal must remain usable if startup fails before creating locks or monitors.
         self.servers = {}
@@ -942,34 +940,6 @@ class RolloutManager(ReloadableMixin):
         self._eviction_monitor_thread = None
 
         init_tracking(args, primary=False)
-
-        self.data_source = data_source
-
-        self.data_system_client = None
-        if not inference_only:
-            self.data_system_client = attach_tq_client(
-                self.args.tq_config,
-                role="rollout_worker",
-            )
-
-        if not inference_only:
-            logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
-            logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
-            self.generate_rollout = load_function(self.args.rollout_function_path)
-            self.eval_generate_rollout = load_function(self.args.eval_function_path)
-            self.custom_reward_post_process_func = None
-            if self.args.custom_reward_post_process_path is not None:
-                self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
-            self.custom_convert_samples_to_train_data_func = None
-            if self.args.custom_convert_samples_to_train_data_path is not None:
-                self.custom_convert_samples_to_train_data_func = load_function(
-                    self.args.custom_convert_samples_to_train_data_path
-                )
-
-        if self.args.use_agentic_rollout and not inference_only:
-            from relax.agentic.rollout import init_agentic_resident_pipeline
-
-            init_agentic_resident_pipeline(self.args, self.data_source, self.data_system_client)
 
         if self.args.debug_train_only:
             self.servers: dict[str, RolloutServer] = {}
@@ -980,8 +950,6 @@ class RolloutManager(ReloadableMixin):
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
         self.rollout_id = -1
-        self._metric_checker = MetricChecker.maybe_create(args)
-        self._tokenizer = None  # Lazy-initialized tokenizer for debug data saving
         self._engine_lifecycle_lock = threading.RLock()
         existing_groups = [group for srv in self.servers.values() for group in srv.engine_groups]
         self._next_engine_rank = max(
@@ -998,20 +966,6 @@ class RolloutManager(ReloadableMixin):
                     self._health_monitors.append(monitor)
             self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
         self.status = None
-
-        # In-process singleton so user code running inside this actor (notably
-        # custom_reward_post_process_func loaded and invoked on the rollout
-        # actor's event loop) can call offload()/onload() directly without a
-        # self-remote call that would deadlock.
-        # We must write into sys.modules[__name__] explicitly: when Ray/cloudpickle
-        # reconstructs the @ray.remote class in the worker, __init__.__globals__
-        # can be a namespace distinct from sys.modules['relax.distributed.ray.rollout'],
-        # so a plain `global _LOCAL_ROLLOUT_MANAGER` write becomes invisible to
-        # any code that imports the module the normal way.
-        import sys as _sys
-
-        if not inference_only:
-            _sys.modules[__name__]._LOCAL_ROLLOUT_MANAGER = self
 
         # Elastic scale-out tracking
         self._scale_out_requests: dict[str, ScaleOutRequest] = {}
@@ -1046,6 +1000,9 @@ class RolloutManager(ReloadableMixin):
             rank_offset = ((self._next_engine_rank + alignment - 1) // alignment) * alignment
             self._next_engine_rank = rank_offset + count
             return rank_offset
+
+    def get_training_weight_updating(self) -> bool:
+        return self.training_weight_updating
 
     @property
     def training_weight_updating(self) -> bool:
@@ -1092,15 +1049,8 @@ class RolloutManager(ReloadableMixin):
                 monitor.stop(timeout=max(0.0, deadline - time.monotonic()))
             self._shutdown_all_engines()
         finally:
-            try:
-                # Deregister the worker's Mooncake segment before a fast restart.
-                if getattr(self, "data_system_client", None) is not None:
-                    detach_tq_client()
-            finally:
-                self.data_system_client = None
-                # Routers are child processes of this Ray actor, so its process
-                # owns the registry; the Controller driver's registry is separate.
-                stop_launched_routers()
+            # Routers are children of the task Manager process.
+            stop_launched_routers()
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.
@@ -1184,6 +1134,7 @@ class RolloutManager(ReloadableMixin):
         """
         return self._weight_sync_lock
 
+<<<<<<< HEAD:relax/distributed/ray/rollout.py
     def get_dynamic_global_batch_size(self):
         """Return the actual sample count from the last rollout step.
 
@@ -1327,6 +1278,8 @@ class RolloutManager(ReloadableMixin):
         except Exception as e:
             logger.warning(f"Failed to load data source: {e}")
 
+=======
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes):relax/distributed/ray/policy_engine_pool.py
     async def offload(self):
         self._offload_local()
 
@@ -1347,12 +1300,14 @@ class RolloutManager(ReloadableMixin):
     def _onload_local(self, tags: list[str] | None = None):
         """Sync body of onload(); safe to call directly from code running
         inside this actor's process (e.g. custom_reward_post_process)."""
+        # Record possible residency before the first fallible load so cleanup
+        # still runs when a later server fails after an earlier one loaded.
+        self.status = "partial"
         for srv in self.servers.values():
             srv.onload(tags)
-        # Full onload transitions status; per-tag calls leave status for the
-        # dedicated wrappers below (onload_weights / onload_kv).
-        if tags is None:
-            self.status = "onload"
+        # Partial loads also hold GPU memory. Do not let a later offload
+        # short-circuit merely because the last full state was sleeping.
+        self.status = "onload" if tags is None else "partial"
 
     async def onload_weights(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
@@ -1364,7 +1319,6 @@ class RolloutManager(ReloadableMixin):
     def get_status(self):
         return self.status
 
-    @ray.method(concurrency_group="recover_rollout_engines")
     def recover_rollout_engines(self, model_name: str | None = None):
         """Restart any dead rollout engines and update num_new_engines for
         update_weights detection."""
@@ -1385,7 +1339,6 @@ class RolloutManager(ReloadableMixin):
             srv.engine_gpu_offsets,
         )
 
-    @ray.method(concurrency_group="recover_rollout_engines")
     def register_recovered_engines(self, synced_actor_ids: list[str]) -> None:
         """Publish only current recovered generations that completed weight
         sync."""
@@ -1441,12 +1394,10 @@ class RolloutManager(ReloadableMixin):
         if srv:
             srv.num_new_engines = 0
 
-    @ray.method(concurrency_group="health_monitoring")
     def health_monitoring_pause(self) -> None:
         for monitor in self._health_monitors:
             monitor.pause()
 
-    @ray.method(concurrency_group="health_monitoring")
     def health_monitoring_resume(self) -> None:
         for monitor in self._health_monitors:
             monitor.resume()
@@ -1455,7 +1406,6 @@ class RolloutManager(ReloadableMixin):
         refs = [engine.check_weights.remote(action=action) for engine in self.rollout_engines]
         return await asyncio.gather(*refs)
 
-    @ray.method(concurrency_group="health_monitoring")
     def set_force_unhealthy(self, engine_id: int) -> None:
         """Set ``_force_unhealthy`` on a specific rollout engine for debug.
 
@@ -1471,13 +1421,9 @@ class RolloutManager(ReloadableMixin):
         ray.get(engine.set_force_unhealthy.remote(True))
         logger.info(f"set_force_unhealthy: engine {engine_id} marked as unhealthy")
 
-    @property
-    def tokenizer(self):
-        """Lazy-initialized tokenizer for debug data saving."""
-        if self._tokenizer is None:
-            try:
-                from relax.utils.data.processing_utils import load_tokenizer
+    # ===================== Elastic Rollout Scale-Out Methods =====================
 
+<<<<<<< HEAD:relax/distributed/ray/rollout.py
                 prepare_model_maybe_update_args(self.args, completeness="metadata")
                 self._tokenizer = load_tokenizer(self.args.hf_checkpoint, trust_remote_code=True)
                 logger.info(f"Loaded tokenizer from {self.args.hf_checkpoint}")
@@ -1494,6 +1440,8 @@ class RolloutManager(ReloadableMixin):
 
     # ===================== Elastic Rollout Scale-Out Methods =====================
 
+=======
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes):relax/distributed/ray/policy_engine_pool.py
     def _gc_terminal_requests(self) -> None:
         """Garbage-collect terminal scale-out/in requests to prevent unbounded
         memory growth.
@@ -1547,7 +1495,7 @@ class RolloutManager(ReloadableMixin):
             ValueError: If the address format is invalid
         """
         # Strip scheme prefix so callers can pass full URLs
-        addr = RolloutManager._normalize_engine_addr(addr)
+        addr = PolicyEnginePool._normalize_engine_addr(addr)
         if addr.startswith("["):
             # IPv6 bracket notation: [::1]:8000
             bracket_end = addr.find("]")
@@ -1643,7 +1591,6 @@ class RolloutManager(ReloadableMixin):
                         }
         return None
 
-    @ray.method(concurrency_group="scale_coordination")
     def create_scale_out_request(
         self,
         model_name: str = "default",
@@ -1801,7 +1748,6 @@ class RolloutManager(ReloadableMixin):
             self._gc_terminal_requests()
         return request.to_dict()
 
-    @ray.method(concurrency_group="scale_out")
     async def execute_scale_out(self, request_id: str) -> None:
         """Execute a previously created scale-out request. Meant to be called
         via .remote() (fire-and-forget).
@@ -2446,8 +2392,19 @@ class RolloutManager(ReloadableMixin):
         logger.info(f"{log_prefix} {replica_str}: starting weight sync from seed engine...")
         sync_timeout = max(30.0, request.timeout_secs - (time.time() - request.created_at))
         sync_reasons: list[ScaleOutFailure] = []
+        initial_generations = {}
+        if engine_group is not None:
+            for first in range(0, len(engine_group.all_engines), engine_group.nodes_per_engine):
+                slots = tuple(engine_group.all_engines[first : first + engine_group.nodes_per_engine])
+                if len(slots) == engine_group.nodes_per_engine and all(engine is not None for engine in slots):
+                    initial_generations[slots[0]._actor_id.hex()] = tuple(engine._actor_id.hex() for engine in slots)
+        else:
+            initial_generations = {
+                engine._actor_id.hex(): (engine._actor_id.hex(),) for engine in engines if engine is not None
+            }
         sync_ok = await self._sync_weights_from_seed_engine(
             engines,
+            replica_generations=initial_generations,
             timeout=sync_timeout,
             model_name=request.model_name,
             run_precheck=(engine_group is not None and getattr(self.args, "scale_weight_sync_precheck", True)),
@@ -3058,10 +3015,28 @@ class RolloutManager(ReloadableMixin):
         model_name: str = "default",
         run_precheck: bool = False,
         reason_sink: list[ScaleOutFailure] | None = None,
+        replica_generations: dict[str, tuple[str, ...]] | None = None,
     ) -> bool:
         if not new_engines:
             logger.info("[ScaleOut][WeightSync] No new engines to sync")
             return True
+
+        # Receipts describe the exact full replica before transport starts.
+        # A healthy, versioned head cannot prove that a replacement follower
+        # participated in an earlier successful sync.
+        generations = dict(replica_generations or {})
+        with self._engine_lifecycle_lock:
+            for server in self.servers.values():
+                for group in server.engine_groups:
+                    for first in range(0, len(group.all_engines), group.nodes_per_engine):
+                        slots = tuple(group.all_engines[first : first + group.nodes_per_engine])
+                        if len(slots) == group.nodes_per_engine and all(engine is not None for engine in slots):
+                            generations[slots[0]._actor_id.hex()] = tuple(engine._actor_id.hex() for engine in slots)
+        if not hasattr(self, "_seed_sync_receipts"):
+            self._seed_sync_receipts = {}
+        for engine in new_engines:
+            if engine is not None:
+                self._seed_sync_receipts.pop(engine._actor_id.hex(), None)
 
         def _record(failure: ScaleOutFailure) -> None:
             if reason_sink is not None:
@@ -3240,6 +3215,9 @@ class RolloutManager(ReloadableMixin):
                         next_pending.append((i, e))
                     else:
                         synced_indices.add(i)
+                        identity = e._actor_id.hex()
+                        if identity in generations:
+                            self._seed_sync_receipts[identity] = (generations[identity], str(seed_weight_version))
                 pending_engines = next_pending
 
                 if pending_engines:
@@ -3367,7 +3345,6 @@ class RolloutManager(ReloadableMixin):
         if failures:
             raise RuntimeError(f"Rollback resource release is unconfirmed: {failures}") from failures[0]
 
-    @ray.method(concurrency_group="scale_out")
     def get_scale_out_status(self, request_id: str) -> Optional[dict]:
         """Get the status of a scale-out request.
 
@@ -3380,7 +3357,6 @@ class RolloutManager(ReloadableMixin):
         request = self._scale_out_requests.get(request_id)
         return request.to_dict() if request else None
 
-    @ray.method(concurrency_group="scale_out")
     def cancel_scale_out(self, request_id: str) -> Optional[dict]:
         """Cancel a scale-out request.
 
@@ -3411,7 +3387,6 @@ class RolloutManager(ReloadableMixin):
             return {"router_ip": None, "router_port": None}
         return {"router_ip": srv.router_ip, "router_port": srv.router_port}
 
-    @ray.method(concurrency_group="scale_out")
     def get_engines_info(self, model_name: Optional[str] = None) -> dict:
         """Get information about all engines.
 
@@ -3472,7 +3447,6 @@ class RolloutManager(ReloadableMixin):
         result["observation"]["complete"] = not issues
         return result
 
-    @ray.method(concurrency_group="scale_out")
     def list_all_scale_out_requests(
         self, model_name: Optional[str] = None, status_filter: Optional[str] = None
     ) -> list[dict]:
@@ -3539,7 +3513,6 @@ class RolloutManager(ReloadableMixin):
 
         return [r.to_dict() for r in requests]
 
-    @ray.method(concurrency_group="scale_out")
     async def cancel_all_scale_out_requests(
         self, model_name: Optional[str] = None, status_filter: Optional[str] = None, dry_run: bool = False
     ) -> dict:
@@ -3647,7 +3620,6 @@ class RolloutManager(ReloadableMixin):
 
         return result
 
-    @ray.method(concurrency_group="scale_in")
     def set_weight_updating(self, is_updating: bool) -> bool:
         """Acquire or release the fully-async topology lease.
 
@@ -3665,7 +3637,6 @@ class RolloutManager(ReloadableMixin):
             self._training_weight_updating = is_updating
             return True
 
-    @ray.method(concurrency_group="scale_in")
     async def sync_weights_for_scaled_out_engines(
         self,
         model_name: str = "default",
@@ -3755,7 +3726,6 @@ class RolloutManager(ReloadableMixin):
                 "error_message": str(e),
             }
 
-    @ray.method(concurrency_group="scale_coordination")
     def create_scale_in_request(
         self,
         model_name: str = "default",
@@ -3842,7 +3812,6 @@ class RolloutManager(ReloadableMixin):
             self._gc_terminal_requests()
         return request.to_dict()
 
-    @ray.method(concurrency_group="scale_in")
     async def execute_scale_in(self, request_id: str) -> None:
         request = self._scale_in_requests.get(request_id)
         if request is None:
@@ -4256,12 +4225,10 @@ class RolloutManager(ReloadableMixin):
         if groups_to_remove:
             logger.info(f"[ScaleIn] Cleaned up {len(groups_to_remove)} empty engine groups")
 
-    @ray.method(concurrency_group="scale_in")
     def get_scale_in_status(self, request_id: str) -> Optional[dict]:
         request = self._scale_in_requests.get(request_id)
         return request.to_dict() if request else None
 
-    @ray.method(concurrency_group="scale_in")
     def list_all_scale_in_requests(
         self, model_name: Optional[str] = None, status_filter: Optional[str] = None
     ) -> list[dict]:
@@ -4881,6 +4848,8 @@ def stop_launched_routers() -> int:
             logger.warning(f"Failed to terminate router pid={getattr(proc, 'pid', None)}: {e}")
             survivors.append(proc)  # Retain ownership when cleanup could not be verified.
     _LAUNCHED_ROUTER_PROCESSES = survivors
+    if survivors:
+        raise RuntimeError("Router process exit is unconfirmed; retain the task owner for cleanup retry")
     return killed
 
 
@@ -4986,6 +4955,10 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
     as the HTTP client is shared across all servers.
     """
     config = _resolve_sglang_config(args)
+    route_mode = getattr(_resolve_rollout_engine_class(args), "route_mode", "sglang_router")
+    if route_mode not in {"direct", "sglang_router"}:
+        raise ValueError(f"Unsupported engine routing capability: {route_mode}")
+    direct = route_mode == "direct"
 
     servers: dict[str, RolloutServer] = {}
     gpu_offset = 0
@@ -4995,6 +4968,8 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
         model_cfg.resolve(args)
 
         has_pd = model_cfg.has_pd_disaggregation
+        if direct and has_pd:
+            raise ValueError("Direct engine backends do not support PD router groups")
         endpoint = (args.sglang_router_ip, args.sglang_router_port)
         managed = (
             model_idx > 0
@@ -5008,7 +4983,9 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
             and getattr(args, "router_decode_policy", None) == "power_of_two"
             and not args.debug_train_only
         )
-        if defer_router:
+        if direct:
+            router_ip, router_port = None, None
+        elif defer_router:
             if args.rollout_external or getattr(args, "rollout_engine_class_path", None):
                 raise ValueError("Managed static PD startup requires native, framework-launched SGLang engines")
             if getattr(args, "router_dp_aware", False):
@@ -5056,7 +5033,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
                 sglang_overrides=group_cfg.overrides,
                 router_ip=router_ip,
                 router_port=router_port,
-                skip_router_registration=defer_router,
+                skip_router_registration=defer_router or direct,
                 require_router_registration=defer_router,
             )
             started_groups.append(group)
@@ -5075,7 +5052,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
                 log_interval=60.0,
             )
 
-        if defer_router:
+        if defer_router and not direct:
             router_ip, router_port = _start_managed_pd_router(args, engine_groups, force_new=(model_idx > 0))
             if model_idx == 0:
                 args.sglang_router_ip, args.sglang_router_port = router_ip, router_port

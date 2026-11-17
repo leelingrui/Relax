@@ -9,6 +9,8 @@ from typing import Any
 WORKLOAD_METHODS = frozenset(
     {
         "generate",
+        "run_predict",
+        "generate_predict",
         "eval",
         "save",
         "load",
@@ -25,12 +27,43 @@ WORKLOAD_METHODS = frozenset(
 
 
 @dataclass(frozen=True)
+class InferenceRoleHandle:
+    """Serializable routing only; every operation executes in the task
+    actor."""
+
+    task: Any
+    role: str
+    model_id: str
+
+    def __getattr__(self, method: str) -> Any:
+        if method.startswith("_"):
+            raise AttributeError(method)
+        return _RoleCall(self, method)
+
+
+@dataclass(frozen=True)
+class _RoleCall:
+    handle: InferenceRoleHandle
+    method: str
+
+    def remote(self, *args: Any, **kwargs: Any) -> Any:
+        return self.handle.task.dispatch.remote(
+            self.handle.role,
+            self.handle.model_id,
+            self.method,
+            *args,
+            **kwargs,
+        )
+
+
+@dataclass(frozen=True)
 class ManagedRolloutHandle:
     """Keep Actor/Controller interfaces while separating workload and GPU
     ownership."""
 
     inference_manager: Any
     worker: Any
+    phase_coordinator: Any = None
 
     def __getattr__(self, method: str) -> Any:
         if method.startswith("_"):
@@ -46,6 +79,8 @@ class _PoolCall:
     method: str
 
     def remote(self, *args: Any, **kwargs: Any) -> Any:
+        if self.method == "offload" and self.handle.phase_coordinator is not None:
+            return self.handle.phase_coordinator.switch.remote("startup")
         if self.method == "dispose":
             from relax.distributed.ray.inference_manager import dispose_managed_rollout
 
@@ -54,6 +89,7 @@ class _PoolCall:
 
 
 def use_managed_rollout(args: Any) -> bool:
+<<<<<<< HEAD
     """Select engine ownership for the complete task, including auxiliary
     roles."""
     from relax.engine.sft.runtime import is_offline_mode
@@ -82,3 +118,18 @@ def use_managed_rollout(args: Any) -> bool:
 def use_managed_auxiliary(args: Any) -> bool:
     """Use independent ownership for non-colocated auxiliary roles."""
     return not getattr(args, "colocate", False) and use_managed_rollout(args)
+=======
+    """Every inference workload uses the task control plane."""
+    from relax.engine.sft.runtime import is_offline_mode
+
+    return not is_offline_mode(args) or getattr(args, "sft_predict_interval", None) is not None
+
+
+def use_managed_auxiliary(args: Any) -> bool:
+    return use_managed_rollout(args)
+
+
+def shared_task_enabled(args: Any) -> bool:
+    """Whether Controller prepares a task inference owner before deployment."""
+    return use_managed_rollout(args) and not getattr(args, "debug_train_only", False)
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)

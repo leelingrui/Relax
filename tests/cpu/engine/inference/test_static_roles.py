@@ -3,7 +3,10 @@
 """Auxiliary entry points use real snapshots/executor with HTTP isolated."""
 
 import asyncio
+<<<<<<< HEAD
 import json
+=======
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
 from types import SimpleNamespace
 
 import httpx
@@ -22,6 +25,10 @@ def _owner(role):
     pool.backend = SimpleNamespace(
         all_engines=[object(), object()],
         nodes_per_engine=2,
+<<<<<<< HEAD
+=======
+        router=SimpleNamespace(ready=True, url="http://router:3000"),
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
         _engine_addr_and_ports={0: {"host": "engine", "port": 16000}},
     )
     owner.pool = pool
@@ -39,6 +46,7 @@ def _owner(role):
 
 
 @pytest.mark.asyncio
+<<<<<<< HEAD
 async def test_genrm_managed_request_resolves_current_head_and_preserves_sampling():
     from relax.components.genrm import GenRM
 
@@ -67,6 +75,8 @@ async def test_genrm_managed_request_resolves_current_head_and_preserves_samplin
 
 
 @pytest.mark.asyncio
+=======
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
 async def test_managed_teacher_total_timeout_aborts_and_returns_permit(monkeypatch):
     from relax.engine.rollout.on_policy_distillation import OpdManager
     from relax.utils import http_utils
@@ -81,6 +91,11 @@ async def test_managed_teacher_total_timeout_aborts_and_returns_permit(monkeypat
         requests.append(request)
         if request.url.path == "/generate":
             await asyncio.Event().wait()
+<<<<<<< HEAD
+=======
+        if request.url.path == "/workers":
+            return httpx.Response(200, json={"workers": [{"url": "http://engine:16000"}]})
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
         return httpx.Response(200, json={})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
@@ -92,8 +107,13 @@ async def test_managed_teacher_total_timeout_aborts_and_returns_permit(monkeypat
             2,
         )
     assert result is None
+<<<<<<< HEAD
     assert [request.url.path for request in requests] == ["/generate", "/abort_request"]
     assert all(request.url.host == "engine" for request in requests)
+=======
+    assert [request.url.path for request in requests] == ["/generate", "/workers", "/abort_request"]
+    assert [request.url.host for request in requests] == ["router", "router", "engine"]
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     assert not owner.ledger.permits
 
 
@@ -110,7 +130,11 @@ def test_static_genrm_configuration_has_no_policy_weight_receiver():
     model = spec.models[0]
     assert model.weight_source is WeightSource.STATIC
     assert not model.needs_dcs
+<<<<<<< HEAD
     assert model.route_mode is RouteMode.DIRECT
+=======
+    assert model.route_mode is RouteMode.SGLANG_ROUTER
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     assert len(model.engine_groups[0].topology.replicas) == 2
     args.genrm_num_gpus = 3
     with pytest.raises(ValueError, match="complete replicas"):
@@ -119,7 +143,11 @@ def test_static_genrm_configuration_has_no_policy_weight_receiver():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("role", [Role.GENRM, Role.TEACHER])
+<<<<<<< HEAD
 async def test_static_requests_rotate_across_two_replicas(role):
+=======
+async def test_static_requests_use_model_router_for_two_replicas(role):
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     from relax.engine.inference.executor import InferenceRequestExecutor
 
     owner, remote = _owner(role)
@@ -135,6 +163,7 @@ async def test_static_requests_rotate_across_two_replicas(role):
         executor = InferenceRequestExecutor(role, remote, client)
         for _ in range(4):
             await executor.generate_json({"input_ids": [1]})
+<<<<<<< HEAD
     assert ports == [16000, 16001, 16000, 16001]
     assert not owner.ledger.permits
 
@@ -170,6 +199,20 @@ def test_genrm_factory_assigns_disjoint_unequal_slices_and_rolls_back(monkeypatc
     assert launched == [("a", 0), ("b", 1)]
     assert closed == ["a"]
     assert killed == [first]
+=======
+    assert ports == [3000, 3000, 3000, 3000]
+    assert not owner.ledger.permits
+
+
+def test_genrm_factory_consumes_task_routes_and_never_allocates_new_owners():
+    from relax.distributed.ray.placement_group import create_genrm_managers
+
+    handles = {"a": object(), "b": object()}
+    args = SimpleNamespace(_genrm_managers=handles)
+    assert create_genrm_managers(args, "service-pg") is handles
+    with pytest.raises(RuntimeError, match="task InferenceManager"):
+        create_genrm_managers(SimpleNamespace(), "service-pg")
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
 
 
 def test_teacher_factory_injects_public_owner_for_independent_requests(monkeypatch):
@@ -178,10 +221,23 @@ def test_teacher_factory_injects_public_owner_for_independent_requests(monkeypat
     import relax.distributed.ray.inference_manager as manager_module
     from relax.utils.opd.opd_utils import create_managed_opd_teacher_manager
 
+<<<<<<< HEAD
     teacher = SimpleNamespace(get_urls=SimpleNamespace(remote=lambda: ["http://engine/generate"]))
     captured = []
 
     def allocate(args, role, **options):
+=======
+    teacher = SimpleNamespace(
+        snapshot=SimpleNamespace(
+            remote=lambda role: SimpleNamespace(
+                models=[SimpleNamespace(replicas=[SimpleNamespace(base_url="http://engine")])]
+            )
+        )
+    )
+    captured = []
+
+    def allocate(args, role, binding, **options):
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
         captured.append((role, options["num_replicas"], options["gpus_per_replica"]))
         return teacher
 
@@ -196,10 +252,17 @@ def test_teacher_factory_injects_public_owner_for_independent_requests(monkeypat
 
 @pytest.mark.parametrize("fully_async,sizes", [(False, (2,)), (True, (2,)), (False, (1, 2))])
 def test_dedicated_genrm_engine_placement_matches_recorded_slices(fully_async, sizes):
+<<<<<<< HEAD
     from relax.distributed.ray.genrm import GenRMManager
     from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementPlanner
 
     implementation = GenRMManager.__ray_metadata__.modified_class
+=======
+    from relax.distributed.ray.engine_pool import EnginePool
+    from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementPlanner
+
+    implementation = EnginePool
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     total = sum(sizes)
     binding = ("dedicated-genrm", list(range(total)), list(range(total)))
     planner = PlacementPlanner()
@@ -217,6 +280,10 @@ def test_dedicated_genrm_engine_placement_matches_recorded_slices(fully_async, s
             genrm_sampling_config={},
         )
         backend = implementation.__new__(implementation)
+<<<<<<< HEAD
+=======
+        backend.role = "genrm"
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
         backend.args = args
         backend.pg = binding
         backend.bundle_offset = offset
@@ -246,7 +313,11 @@ def test_dedicated_genrm_engine_placement_matches_recorded_slices(fully_async, s
 
 
 @pytest.mark.asyncio
+<<<<<<< HEAD
 async def test_managed_teacher_group_affinity_uses_current_replica(monkeypatch):
+=======
+async def test_managed_teacher_groups_use_current_model_router(monkeypatch):
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     from relax.engine.rollout.on_policy_distillation import OpdManager
     from relax.utils import http_utils
     from relax.utils.types import Sample
@@ -267,7 +338,11 @@ async def test_managed_teacher_group_affinity_uses_current_replica(monkeypatch):
         await worker._post_managed_teacher(remote, {}, Sample(index=1, group_index=1))
         await worker._post_managed_teacher(remote, {}, Sample(index=2, group_index=1))
         await worker._post_managed_teacher(remote, {}, Sample(index=3, group_index=0))
+<<<<<<< HEAD
     assert sent == ["other", "other", "engine"]
+=======
+    assert sent == ["router", "router", "router"]
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     assert not owner.ledger.permits
 
 

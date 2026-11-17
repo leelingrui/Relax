@@ -6,6 +6,10 @@ configuration."""
 from typing import Any
 
 from relax.engine.inference.config import DeploymentSpec, EngineGroupSpec, InferenceModelSpec, InferenceRoleSpec
+<<<<<<< HEAD
+=======
+from relax.engine.inference.phase_plans import PHASE_GENERATE, placement_phase
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
 from relax.engine.inference.types import (
     WORKLOAD_BY_ROLE,
     DeploymentMode,
@@ -27,7 +31,11 @@ def static_role_spec(role: Role, args: Any, options: dict[str, Any]) -> Inferenc
     elif role is Role.TEACHER:
         from relax.utils.opd.opd_utils import build_teacher_overrides
 
+<<<<<<< HEAD
         name = "default"
+=======
+        name = options.get("model_id", "default")
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
         path = args.teacher_hf_checkpoint
         tp = options["gpus_per_replica"]
         total = options["num_replicas"] * tp
@@ -43,6 +51,7 @@ def static_role_spec(role: Role, args: Any, options: dict[str, Any]) -> Inferenc
         num_gpus_per_engine=tp,
         engine_groups=[EngineGroupSpec("regular", total, tp, overrides)],
         weight_source=WeightSource.STATIC,
+<<<<<<< HEAD
         route_mode=RouteMode.DIRECT,
         sampling_defaults=sampling,
     ).resolved(args)
@@ -50,6 +59,26 @@ def static_role_spec(role: Role, args: Any, options: dict[str, Any]) -> Inferenc
         role,
         WORKLOAD_BY_ROLE[role],
         DeploymentSpec(DeploymentMode.DECOUPLED, "inference"),
+=======
+        route_mode=RouteMode.SGLANG_ROUTER,
+        sampling_defaults=sampling,
+    ).resolved(args)
+    phase = placement_phase(args, role.value)
+    mode = DeploymentMode.DECOUPLED
+    if phase != PHASE_GENERATE:
+        mode = DeploymentMode.DEFER
+    elif role is Role.GENRM and getattr(args, "colocate", False) and not getattr(args, "hybrid", False):
+        mode = DeploymentMode.SPLIT
+    elif role is Role.TEACHER:
+        from relax.utils.opd.opd_utils import is_managed_opd_teacher_colocate
+
+        if is_managed_opd_teacher_colocate(args):
+            mode = DeploymentMode.SPLIT
+    return InferenceRoleSpec(
+        role,
+        WORKLOAD_BY_ROLE[role],
+        DeploymentSpec(mode, phase),
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
         RoutingSpec(default_model=name, route_key_to_model=((name, name),)),
         (model,),
     )

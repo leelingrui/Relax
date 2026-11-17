@@ -192,8 +192,8 @@ async def test_pool_operation_cancellation_does_not_spin_the_actor_loop():
         {"eval_datasets": [SimpleNamespace(custom_generate_function_path="custom.eval")]},
     ],
 )
-def test_unmigrated_tasks_select_complete_legacy_path(legacy):
-    assert not use_managed_rollout(SimpleNamespace(**legacy))
+def test_inference_paths_use_task_control_plane(legacy):
+    assert use_managed_rollout(SimpleNamespace(**legacy)) is (legacy.get("loss_type") != "sft")
 
 
 @pytest.mark.parametrize("mode", [{}, {"fully_async": True}, {"hybrid": True}, {"prefill_num_servers": 2}])
@@ -451,8 +451,13 @@ def test_independent_auxiliary_tasks_select_managed_path(role):
     assert use_managed_auxiliary(args)
     assert use_managed_rollout(args)
     args.colocate = True
+<<<<<<< HEAD
     assert not use_managed_auxiliary(args)
     assert not use_managed_rollout(args)
+=======
+    assert use_managed_auxiliary(args)
+    assert use_managed_rollout(args)
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
 
 
 @pytest.mark.asyncio
@@ -527,3 +532,109 @@ async def test_shutdown_closes_worker_with_dead_slots_or_abort_failure(monkeypat
     worker.close.remote.assert_awaited_once()
     kill.assert_called_once_with(worker)
     assert pool.backend.status == "disposed"
+
+
+def test_real_phase_coordinator_switch_allows_public_manager_permit_completion():
+    """One isolated CPU Ray runtime covers actor serialization and cross-owner
+    drain.
+
+    Local coordinator tests cannot exercise the factory's captured actor
+    handles or concurrent Ray RPC completion. This adds two zero-GPU actors and
+    one coordinator for a single bounded transition (roughly 10-20 seconds in
+    CI).
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+    from tempfile import TemporaryDirectory
+
+    script = textwrap.dedent("""
+        import sys
+        import time
+        import ray
+        from test_managed_rollout import FakePool
+        from relax.distributed.ray.inference_manager import InferenceManager, _ModelRuntime
+        from relax.distributed.ray.inference_handle import InferenceRoleHandle
+        from relax.engine.inference.lifecycle import AdmissionScope
+        from relax.engine.inference.phases import create_phase_coordinator
+        from relax.engine.inference.types import LifecycleState, Role
+
+        class Harness(InferenceManager.__ray_metadata__.modified_class):
+            def __init__(self):
+                super().__init__()
+                self.pool = FakePool()
+                self.memory_ready = True
+                self.state = LifecycleState.READY
+                self._last_health = float("inf")
+                teacher = _ModelRuntime()
+                teacher.role = Role.TEACHER
+                teacher.pool = FakePool()
+                teacher.ledger = AdmissionScope(self.requests, "teacher/default")
+                teacher.memory_ready = False
+                teacher.state = LifecycleState.SLEEPING
+                teacher.ledger.fences.add("memory")
+                teacher._last_health = float("inf")
+                self.models[(Role.TEACHER, "default")] = teacher
+
+        ray.init(address="local", num_cpus=2, include_dashboard=False,
+                 log_to_driver=False, _temp_dir=sys.argv[1])
+        owners = []
+        coordinator = None
+        try:
+            Actor = ray.remote(num_cpus=0, max_concurrency=100)(Harness)
+            policy = Actor.remote()
+            teacher = InferenceRoleHandle(policy, "teacher", "default")
+            owners = [policy]
+            permit = ray.get(policy.admit_request.remote("rollout", "default"), timeout=20)
+            coordinator = create_phase_coordinator({"inference": (policy,), "teacher": (teacher,)}, "inference")
+            assert coordinator == policy
+            transition = coordinator.switch.remote("teacher")
+            deadline = time.monotonic() + 15
+            while ray.get(policy.snapshot.remote("rollout"), timeout=10).models[0].admission:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            assert not ray.get(teacher.snapshot.remote("teacher"), timeout=10).models[0].admission
+            assert not ray.wait([transition], timeout=0)[0]
+            ray.get(policy.complete_request.remote(permit), timeout=10)
+            ray.get(transition, timeout=20)
+            assert not ray.get(policy.snapshot.remote("rollout"), timeout=10).models[0].admission
+            assert ray.get(teacher.snapshot.remote("teacher"), timeout=10).models[0].admission
+            ray.get(coordinator.switch.remote("inference"), timeout=20)
+            assert ray.get(policy.snapshot.remote("rollout"), timeout=10).models[0].admission
+            assert not ray.get(teacher.snapshot.remote("teacher"), timeout=10).models[0].admission
+        finally:
+            for owner in owners:
+                ray.kill(owner)
+            ray.shutdown()
+    """)
+    env = dict(os.environ)
+    env.pop("RAY_ADDRESS", None)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["PYTHONPATH"] = os.pathsep.join(
+        (str(Path(__file__).resolve().parent), str(Path.cwd()), env.get("PYTHONPATH", ""))
+    )
+    # Ray's UNIX sockets require a short path, independent of pytest node IDs.
+    with TemporaryDirectory(prefix="rphase-", dir="/tmp") as ray_dir:
+        result = subprocess.run(
+            [sys.executable, "-c", script, ray_dir],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=100,
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.asyncio
+async def test_memory_transitions_do_not_change_topology_revision():
+    owner = manager()
+    initial = await owner.snapshot()
+    await owner.pool_call("offload")
+    sleeping = await owner.snapshot()
+    assert not sleeping.models[0].admission
+    assert sleeping.topology_revision == initial.topology_revision
+    await owner.pool_call("onload")
+    ready = await owner.snapshot()
+    assert ready.models[0].admission
+    assert ready.topology_revision == initial.topology_revision

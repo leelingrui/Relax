@@ -6,16 +6,10 @@ import time
 
 import ray
 from ray.util.placement_group import PlacementGroup, placement_group
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from relax.core.node_group_affinity import (
-    require_control_plane_resource_on_node,
-    with_control_plane_affinity,
-)
 from relax.engine.inference.placement import ProbedPlacementGroup
-from relax.engine.sft.runtime import is_offline_mode
 from relax.utils import device as device_utils
-from relax.utils.agentic_obs.startup import record_run_startup
 from relax.utils.device import ray_get_device_ids
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
@@ -191,87 +185,14 @@ def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
 
 
 def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
-    from .inference_handle import use_managed_rollout
-    from .rollout import RolloutManager
+    """Deploy a CPU workload worker attached to the task engine owner."""
+    from .inference_manager import create_managed_rollout
 
-    if use_managed_rollout(args) and isinstance(pg, ProbedPlacementGroup):
-        from .inference_manager import create_managed_rollout
-
-        return create_managed_rollout(args, pg, data_source, runtime_env)
-
-    # Get the head node ID to ensure RolloutManager runs on the head node
-    # This is critical because the Router binds to the SLIME_HOST_IP address,
-    # and other components expect the router to be accessible at the head node's IP
-    head_node_id = _get_head_node_id()
-    logger.info(f"Scheduling RolloutManager on head node: {head_node_id}")
-    require_control_plane_resource_on_node(args, head_node_id)
-
-    rollout_manager = RolloutManager.options(
-        **with_control_plane_affinity(
-            args,
-            {
-                "num_cpus": 1,
-                "num_gpus": 0,
-                "runtime_env": runtime_env,
-                "scheduling_strategy": NodeAffinitySchedulingStrategy(
-                    node_id=head_node_id,
-                    soft=False,  # Hard constraint: must run on the specified node
-                ),
-            },
-        )
-    ).remote(args, pg, data_source=data_source)
-
-    # Add timeout protection to prevent indefinite blocking during initialization
-    # The timeout is set to 120 seconds to allow sufficient time for:
-
-    # Resolve num_rollout. Semantics:
-    #   - both set         -> min(num_rollout, num_epoch * rollout_per_epoch)
-    #   - only num_epoch   -> num_epoch * rollout_per_epoch
-    #   - only num_rollout -> use as-is
-    # Offline training pre-resolves num_rollout and num_rollout_per_epoch from its
-    # dataset in controller.py before any role is launched; the injected Rollout
-    # has no RL global dataset, so trust those values and skip the RL-side
-    # computation (which would assert on rollout_global_dataset).
-    if is_offline_mode(args):
-        num_rollout_per_epoch = getattr(args, "num_rollout_per_epoch", None)
-        logger.info(
-            f"RolloutManager initialized successfully (offline mode). "
-            f"num_rollout_per_epoch={num_rollout_per_epoch} (pre-resolved by controller)."
-        )
-    else:
-        num_rollout_per_epoch = ray.get(
-            rollout_manager.get_num_rollout_per_epoch.remote(),
-        )
-        logger.info(f"RolloutManager initialized successfully. num_rollout_per_epoch: {num_rollout_per_epoch}")
-
-        args.num_rollout_per_epoch = num_rollout_per_epoch
-        if args.num_epoch is not None:
-            epoch_rollout = num_rollout_per_epoch * args.num_epoch
-            args.num_rollout = min(args.num_rollout, epoch_rollout) if args.num_rollout is not None else epoch_rollout
-        evaluation_only = (
-            args.num_rollout == 0
-            and args.debug_rollout_only
-            and args.eval_interval is not None
-            and not args.skip_eval_before_train
-        )
-        assert args.num_rollout is not None and (args.num_rollout > 0 or evaluation_only), (
-            f"num_rollout resolved to {args.num_rollout}; "
-            f"num_rollout_per_epoch={num_rollout_per_epoch}, num_epoch={args.num_epoch}"
-        )
-
-    record_run_startup(args)
-
-    if args.check_weight_update_equal:
-        ray.get(rollout_manager.check_weights.remote(action="snapshot"))
-        ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
-
-    if args.offload_rollout:
-        ray.get(rollout_manager.offload.remote())
-
-    return rollout_manager, num_rollout_per_epoch
+    return create_managed_rollout(args, pg, data_source, runtime_env)
 
 
 def create_genrm_manager(args, pg, runtime_env=None):
+<<<<<<< HEAD
     """Create and initialize a single GenRM manager (legacy single-instance
     path).
 
@@ -410,3 +331,19 @@ def create_genrm_managers(args, pg, runtime_env=None):
     )
     logger.info(f"GenRM managers initialized successfully: instances={list(managers.keys())}")
     return managers
+=======
+    """Return the task-owned default model routing handle."""
+    managers = create_genrm_managers(args, pg, runtime_env)
+    if len(managers) != 1:
+        raise ValueError("A single GenRM handle requires exactly one model")
+    return next(iter(managers.values()))
+
+
+def create_genrm_managers(args, pg, runtime_env=None):
+    """Services consume role routes; only Controller creates task engine
+    pools."""
+    prepared = getattr(args, "_genrm_managers", None)
+    if prepared is None:
+        raise RuntimeError("GenRM models must be registered in the task InferenceManager before deployment")
+    return prepared
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)

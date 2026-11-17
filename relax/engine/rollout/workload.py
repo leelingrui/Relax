@@ -134,6 +134,11 @@ class RolloutWorkload(ReloadableMixin):
             )
 
     async def eval(self, rollout_id) -> None:
+<<<<<<< HEAD
+=======
+        from relax.distributed.ray.policy_engine_pool import _log_eval_rollout_data
+
+>>>>>>> f91f65ba (feat(inference)!: unify task inference ownership)
         await self.inference.resume_health_monitoring()
 
         # TODO: add fault tolerance to eval
@@ -154,6 +159,7 @@ class RolloutWorkload(ReloadableMixin):
         self.save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
 
+<<<<<<< HEAD
     def _on_custom_reward_reloaded(self, module_path: str) -> None:
         """Wait for this manager's background judge to refresh as well."""
         if self._eval_judge is not None:
@@ -205,6 +211,41 @@ class RolloutWorkload(ReloadableMixin):
             finally:
                 ray.kill(self._eval_judge)
                 self._eval_judge = None
+=======
+    async def run_predict(self, train_step: int) -> None:
+        from relax.engine.sft.predict.loop import run_predict_loop
+
+        await self.inference.onload_kv()
+        await run_predict_loop(self, self.args, train_step)
+
+    async def generate_predict(
+        self, prompts: list[str], multimodal_inputs_list: list[dict | None] | None = None
+    ) -> list[str]:
+        from relax.engine.inference.executor import InferenceRequestExecutor
+        from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
+        from relax.utils import http_utils
+
+        await self.inference.resume_health_monitoring()
+        executor = InferenceRequestExecutor("rollout", self.args._inference_manager_handle, http_utils._http_client)
+        params = {
+            "temperature": getattr(self.args, "eval_temperature", None),
+            "max_new_tokens": getattr(self.args, "eval_max_response_len", None),
+            "top_p": getattr(self.args, "eval_top_p", None),
+        }
+        defaults = {"temperature": 0.0, "max_new_tokens": 512, "top_p": 1.0}
+        params = {key: defaults[key] if value is None else value for key, value in params.items()}
+        media = multimodal_inputs_list if multimodal_inputs_list is not None else [None] * len(prompts)
+
+        async def one(prompt: str, multimodal: dict | None) -> str:
+            payload: dict[str, Any] = {"text": prompt, "sampling_params": params}
+            if multimodal:
+                encoded, _ = await _encode_multimodal_inputs(multimodal)
+                payload.update(encoded)
+            output = await executor.generate_json(payload)
+            return output["text"] if isinstance(output, dict) and "text" in output else str(output)
+
+        return await asyncio.gather(*(one(prompt, mm) for prompt, mm in zip(prompts, media, strict=True)))
+>>>>>>> f91f65ba (feat(inference)!: unify task inference ownership)
 
     # ------------------------------ debug dump -----------------------------
 

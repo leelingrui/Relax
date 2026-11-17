@@ -32,17 +32,27 @@ def test_static_rollback_retains_owner_until_confirmed_cleanup(monkeypatch, fail
 
 @pytest.mark.asyncio
 async def test_partial_static_start_and_failed_dispose_preserve_backend_and_fence(monkeypatch):
+<<<<<<< HEAD
     from relax.distributed.ray.genrm import GenRMManager
     from relax.engine.inference.types import Role
 
     implementation = GenRMManager.__ray_metadata__.modified_class
     lock = object()
+=======
+    from relax.distributed.ray.engine_pool import EnginePool
+    from relax.engine.inference.types import Role
+
+    implementation = EnginePool
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     shutdowns = []
     killed = []
 
     def partial_init(backend, *args, **kwargs):
         backend.all_engines = []
+<<<<<<< HEAD
         backend.genrm_engine_lock = lock
+=======
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
         raise RuntimeError("engine startup failed")
 
     def failed_shutdown(backend):
@@ -67,7 +77,10 @@ async def test_partial_static_start_and_failed_dispose_preserve_backend_and_fenc
     assert pool is not None
     backend = pool.backend
     assert shutdowns == [backend]
+<<<<<<< HEAD
     assert backend.genrm_engine_lock is lock
+=======
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     with pytest.raises(TimeoutError, match="exit unconfirmed"):
         await owner.dispose()
     assert owner.pool is pool
@@ -79,6 +92,7 @@ async def test_partial_static_start_and_failed_dispose_preserve_backend_and_fenc
     monkeypatch.setattr(implementation, "shutdown", lambda backend: None)
     await owner.dispose()
     assert owner.pool is None
+<<<<<<< HEAD
     assert killed == [lock]
 
 
@@ -86,12 +100,21 @@ def test_static_pool_keeps_lock_when_backend_shutdown_is_unconfirmed(monkeypatch
     from relax.distributed.ray.static_inference_pool import StaticInferencePool
 
     lock = object()
+=======
+    assert killed == []
+
+
+def test_static_pool_retains_backend_when_shutdown_is_unconfirmed(monkeypatch):
+    from relax.distributed.ray.static_inference_pool import StaticInferencePool
+
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     killed = []
 
     def failed_shutdown():
         raise TimeoutError("exit unconfirmed")
 
     pool = StaticInferencePool.__new__(StaticInferencePool)
+<<<<<<< HEAD
     pool.backend = SimpleNamespace(shutdown=failed_shutdown, genrm_engine_lock=lock)
     monkeypatch.setattr(module.ray, "kill", killed.append)
     with pytest.raises(TimeoutError, match="exit unconfirmed"):
@@ -108,6 +131,25 @@ def test_partial_rollout_cleanup_failure_preserves_locks_and_routers(monkeypatch
     from relax.distributed.ray.inference_pool import RolloutPool
 
     implementation = rollout.RolloutManager.__ray_metadata__.modified_class
+=======
+    backend = SimpleNamespace(shutdown=failed_shutdown)
+    pool.backend = backend
+    monkeypatch.setattr(module.ray, "kill", killed.append)
+    with pytest.raises(TimeoutError, match="exit unconfirmed"):
+        pool.dispose()
+    assert pool.backend is backend
+    assert killed == []
+    pool.backend.shutdown = lambda: None
+    pool.dispose()
+    assert killed == []
+
+
+def test_partial_rollout_cleanup_failure_preserves_locks_and_routers(monkeypatch):
+    from relax.distributed.ray import policy_engine_pool as rollout
+    from relax.distributed.ray.inference_pool import RolloutPool
+
+    implementation = rollout.PolicyEnginePool
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     lock = object()
     released = []
 
@@ -156,7 +198,11 @@ def test_managed_rollout_disposal_retains_owner_on_failure(monkeypatch):
 
 
 def test_actual_rollout_second_lock_failure_retains_pool_until_shutdown_retry(monkeypatch):
+<<<<<<< HEAD
     from relax.distributed.ray import rollout
+=======
+    from relax.distributed.ray import policy_engine_pool as rollout
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     from relax.distributed.ray.inference_pool import RolloutPool
 
     lock = object()
@@ -190,7 +236,10 @@ def test_actual_rollout_second_lock_failure_retains_pool_until_shutdown_retry(mo
     monkeypatch.setattr(rollout, "init_http_client", lambda *a: None)
     monkeypatch.setattr(rollout, "start_rollout_servers", lambda *a: {"policy": server})
     monkeypatch.setattr(rollout, "with_control_plane_affinity", lambda args, options: options)
+<<<<<<< HEAD
     monkeypatch.setattr(rollout.MetricChecker, "maybe_create", lambda args: None)
+=======
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     monkeypatch.setattr(module.ray, "kill", killed.append)
     args = SimpleNamespace(use_agentic_rollout=False, debug_train_only=False, use_fault_tolerance=False)
     pool = RolloutPool.__new__(RolloutPool)
@@ -201,3 +250,39 @@ def test_actual_rollout_second_lock_failure_retains_pool_until_shutdown_retry(mo
     pool.dispose()
     assert len(shutdown_attempts) == 2
     assert killed == [lock]
+<<<<<<< HEAD
+=======
+
+
+@pytest.mark.asyncio
+async def test_router_survivor_keeps_task_owner_pool_and_locks_for_retry(monkeypatch):
+    from unittest.mock import Mock
+
+    from relax.distributed.ray import policy_engine_pool
+    from relax.distributed.ray.inference_pool import RolloutPool
+
+    process = Mock()
+    process.is_alive.return_value = True
+    monkeypatch.setattr(policy_engine_pool, "_LAUNCHED_ROUTER_PROCESSES", [process])
+    backend = policy_engine_pool.PolicyEnginePool.__new__(policy_engine_pool.PolicyEnginePool)
+    backend._stop_eviction_monitor = Mock()
+    backend._health_monitors = []
+    backend._shutdown_all_engines = Mock()
+    backend.rollout_engine_lock = object()
+    backend._weight_sync_lock = object()
+    pool = RolloutPool.__new__(RolloutPool)
+    pool.backend = backend
+    owner = module.InferenceManager.__ray_metadata__.modified_class()
+    owner.pool = pool
+    killed = []
+    monkeypatch.setattr(module.ray, "kill", killed.append)
+    with pytest.raises(RuntimeError, match="Router process exit is unconfirmed"):
+        await owner.dispose()
+    assert owner.pool is pool
+    assert killed == []
+    assert policy_engine_pool._LAUNCHED_ROUTER_PROCESSES == [process]
+    process.is_alive.return_value = False
+    await owner.dispose()
+    assert owner.pool is None
+    assert killed == [backend.rollout_engine_lock, backend._weight_sync_lock]
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)

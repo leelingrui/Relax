@@ -62,6 +62,10 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
         filter_fn: Callable | None = check_reward_nonzero_std,
         rollout_batch_size: int = 1,
         dp_size: int = 1,
+        deferred: bool = False,
+        genrm: bool = False,
+        scoring_failure: bool = False,
+        trace: list | None = None,
     ) -> SimpleNamespace:
         args = Namespace(
             rollout_global_dataset=True,
@@ -78,7 +82,49 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
             debug_rollout_only=False,
             reward_key=reward_key,
         )
+        events = trace if trace is not None else []
+
+        async def score_teacher(samples):
+            events.append("score")
+            for sample in samples:
+                sample.teacher_log_probs = [float("nan") if scoring_failure else -0.2] * sample.response_length
+            return [True] * len(samples)
+
+        manager = SimpleNamespace(
+            schema_opd_transfer_data=lambda: ["teacher_log_probs"],
+            prepare_teacher_inputs=AsyncMock(),
+            score_teacher=score_teacher,
+            needs_student_prefill=False,
+            assemble_transfer=Mock(),
+        )
+        if deferred:
+            from contextlib import asynccontextmanager
+
+            from relax.engine.rollout import deferred_opd, scoring_phase
+
+            @asynccontextmanager
+            async def phase(*args):
+                yield True
+
+            monkeypatch.setattr(deferred_opd, "deferred_opd_active", lambda args: not genrm)
+            if genrm:
+                from relax.utils import misc
+
+                args._genrm_instances_resolved = {"judge": {}}
+                args._genrm_colocate_with_rollout = True
+                args.defer_reward_to_post_process = True
+                args.custom_reward_post_process_path = "judge.hook"
+
+                def hook(scoring_args, samples):
+                    events.append("score")
+                    for sample in samples:
+                        sample.reward = float("nan") if scoring_failure else 0.75
+                    return [float("nan") if scoring_failure else 0.25] * len(samples)
+
+                monkeypatch.setattr(misc, "load_function", lambda path: hook)
+            monkeypatch.setattr(scoring_phase, "async_scoring_phase", phase)
         state = SimpleNamespace(
+            opd_manager=manager if deferred and not genrm else None,
             last_step_current_deficit=0,
             remaining_batch_size=0,
             prefetched_samples_ref=None,
@@ -89,6 +135,7 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
         )
 
         async def completed(group: Group) -> Group:
+            events.append("generate")
             return group
 
         def submit(groups: list[Group]) -> None:
@@ -110,6 +157,11 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
             assert batch_size == len(groups)
             transferred.extend(groups)
             current_batch.extend(sample for group in groups for sample in group)
+            events.append(("publish", kwargs.get("is_last", False)))
+            if deferred:
+                from relax.engine.rollout.deferred import PublicationReceipt, PublicationState
+
+                return PublicationReceipt(kwargs["operation_id"], PublicationState.CONFIRMED)
 
         data_source = SimpleNamespace(get_samples=SimpleNamespace(remote=Mock(side_effect=batches)))
         log = Mock()
@@ -118,7 +170,12 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
         monkeypatch.setattr(sglang_rollout, "load_function", lambda path: filter_fn)
         monkeypatch.setattr(sglang_rollout, "start_sglang_profile", AsyncMock())
         monkeypatch.setattr(sglang_rollout, "stop_sglang_profile", AsyncMock())
-        monkeypatch.setattr(sglang_rollout, "abort", AsyncMock(return_value=drained or ([], [])))
+
+        async def abort(*args):
+            events.append("abort")
+            return drained or ([], [])
+
+        monkeypatch.setattr(sglang_rollout, "abort", abort)
         monkeypatch.setattr(sglang_rollout, "transfer_batch_to_data_system", transfer)
         monkeypatch.setattr(sglang_rollout, "CURRENT_ROLLOUT_BATCH", current_batch)
         monkeypatch.setattr(sglang_rollout, "compute_dp_size", lambda args: dp_size)
@@ -231,3 +288,28 @@ async def test_sglang_rollout_defers_drain_filter_without_dynamic_batch_size(run
     assert result.buffered == [drained]
     assert result.output.metrics == {}
     assert [call.args[1] for call in filter_fn.call_args_list] == [accepted]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scoring_failure", [False, True])
+@pytest.mark.parametrize("genrm", [False, True])
+async def test_native_rollout_deferred_scoring_waits_for_abort_and_preserves_terminal_batch(
+    run_rollout, scoring_failure, genrm
+):
+    trace = []
+    group = _group(10)
+    for index, sample in enumerate(group):
+        sample.index = index
+        sample.tokens = [1, 2]
+        sample.response_length = 1
+    if scoring_failure:
+        with pytest.raises(RuntimeError, match="did not publish"):
+            await run_rollout(
+                [[group]], deferred=True, genrm=genrm, fully_async=True, scoring_failure=True, trace=trace
+            )
+        assert not any(isinstance(event, tuple) and event[0] == "publish" for event in trace)
+    else:
+        result = await run_rollout([[group]], deferred=True, genrm=genrm, fully_async=True, trace=trace)
+        assert result.transferred == [group]
+        assert trace[-1] == ("publish", True)
+    assert trace.index("generate") < trace.index("abort") < trace.index("score")

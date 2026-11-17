@@ -254,6 +254,15 @@ def test_train_initialization_excludes_live_teacher_owner_from_checkpoint_args(m
     original = Namespace(hf_checkpoint="student", lr=1e-6, use_opd=True, teacher_hf_checkpoint="teacher")
     if has_teacher_owner:
         original._teacher_inference_manager_handle = owner
+<<<<<<< HEAD
+=======
+        original._inference_phase_coordinator = owner
+        original._rollout_engine_manager = owner
+        original._genrm_managers = {"judge": owner}
+        original._teacher_inference_managers = {"teacher": owner}
+        original._inference_manager_handle = owner
+        original._inference_startup_token = "startup-attempt"
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     captured = []
 
     class DistributedBoundaryReached(Exception):
@@ -271,6 +280,16 @@ def test_train_initialization_excludes_live_teacher_owner_from_checkpoint_args(m
     training_args = captured[0]
     assert training_args is not original
     assert not hasattr(training_args, "_teacher_inference_manager_handle")
+<<<<<<< HEAD
+=======
+    assert not hasattr(training_args, "_inference_phase_coordinator")
+    assert not hasattr(training_args, "_rollout_engine_manager")
+    assert not hasattr(training_args, "_genrm_managers")
+    assert not hasattr(training_args, "_teacher_inference_managers")
+    assert not hasattr(training_args, "_inference_manager_handle")
+    assert not hasattr(training_args, "_inference_startup_token")
+    assert getattr(original, "_inference_phase_coordinator", None) is (owner if has_teacher_owner else None)
+>>>>>>> 25948b78 (feat(inference): restore unified shared inference changes)
     assert getattr(original, "_teacher_inference_manager_handle", None) is (owner if has_teacher_owner else None)
     storage = io.BytesIO()
     torch.save({"args": training_args}, storage)
